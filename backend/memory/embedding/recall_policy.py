@@ -22,9 +22,10 @@ MAX_VECTOR_IDS = 2000  # the backend's cap; the candidate pool is far smaller
 class Fallback(Exception):
     """This turn uses the lexical path; ``reason`` is a fixed vocabulary word."""
 
-    def __init__(self, reason: str):
+    def __init__(self, reason: str, *, authorization_failed: bool = False):
         super().__init__(reason)
         self.reason = reason
+        self.authorization_failed = authorization_failed
 
 
 def hybrid_enabled() -> bool:

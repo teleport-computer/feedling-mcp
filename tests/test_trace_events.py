@@ -1056,3 +1056,67 @@ def test_monitor_start_spawns_daemon_thread(monkeypatch):
         "name": "trace-events-monitor",
         "started": True,
     }
+
+
+def test_v2_model_job_link_survives_producer_persist_reader(tee_primary):
+    """A shared trace must not attach an earlier job's success to a failed job."""
+    import asyncio
+    from model_api_runtime.v2 import serve_worker, worker
+
+    uid = _uid()
+    db.upsert_user({"user_id": uid, "created_at": datetime.now(_ZONE).isoformat()})
+    store = types.SimpleNamespace(user_id=uid)
+    deps = types.SimpleNamespace(
+        emit_debug_trace=lambda _uid, kind, **fields:
+        serve_worker._emit_v2_debug_trace(store, kind, **fields),
+    )
+
+    async def record():
+        for job_id, terminal, model in (
+            ("job-done", "done", "claude-test"),
+            ("job-error", "error", "glm-test"),
+        ):
+            trace = worker._provider_tool_surface_callback(
+                deps, uid, "heartbeat", "shared-trace", job_id,
+            )
+            detail = {"round": 1, "provider": "test", "model": model}
+            await trace.record_model_call("start", detail)
+            await trace.record_model_call(terminal, detail)
+            if terminal == "error":
+                # Duplicate diagnostics may happen; they are not additional jobs.
+                await trace.record_model_call(terminal, detail)
+
+    try:
+        debug_trace.set_enabled(store, True)
+        asyncio.run(record())
+        debug_trace.read_trace(store)  # Flush this user's actual async writer.
+        rows = db.query_trace_events(user_id=uid, trace_id="shared-trace")
+        assert len(rows) == 5
+        assert {row["job_id"] for row in rows} == {"job-done", "job-error"}
+        failed = [row for row in rows if row["job_id"] == "job-error"]
+        assert {row["type"] for row in failed} == {
+            "agent.model.call.start", "agent.model.call.error",
+        }
+        assert {row["model"] for row in failed} == {"glm-test"}
+        # A done-only reader misses this observed failed call entirely.
+        assert not any(row["type"] == "agent.model.call.done" for row in failed)
+        assert len({row["job_id"] for row in failed}) == 1
+        from tools import wake_failure_attribution
+        projection = wake_failure_attribution.summarize({
+            "jobs": [
+                {"user_id": uid, "job_id": job, "status": "failed", "lane": "heartbeat"}
+                for job in ("job-error", "job-unobserved")
+            ],
+            "events": rows,
+        })
+        assert projection["failed_jobs"] == 2
+        assert projection["evidence"]["error_observed"] == 1
+        assert projection["evidence"]["unobserved"] == 1
+        assert projection["routes"]["single_route_observed"] == 1
+        assert projection["routes"]["unknown_or_partial_route"] == 1
+        # A missing job observation cannot establish that no call happened.
+        assert not [row for row in rows if row["job_id"] == "job-unobserved"]
+    finally:
+        db.delete_trace_events_for_user(uid)
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))

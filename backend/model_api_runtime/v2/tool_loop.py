@@ -2916,7 +2916,12 @@ async def run_tool_loop(
                 # compatibility fallbacks must not create another correction.
                 await _emit_wake_direct_text("still_invalid")
                 await _provider_call_event("error", {
-                    "round": attempts, **_provider_error_facts(exc),
+                    "round": attempts,
+                    "provider": provider_name,
+                    "model": str(getattr(provider_config, "model", "") or ""),
+                    **_provider_error_facts(exc),
+                    "transport_retry_count": _transport_retry_count_from_error(exc),
+                    "dur_ms": (time.monotonic() - provider_call_started_at) * 1000,
                 })
                 if on_provider_failure is not None:
                     try:

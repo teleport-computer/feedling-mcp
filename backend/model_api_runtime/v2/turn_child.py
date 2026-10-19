@@ -146,6 +146,8 @@ async def _run(
     slot_id: str,
     lanes: tuple[str, ...],
     slot_generation: str,
+    *,
+    turn_absolute_budget_sec: float | None = None,
 ) -> None:
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -189,6 +191,7 @@ async def _run(
             slot_generation=slot_generation,
             slot_id=slot_id,
             enclave_sem=enclave_sem,
+            turn_absolute_budget_sec=turn_absolute_budget_sec,
         )),
         asyncio.create_task(
             _event_loop_heartbeat(
@@ -222,6 +225,8 @@ def main(
     lanes: tuple[str, ...] = ("chat", "manual_wake"),
     db_pool_max: int = 2,
     slot_generation: str = "g0",
+    *,
+    turn_absolute_budget_sec: float | None = None,
 ) -> None:
     """`child_supervisor.ChildSupervisor` 的 spawn target——签名约定
     `spawn_target(conn_write_end, *spawn_args)`，这里的 `spawn_args` 就是
@@ -265,6 +270,7 @@ def main(
                 slot_id,
                 tuple(lanes),
                 slot_generation,
+                turn_absolute_budget_sec=turn_absolute_budget_sec,
             )
         )
     finally:
@@ -282,3 +288,18 @@ def main(
         except Exception:  # noqa: BLE001 — best-effort fd cleanup on the way out
             pass
         log.info("[v2.turn_child] child process exiting pid=%s worker_id=%s", os.getpid(), worker_id)
+
+
+def main_with_turn_budget(
+    conn, worker_id, poll_interval, pool, slot_id, lanes, db_pool_max,
+    turn_absolute_budget_sec, slot_generation,
+) -> None:
+    """Production spawn adapter: retain main's historical generation ABI."""
+    from model_api_runtime.v2 import dream_budget
+
+    if "dream" in lanes:
+        dream_budget.validate_slot_budget(turn_absolute_budget_sec)
+    main(
+        conn, worker_id, poll_interval, pool, slot_id, lanes, db_pool_max,
+        slot_generation, turn_absolute_budget_sec=turn_absolute_budget_sec,
+    )

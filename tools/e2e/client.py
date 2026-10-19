@@ -152,7 +152,8 @@ def _write_private_json(path: Path, body: dict) -> None:
         raise
 
 
-def _write_orphan_manifest(api_url: str, user_id: str, api_key: str) -> Path:
+def _write_orphan_manifest(api_url: str, user_id: str, api_key: str, *,
+                           release_run_id: str | None = None) -> Path:
     """Atomically create the leak-manifest file with 0o600 FROM BIRTH
     (O_CREAT|O_EXCL open — never a 0644 window) and fsync it durable."""
     _ORPHANS_DIR.mkdir(parents=True, exist_ok=True)
@@ -161,7 +162,7 @@ def _write_orphan_manifest(api_url: str, user_id: str, api_key: str) -> Path:
     try:
         with os.fdopen(fd, "w") as f:
             f.write(json.dumps({"api_url": api_url, "user_id": user_id,
-                                "api_key": api_key}))
+                                "api_key": api_key, "release_run_id": release_run_id}))
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
@@ -172,20 +173,34 @@ def _write_orphan_manifest(api_url: str, user_id: str, api_key: str) -> Path:
 
 def _refuse_prod(api_url: str) -> None:
     """Require the explicit test API host before any destructive E2E action."""
-    from urllib.parse import urlparse
-    host = (urlparse(api_url).hostname or "").lower()
-    if host not in _ALLOWED_HOSTS:
-        raise RuntimeError(f"E2E only permits the test API host: {api_url}")
+    from urllib.parse import urlsplit
+    try:
+        if not isinstance(api_url, str):
+            raise ValueError("non-string origin")
+        u = urlsplit(api_url)
+        allowed = (
+            u.hostname in _ALLOWED_HOSTS
+            and not u.username and not u.password
+            and not u.query and not u.fragment and u.path in ("", "/")
+            and ((u.hostname in ("localhost", "127.0.0.1")
+                  and u.scheme in ("http", "https"))
+                 or (u.scheme == "https" and u.port in (None, 443)))
+        )
+    except (TypeError, ValueError):
+        allowed = False
+    if not allowed:
+        raise RuntimeError("E2E only permits the test API at an exact origin")
 
 
 def admin_confirms_absent(api_url: str, user_id: str, *,
                           token_file: Path | None = None) -> tuple[bool | None, str]:
-    """Key-independent account-existence oracle: True only for admin 404.
+    """Key-independent diagnostic read; current endpoint cannot attest absence.
 
     None when no local admin token exists (cannot measure); False for every
     other outcome (alive, transport error, unexpected status). Callers must
     treat None/False identically — "not confirmed absent" is not "absent".
     """
+    _refuse_prod(api_url)
     try:
         token = (token_file or _ADMIN_TOKEN_FILE).read_text().strip()
     except FileNotFoundError:
@@ -195,7 +210,7 @@ def admin_confirms_absent(api_url: str, user_id: str, *,
     try:
         # Certificate verification stays ON here: this answer deletes the leak
         # manifest, and it carries the admin token — a spoofed endpoint must
-        # not be able to say "404". Any TLS/transport failure is "not
+        # not be able to supply diagnostic responses. Any TLS/transport failure is "not
         # confirmed" (False), never "absent".
         r = httpx.get(
             f"{api_url}/v1/admin/data-track/users/{user_id}",
@@ -204,8 +219,16 @@ def admin_confirms_absent(api_url: str, user_id: str, *,
     except httpx.TransportError as e:
         return False, f"admin verification transport error: {type(e).__name__}: {e}"
     if r.status_code == 404:
-        return True, "admin confirmed 404"
+        return False, "INSTRUMENT_GAP: process-local admin 404 is not lease-attested DB absence"
     return False, f"admin verification returned {r.status_code}: {r.text[:80]}"
+
+
+def require_release_execution() -> None:
+    """All release entry points fail closed until the same prerequisites exist."""
+    raise RuntimeError(
+        "INSTRUMENT_GAP: release requires run-bound upstream hard caps, "
+        "durable absence attestation, safe scenario diagnostics and VPS ownership proof"
+    )
 
 
 class E2EClient:
@@ -226,7 +249,7 @@ class E2EClient:
         self.content_encryption_effective = (
             "off" if content_encryption_effective == "off" else "on"
         )
-        self._http = httpx.Client(timeout=60, verify=False)
+        self._http = httpx.Client(timeout=60, verify=True)
         self._deleted = False
         self._orphan_file: Path | None = None
         self._preserve_reason = ""
@@ -234,17 +257,27 @@ class E2EClient:
         self._failure_artifacts: dict[str, str] = {}
         self._failure_locators: dict[str, set[str]] = {"job_id": set(), "trace_id": set()}
         self.failure_evidence_path: Path | None = None
+        self._release_run_id: str | None = None
+        self._release_evidence_dir: Path | None = None
 
     # -- lifecycle ----------------------------------------------------------
     @classmethod
     def provision(cls, *, route: str, api_url: str = TEST_API,
-                  archive_language: str = "zh-Hans") -> "E2EClient":
+                  archive_language: str = "zh-Hans",
+                  release_run_id: str | None = None,
+                  release_evidence_dir: Path | None = None,
+                  defer_failure_cleanup: bool = False,
+                  http_guard=None) -> "E2EClient":
         _refuse_prod(api_url)
+        if release_run_id is not None:
+            require_release_execution()
         sk = PrivateKey.generate()
         pk_b64 = base64.b64encode(bytes(sk.public_key)).decode()
         api_key = ""
         manifest: Path | None = None
-        with httpx.Client(timeout=30, verify=False) as boot:
+        with httpx.Client(timeout=30, verify=True) as boot:
+            if http_guard is not None:
+                http_guard.bind(boot)
             try:
                 # register is NOT idempotent (each call mints a new account), so we
                 # retry only connection establishment failures: ConnectError or
@@ -255,13 +288,18 @@ class E2EClient:
                 reg_body = {"public_key": pk_b64, "archive_language": archive_language,
                             "access_mode": route, "label": "e2e-p0"}
                 for _attempt in range(3):
+                    if http_guard is not None:
+                        http_guard.remaining()
                     try:
                         r = boot.post(f"{api_url}/v1/users/register", json=reg_body)
                         break
                     except (httpx.ConnectError, httpx.ConnectTimeout):
                         if _attempt == 2:
                             raise
-                        time.sleep(3 * (_attempt + 1))
+                        delay = 3 * (_attempt + 1)
+                        if http_guard is not None:
+                            delay = min(delay, http_guard.remaining())
+                        time.sleep(delay)
                 r.raise_for_status()
                 body = r.json()
                 user_id, api_key = body["user_id"], body["api_key"]
@@ -272,7 +310,10 @@ class E2EClient:
                 # successful teardown; `p0.py --cleanup-orphans` sweeps the
                 # rest. If the manifest itself cannot be written, the except
                 # arm best-effort resets rather than proceeding untracked.
-                manifest = _write_orphan_manifest(api_url, user_id, api_key)
+                manifest = _write_orphan_manifest(api_url, user_id, api_key, release_run_id=release_run_id)
+                if http_guard is not None and hasattr(http_guard, 'recovery_callback'):
+                    http_guard.recovery_callback({'ownership': 'REGISTRATION_RECEIPT_AVAILABLE',
+                        'recovery_manifest': str(manifest), 'user_id': user_id})
                 who = boot.get(f"{api_url}/v1/users/whoami",
                                headers={"X-API-Key": api_key})
                 who.raise_for_status()
@@ -285,7 +326,7 @@ class E2EClient:
                     who_body.get("content_encryption_effective") or "on"
                 ).strip().lower()
             except Exception:
-                if api_key:
+                if api_key and release_run_id is None and not defer_failure_cleanup:
                     try:
                         cleanup = boot.post(
                             f"{api_url}/v1/account/reset",
@@ -293,8 +334,8 @@ class E2EClient:
                             json={"confirm": "delete-all-data"},
                         )
                         cleanup.raise_for_status()
-                        if manifest is not None:
-                            manifest.unlink(missing_ok=True)
+                        # Reset response alone is not durable absence evidence.
+                        # Preserve the recovery manifest for independent reconciliation.
                     except Exception as cleanup_error:  # noqa: BLE001 — manifest
                         # stays behind as the recoverable evidence trail
                         print(f"[e2e] WARNING provision cleanup failed: {cleanup_error}",
@@ -308,7 +349,11 @@ class E2EClient:
             enclave_pk,
             content_encryption_effective=content_encryption_effective,
         )
+        client._registration_receipt = {"http": r.status_code, "user_id": user_id,
+                                        "response_digest": hashlib.sha256(json.dumps(r.json(), sort_keys=True).encode()).hexdigest()}
         client._orphan_file = manifest
+        client._release_run_id = release_run_id
+        client._release_evidence_dir = release_evidence_dir
         return client
 
     def teardown(self) -> None:
@@ -327,7 +372,7 @@ class E2EClient:
             # Two 401s on the same key prove nothing about the ACCOUNT (a
             # revoked key on a live account looks identical — codex4's T592
             # counterexample), so only the key-independent admin read bound to
-            # user_id may declare it gone: admin 404 ⇒ clean teardown; anything
+            # user_id may declare it gone: durable attestation ⇒ clean teardown; anything
             # else (alive, no token, transport error) keeps the failure and the
             # orphan manifest — the leak guard never yields to an assumption.
             absent, detail = admin_confirms_absent(self.api_url, self.user_id)
@@ -342,6 +387,12 @@ class E2EClient:
             print(f"[e2e] teardown: reset returned 401 and account absence is NOT "
                   f"confirmed ({detail}) — keeping manifest", file=sys.stderr)
         r.raise_for_status()
+        absent, detail = admin_confirms_absent(self.api_url, self.user_id)
+        if absent is not True:
+            raise RuntimeError(f"cleanup absence unverified: {detail}; keeping manifest")
+        old_key = self.get("/v1/users/whoami")
+        if old_key.status_code != 401:
+            raise RuntimeError("cleanup old key not confirmed revoked; keeping manifest")
         self._deleted = True
         if self._orphan_file is not None:
             self._orphan_file.unlink(missing_ok=True)
@@ -423,7 +474,7 @@ class E2EClient:
                 raise RuntimeError("admin token file is empty")
             r = httpx.get(
                 f"{self.api_url}/v1/admin/data-track/users/{self.user_id}",
-                headers={"X-Admin-Token": token}, timeout=60, verify=False,
+                headers={"X-Admin-Token": token}, timeout=60, verify=True,
             )
             r.raise_for_status()
             captures["admin_user"] = r.json()
@@ -485,10 +536,48 @@ class E2EClient:
         _write_private_json(run_dir / "evidence.json", manifest)
         return run_dir
 
+    def _release_cleanup(self, *, failed: bool) -> None:
+        """Only newly minted, run-bound fixtures; preserve content-free evidence first.
+
+        This does not clean historical manifests or claim durable absence when
+        the current admin oracle cannot prove it. No raw history/trace is copied.
+        """
+        if self._orphan_file is None or self._release_evidence_dir is None:
+            raise RuntimeError("release fixture ownership missing; cleanup stopped")
+        manifest = json.loads(self._orphan_file.read_text())
+        expected = {"api_url": self.api_url, "user_id": self.user_id,
+                    "api_key": self.api_key, "release_run_id": self._release_run_id}
+        if not self._release_run_id or any(manifest.get(k) != v for k, v in expected.items()):
+            raise RuntimeError("release fixture ownership mismatch; cleanup stopped")
+        if self._orphan_file.stem != self.user_id:
+            raise RuntimeError("release fixture path mismatch; cleanup stopped")
+        target = self._release_evidence_dir / self._release_run_id / f"{self.user_id}.json"
+        # Fixed allowlist: no exception text, model content, credentials, raw
+        # traces, or caller-provided artifact paths. O_EXCL prevents overwrites.
+        _write_private_json(target, {
+            "schema": 1, "run_id": self._release_run_id, "user_id": self.user_id,
+            "api_url": self.api_url, "failed": failed,
+            "cleanup_state": "not_yet_verified",
+        })
+        self.failure_evidence_path = target
+        # This metadata receipt is NOT the required scenario diagnostic original.
+        # No verified content-free collector is bound here. Preserve the fixture
+        # rather than erase the only remaining failure evidence.
+        raise RuntimeError(
+            "INSTRUMENT_GAP: necessary scenario diagnostics not safely preserved; "
+            "cleanup stopped before deletion"
+        )
+
     def __enter__(self) -> "E2EClient":
         return self
 
     def __exit__(self, exc_type, exc, _tb) -> bool:
+        if self._release_run_id is not None:
+            try:
+                self._release_cleanup(failed=exc_type is not None or bool(self._preserve_reason))
+            finally:
+                self._http.close()
+            return False
         if exc_type is not None and not self._preserve_reason:
             self.preserve_failure(f"{exc_type.__name__}: {exc}")
         if self._preserve_reason:
@@ -644,13 +733,15 @@ class E2EClient:
         history for the same reason), and one dropped connection must not fail a
         whole P0 cell.
 
-        Retrying POSTs is safe for every path this client uses: both send paths
+        Logical idempotency does not imply zero provider cost on retry. both send paths
         carry a client_msg_id minted ONCE per logical send and reused across
         retries (/v1/chat/message and /v1/model_api/chat/send dedup on it);
-        setup is idempotent; reset is NOT (a retry after a lost 200 gets 401 —
+        setup may execute another provider self-test; reset is NOT (a retry after a lost 200 gets 401 —
         teardown resolves that via the key-independent admin oracle); verify_loop is a repeatable probe (each
         call may post a fresh hidden ping — harmless, GC'd server-side).
         (register does NOT ride this wrapper — provision uses its own client.)"""
+        if method.upper() == "POST" and path == "/v1/model_api/setup":
+            _retries = 1  # A lost response must not spend another setup probe.
         last: Exception | None = None
         for attempt in range(_retries):
             try:

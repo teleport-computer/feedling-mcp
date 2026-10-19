@@ -40,7 +40,7 @@ router = APIRouter()
 
 @router.get("/v1/identity/get")
 async def identity_get(auth: AuthResult = Depends(require_auth)):
-    body, status = await threadpool.run_db(identity_core.get_identity, auth.store)
+    body, status = await threadpool.run_db(identity_core.get_identity_strict, auth.store)
     return JSONResponse(body, status_code=status)
 
 

@@ -1,0 +1,4 @@
+eth-account==0.13.7
+PyYAML==6.0.3
+eth-abi==6.0.0
+eth-utils==6.0.0

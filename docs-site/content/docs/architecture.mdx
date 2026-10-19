@@ -7,6 +7,24 @@ canonical_owner: self
 
 import { ArchitectureDiagram } from '@/components/architecture-diagram';
 
+## Managed Genesis without an enclave URL
+
+The explicitly enabled Genesis worker in the V2 host can process uploaded or
+backfill jobs without an enclave URL only when effective write policy is off and
+all required inputs are locally readable plaintext. A serializable PostgreSQL
+snapshot binds chunks, authenticated provider credentials, persona, voice,
+identity and the complete relevant Garden. Sealed, foreign, malformed or
+unavailable dependencies leave the job uploaded without provider work.
+
+The worker commits an execution boundary before provider calls, then binds each
+artifact mutation to its private claim on the same database connection. Identity
+uses exact-document compare-and-swap, and Garden mutations reuse the existing
+per-user memory fence. Different artifacts commit separately: a later failure
+can leave earlier writes and usage records intact. Started or applying work is
+never automatically replayed after interruption. This plaintext path does not
+provide an enclave decryption or confidentiality guarantee. Configured-enclave,
+direct plaintext API threads and Resident queues retain their own execution paths.
+
 ## Synchronous agent body generation
 
 `POST /v1/agent-body/generate` returns a validated grid without saving a preset.
@@ -72,6 +90,27 @@ Self-hosted deployments can place the same logical components on one machine,
 but process separation on a generic host is not equivalent to a hardware-backed
 confidential-VM boundary. See [self-hosting](/docs/self-hosting) before choosing a
 deployment topology.
+
+### Hosted runtime admission and drain evidence
+
+Hosted Resident supervisors serialize lease acquisition and process startup with
+per-user Model API configuration mutations. They revalidate the active tested
+route and runtime generation before startup; configuration deletion cannot
+complete between that validation and process tracking. A process admitted before
+a later deletion is stopped by its owning supervisor. Its lease remains owned
+until that supervisor confirms exit; lease expiry alone is not an exit receipt.
+Deleting Model API configuration fences V2 work and removes routes, but is not a
+synchronous assertion that every previously admitted process has exited.
+
+Runtime V2 parent observations include process and slot generations, monotonic
+progress times, and explicit unknown states for missing or invalid snapshots.
+A new database heartbeat can still contain an old idle snapshot. Bounded test
+acceptance therefore requires a post-fence heartbeat, a later iteration from the
+same parent, and child idle progress after that later sample. The test harness
+uses this proof only for an explicitly reviewed exclusive test runner and all
+its configured pools; it does not certify unrelated shared runners. Missing,
+restarted, busy, or unknown execution evidence prevents account cleanup.
+These observations contain process metadata, not conversation content.
 
 ## Components and responsibilities
 
@@ -144,6 +183,13 @@ it does not create or configure the bucket or its lifecycle.
    turns whose history includes sealed rows keep the decrypt-service path.
 5. The runner wraps the assistant result in the effective write shape before
    it is persisted. The original send remains asynchronous and returns `202`.
+
+For effective plaintext accounts, the resident `io_cli identity-read` fetches
+its authenticated raw identity envelope from the API and projects the card on
+the resident host. It does not call the decrypt service for this content.
+Owner checks, local-only metadata handling, failed reads and legacy day-count
+compatibility are specified in [self-hosting](/docs/self-hosting). This does not
+change the behavior of other identity consumers or the doctor probes.
 
 The model provider is an external plaintext recipient. For encrypted records,
 envelope encryption protects persisted content and the storage path; it does not hide the prompt
@@ -815,6 +861,17 @@ broker shared across all children. All three pools still run inside one
 confidential VM and one service instance; process isolation limits a hung Job's
 failure domain but is not a sandbox for mutually hostile code.
 
+For Dream, the child uses the original post-claim monotonic start and the same
+slot budget supplied to the parent's watchdog. A task-local deadline reserves
+120 nominal seconds for cleanup; all model retries and re-asks consume its
+remaining time. This does not extend the Heavy slot's absolute limit or change
+its stall clock. The existing parent absolute-age calculation assumes a common
+host monotonic clock domain; this is not a distributed clock protocol. Explicit
+budget provenance separates a local deadline from an earlier provider failure.
+Database writes are not made atomic or safely cancelable by this timer, and
+existing watchdog recovery does not establish that Dream effects can be replayed
+without duplication. Pool topology and the enclave trust boundary are unchanged.
+
 Durable jobs, conversation state, reply cursors, ownership fences, deadlines,
 and terminal errors live in PostgreSQL. A watchdog restarts only the exact
 stalled slot, and PostgreSQL recovery settles that slot's exact claim before
@@ -1148,6 +1205,18 @@ backend returns HTTP 200 whenever its worker can serve the request. The enclave
 probe reports readiness, release, and TLS posture from cached boot state without
 doing any cryptography. A `degraded` result still returns HTTP 200.
 
+For the fixed managed test fleet only, Runtime V2's existing bounded heartbeat
+sampler also reports allowlisted process diagnostics through the authenticated
+admin metrics route: capture/recall flags from Linux initial process environments,
+release SHA, parent/child PIDs and start ticks, and namespace hostname. It samples
+only the worker and children identified by its supervisors; unavailable or
+inconsistent observations remain unknown. No full environment, command line,
+credential, or user content is published. These observations are not hardware
+attestation, a Docker container identifier, or proof of later environment mutation.
+The manual test collector checks fresh observations against the expected release
+and worker boot identity; a successful read does not authorize model calls or
+change runtime flags. Other fleet inventories do not publish these diagnostics.
+
 `GET /healthz/runner` runs its blocking heartbeat database query on a
 per-backend-worker executor with two worker threads and a four-call outstanding
 admission cap, separate from ordinary ASGI blocking work. Connection acquisition
@@ -1257,3 +1326,28 @@ model, performs no vector read and recall output is unchanged. When enabled:
   vector-contract error makes the whole turn use the unchanged lexical path; the
   content-free selection record carries the fallback reason and timings, never
   text or vectors.
+
+
+### Resident revision provenance
+
+Hosted supervisor heartbeats report the runner's declared image revision;
+Resident polls report a separately captured consumer startup revision and its
+source. Per-identity poll observations retain their own version and timestamp,
+including unknown or stale reports. These labels are not loaded-source
+attestations and cannot be replaced by the backend release or by a fresh
+supervisor heartbeat. See [version observations](/docs/self-hosting#resident-version-observations)
+for compatibility and process/container inheritance boundaries. This reporting
+uses the existing heartbeat payload and consumer-state storage; it adds no
+execution path or encryption trust boundary.
+
+
+### Plaintext automatic recall boundaries
+
+For an authenticated effective-off account, automatic recall has no enclave
+content fallback, including rollout `off`/`shadow`, old sealed input and local
+failure. Required turn content and subject ownership are validated separately
+from optional candidate payloads. An invalid same-owner candidate makes the
+whole recall result unavailable; an ownership, authorization, required-content
+or unknown shared-read failure stops the turn. See the [memory workflow](./workflows/memory)
+for fixed-frontier, unavailable-count and deadline behavior. Whoami public
+attestation metadata remains compatible and may still make network requests.

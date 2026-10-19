@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+from contextlib import nullcontext
 import hashlib
 import inspect
 import itertools
@@ -98,8 +99,11 @@ from core import provider_usage
 from agent_protocol_core import self_thinking
 from core import store as core_store
 from core import wake_bus as core_wake_bus
+from memory import recall_contract
+
 from memory import capture_failure
 from memory import extraction_trace as memory_extraction_trace
+from model_api_runtime.v2 import dream_budget
 from memory import dream_trace as memory_dream_trace
 from memory import garden_component
 from memgarden import timestamps as memory_timestamps
@@ -114,6 +118,7 @@ from perception.agent_fields import (
 )
 from perceptkit import prompts as perception_prompts
 from screen import screen_read_core
+from model_api_runtime.v2 import failure_provenance
 from model_api_runtime.v2 import wake_circuit
 from model_api_runtime.v2 import coalesce as v2_coalesce
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -257,6 +262,8 @@ def _session_only_parse(_reply: str) -> tuple[None, str]:
 
 async def _extract_with_provider_health(
     user_id: str,
+    *,
+    success_out: Callable[[float], None] | None = None,
     **kwargs: Any,
 ) -> tuple[Any, str | None]:
     started = time.monotonic()
@@ -266,9 +273,17 @@ async def _extract_with_provider_health(
         await _record_provider_failure(user_id, exc)
         raise
     _items, reason = result
+    deadline = kwargs.get("absolute_deadline")
+    if not reason and deadline is not None and time.monotonic() >= deadline:
+        result = (None, dream_budget.EXHAUSTED)
+        reason = dream_budget.EXHAUSTED
+    if reason == dream_budget.EXHAUSTED:
+        return result  # internal admission budget says nothing about route health
     provider_failure = v2_extraction.provider_failure_code_from_reason(reason or "")
     if provider_failure is not None and provider_failure != "content_filtered":
         await _record_provider_failure_class(user_id, provider_failure)
+    elif not reason and success_out is not None:
+        success_out((time.monotonic() - started) * 1000.0)
     else:
         # Policy refusal and parse/semantic rejection prove the route answered;
         # provider-health tracks route liveness, not card quality.
@@ -1872,7 +1887,9 @@ def _known_exception_detail(exc: BaseException) -> str:
 
 def _safe_failure_code(scope: str, exc: BaseException) -> str:
     """Stable plaintext error code that never embeds exception messages."""
-    if isinstance(exc, WorkspacePromptUnavailable):
+    if isinstance(exc, recall_contract.RecallFailure):
+        kind = "recall_binding_failed" if exc.category == "binding_error" else "required_content_unavailable"
+    elif isinstance(exc, WorkspacePromptUnavailable):
         kind = "workspace_prompt_unavailable"
     elif isinstance(exc, (DedicatedVisionUnavailable, ImageGenerationUnavailable)):
         candidate = str(exc.error_code or "")
@@ -1961,6 +1978,7 @@ _EXTRACTION_FAILURE_REASONS = frozenset(
         "capture_provider_call_cancelled",
         "capture_provider_fence_incomplete",
         "capture_provider_result_invalid",
+        "dream_turn_budget_exhausted",
         "dream_blast_radius_exceeded",
         "dream_context_unavailable",
         "dream_kernel_outdated",
@@ -2210,6 +2228,8 @@ class TurnDeps:
     # same-timestamp message during rollout.
     read_messages_after_seq: Callable[[str, int], list[dict]] | None = None
     read_context_memories: Callable[..., dict] | None = None
+    read_recall_mode: Callable[[str], str] | None = None
+    prepare_recall_attachments: Callable[..., dict] | None = None
     # Production chat preserves one visible reply per user message. Later sends
     # stay queued behind the current turn instead of being folded into it.
     ordered_chat_replies: bool = False
@@ -3211,7 +3231,7 @@ class _ProviderRoundtripTrace:
                 trace_id=self.trace_id,
                 **(
                     {"job_id": self.job_id}
-                    if event_kind == "error" and self.job_id
+                    if self.job_id
                     else {}
                 ),
                 status=(
@@ -3425,7 +3445,7 @@ def _turn_coordinates(lane, job_id, trace_id, attempt) -> dict:
             "attempt": int(attempt or 0)}
 
 
-async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coordinates=None):
+async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coordinates=None, *, required_rows=(), required_ids=(), prompt_through_seq=None, semaphore_held=False):
     """Best-effort selection with an explicit unavailable state, never fake 0.
 
     ``coordinates`` (optional) only labels diagnostics about this read; the
@@ -3436,14 +3456,51 @@ async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coo
     if coordinates is not None:
         kwargs["coordinates"] = coordinates
     try:
-        async with enclave_sem:
+        if getattr(deps, "prepare_recall_attachments", None) is not None:
+            from memory import plaintext_recall
+            deadline = time.monotonic() + plaintext_recall.local_timeout_seconds()
+            proofs = await asyncio.to_thread(
+                deps.prepare_recall_attachments, user_id, required_rows,
+                required_ids=required_ids, deadline=deadline)
+            for row in required_rows:
+                proof = proofs.get(row.get("id"))
+                if proof is not None:
+                    row["_recall_attachment_proof"] = proof
+            kwargs["deadline"] = deadline
+            kwargs["attachment_proofs"] = proofs
+            kwargs["source_snapshots"] = {
+                row["id"]: json.loads(row["_recall_source_json"])
+                for row in required_rows if isinstance(row.get("_recall_source_json"), str)
+            }
+        async with (nullcontext() if semaphore_held else enclave_sem):
             payload = await asyncio.to_thread(
                 deps.read_context_memories, user_id, **kwargs
             )
         if not isinstance(payload, dict):
             raise ValueError("context_memory_response_not_object")
+        if recall_contract.operation_mode(user_id) == "off" and payload.get("account_mode") != "off":
+            raise recall_contract.RecallFailure("recall_binding_invalid", category="binding_error")
+        if payload.get("account_mode") == "off":
+            recall_contract.validate_prompt_rows(required_rows, user_id, prompt_through_seq or through_seq,
+                                                required_ids=required_ids)
+            if not required_rows:
+                raise recall_contract.RecallFailure("turn_content_unconfirmed")
+            for row in required_rows:
+                proof = row.get("_recall_attachment_proof")
+                if proof is not None and row.get("id") == payload.get("message_id"):
+                    expected = {"id": proof.message_id, "seq": proof.seq,
+                                "sha256": hashlib.sha256(proof.body).hexdigest()}
+                    if expected not in (payload.get("required_attachments") or []):
+                        raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
+            if payload.get("user_id") != user_id or payload.get("seq") != through_seq:
+                raise recall_contract.RecallFailure("recall_binding_invalid", category="binding_error")
         return payload
+    except recall_contract.RecallFailure:
+        raise
     except Exception as exc:
+        if (recall_contract.operation_mode(user_id) == "off" or
+                any(isinstance(row.get("_recall_row_proof"), recall_contract.TurnRowProof) for row in required_rows)):
+            raise recall_contract.RecallFailure("recall_input_unconfirmed") from exc
         log.warning("[v2.memory] selection unavailable: %s", type(exc).__name__)
         return {}
 
@@ -6017,6 +6074,18 @@ async def _run_trajectory_review_turn(
         return "failed"
     except Exception as exc:  # noqa: BLE001 — offline lane: bounded retry, no user surface
         code = _safe_failure_code("trajectory_review_failed", exc)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id=str(job.get("trace_id") or ""),
+            exc=exc,
+            stage="trajectory_review",
+            lane="trajectory_review",
+            code=code,
+            classify=lambda: _turn_failure_error_class(exc),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         log.warning(
             "[v2.worker] trajectory review runner=%s source=%s failed code=%s",
             job_id,
@@ -8907,6 +8976,7 @@ async def _read_seq_adaptive_prompt_context(
     active_image_ids: set[str] | None = None,
     vision_fallback_state: VisionFallbackState | None = None,
     tail_cap: int | None = None,
+    before_media=None,
 ) -> tuple[str, list[dict], list[list[dict]], bool, int, str, str, str]:
     """Read one exact core plus summary-covered complete-turn replay.
 
@@ -8980,6 +9050,21 @@ async def _read_seq_adaptive_prompt_context(
                 watermark_seq=watermark_seq,
                 required_tail=tail,
             )
+        if before_media is not None:
+            # The raw prompt rows still carry reader-created content proofs.
+            # Complete required-content and candidate-owner checks before any
+            # dedicated image observer can dispatch a provider request.
+            await before_media([*_flatten_turns(optional_tail_turns), *tail], True)
+        tail = await asyncio.to_thread(
+            _inject_tail_files,
+            tail,
+            user_id=user_id,
+            read_files=deps.read_files,
+        )
+        optional_rows = _flatten_turns(optional_tail_turns)
+        if optional_rows:
+            optional_rows = await asyncio.to_thread(
+                _inject_tail_files, optional_rows, user_id=user_id, read_files=deps.read_files)
         tail = await asyncio.to_thread(
             _inject_tail_images,
             tail,
@@ -8991,16 +9076,10 @@ async def _read_seq_adaptive_prompt_context(
             vision_fallback_state=vision_fallback_state,
             emit_debug_trace=deps.emit_debug_trace,
         )
-        tail = await asyncio.to_thread(
-            _inject_tail_files,
-            tail,
-            user_id=user_id,
-            read_files=deps.read_files,
-        )
         if optional_tail_turns:
             optional_rows = await asyncio.to_thread(
                 _inject_tail_images,
-                _flatten_turns(optional_tail_turns),
+                optional_rows,
                 user_id=user_id,
                 read_images=deps.read_images,
                 active_image_ids=active_image_ids,
@@ -9008,12 +9087,6 @@ async def _read_seq_adaptive_prompt_context(
                 main_provider_config=provider_config,
                 vision_fallback_state=vision_fallback_state,
                 emit_debug_trace=deps.emit_debug_trace,
-            )
-            optional_rows = await asyncio.to_thread(
-                _inject_tail_files,
-                optional_rows,
-                user_id=user_id,
-                read_files=deps.read_files,
             )
             optional_tail_turns = _group_complete_turns(optional_rows)
     profile_selection = await _select_profile_prompt_for_turn(
@@ -9224,6 +9297,18 @@ async def _run_compaction(
         return "failed"
     except Exception as exc:  # noqa: BLE001 — maintenance stays user-invisible
         code = _safe_failure_code("compaction_failed", exc)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id="",
+            exc=exc,
+            stage="compaction",
+            lane="maintenance",
+            code=code,
+            classify=lambda: _turn_failure_error_class(exc),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
@@ -9840,6 +9925,18 @@ async def _run_wake(
         user_profile = ""
         coverage_hole_notice = ""
         wake_snapshot_seq = 0
+        turn_memory_payload = None
+
+        async def _validate_wake_before_media(raw_rows, semaphore_held=False):
+            nonlocal turn_memory_payload
+            if turn_memory_payload is None:
+                turn_memory_payload = await _load_turn_memory_context(
+                    deps, user_id, wake_snapshot_seq, enclave_sem,
+                    coordinates=_turn_coordinates(lane, job_id, trace_id, attempt_count),
+                    required_rows=raw_rows, semaphore_held=semaphore_held)
+            elif turn_memory_payload.get("account_mode") == "off":
+                recall_contract.validate_prompt_rows(raw_rows, user_id, wake_snapshot_seq)
+
         compact_through_seq = None
         if seq_context:
             wake_snapshot_seq = await asyncio.to_thread(
@@ -9879,6 +9976,7 @@ async def _run_wake(
                 deps=deps,
                 through_seq=wake_snapshot_seq,
                 target_turns=_WAKE_TAIL_MAX_TURNS,
+                before_media=_validate_wake_before_media,
                 provider_config=provider_config,
                 enclave_sem=enclave_sem,
                 claimed_by=claimed_by,
@@ -11539,10 +11637,8 @@ async def _run_wake(
                     type(exc).__name__.lower(),
                 )
 
-        turn_memory_payload = await _load_turn_memory_context(
-            deps, user_id, wake_snapshot_seq, enclave_sem,
-            coordinates=_turn_coordinates(lane, job_id, trace_id, attempt_count),
-        )
+        if turn_memory_payload is None:
+            await _validate_wake_before_media(wake_tail)
         turn_memory_observation: dict = {}
 
         wake_reply_language = infer_reply_language(
@@ -11640,6 +11736,7 @@ async def _run_wake(
                     deps=deps,
                     through_seq=wake_snapshot_seq,
                     target_turns=_WAKE_TAIL_MAX_TURNS,
+                before_media=_validate_wake_before_media,
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -11946,6 +12043,18 @@ async def _run_wake(
         return "completed"
     except Exception as e:  # noqa: BLE001 — scheduled failures surface below
         code = _safe_failure_code("wake_failed", e)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id=trace_id,
+            exc=e,
+            stage="wake",
+            lane=lane,
+            code=code,
+            classify=lambda: _turn_failure_error_class(e),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
@@ -12749,6 +12858,36 @@ async def _emit_v2_dream_context_error(
         )
 
 
+async def _settle_dream_budget(
+    job_id, user_id, claimed_by, deps, tm, trace_id="", *,
+    counts=None, degraded_context=False, model_active=False,
+) -> str:
+    """A budget result is terminal only when this owner wins the durable fence."""
+    code = f"extraction_failed:{dream_budget.EXHAUSTED}"
+    owned = await asyncio.to_thread(
+        jobs_store.mark_failed, job_id, code, claimed_by=claimed_by
+    )
+    if not owned:
+        return dream_budget.LEASE_LOST
+    budget = dream_budget.current.get()
+    if model_active:
+        await _emit_v2_dream_lifecycle(
+            deps, user_id, "memory.dream.model.error", job_id=str(job_id), trace_id=trace_id,
+            status="error", outcome="budget_exhausted",
+            started_at=budget.start if budget is not None else time.monotonic(),
+            degraded_context=degraded_context, counts=counts or {},
+        )
+    await _emit_v2_dream_lifecycle(
+        deps, user_id, "memory.dream.error", job_id=str(job_id), trace_id=trace_id,
+        status="error", outcome="budget_exhausted",
+        started_at=budget.start if budget is not None else time.monotonic(),
+        degraded_context=degraded_context, counts=counts or {},
+    )
+    if tm is not None:
+        tm.flush(failed=True, status=code)
+    return "failed"
+
+
 async def _run_extraction(
     job_id,
     user_id: str,
@@ -12769,13 +12908,34 @@ async def _run_extraction(
     """
     extraction_status_recorded = False
     extraction_failure_detail: dict[str, Any] = {}
+    provider_failure_snapshot: dict[str, Any] | None = None
+    returned_provider_error: RuntimeError | None = None
+
+    def _observe_provider_failure(exc: BaseException, code: str) -> None:
+        nonlocal provider_failure_snapshot
+        # Pure, bounded projection only: no emitter/store lookup or retained
+        # exception. The existing turn_exception event owns any later I/O.
+        provider_failure_snapshot = failure_provenance.build_detail(
+            exc, stage="extraction_provider", lane=lane,
+            code=f"extraction_failed:{code}", error_class=code,
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
+
     capture_window: dict[str, Any] = {}
     dream_started = time.monotonic()
     dream_counts: dict[str, int] = {}
+    pending_provider_success: list[float] = []
+
+    async def _finish_provider_success() -> None:
+        if pending_provider_success:
+            latency = pending_provider_success.pop()
+            await _record_provider_success(user_id, latency_ms=latency)
+
     dream_degraded_context = False
     dream_stage = "context"
     dream_terminal_outcome = "failed"
     dream_model_attempts = 0
+    dream_model_active = False
     dream_context_reader_failed = False
     # Kernel verdict reason when Dream legitimately had nothing to consolidate
     # (the garden is below memgarden's minimum). "" = a real run.
@@ -13393,6 +13553,7 @@ async def _run_extraction(
                         v2_extraction.CAPTURE_TRUNCATION_MAX_ATTEMPTS
                     ),
                     failure_detail_out=extraction_failure_detail.update,
+                    provider_failure_observer=_observe_provider_failure,
                     progress_cb=lambda stage, attempt: _report_turn_progress(
                         f"extraction_provider_{stage}_{attempt}"
                     ),
@@ -13511,6 +13672,12 @@ async def _run_extraction(
                 await _ensure_capture_not_halted("legacy_provider_call")
                 items, reason = await _invoke_capture_provider()
         elif lane != "capture":
+            if dream_budget.exhausted():
+                return await _settle_dream_budget(
+                    job_id, user_id, claimed_by, deps, tm, trace_id,
+                    counts=dream_counts, degraded_context=dream_degraded_context,
+                    model_active=dream_model_active,
+                )
             dream_stage = "model"
             await _emit_v2_dream_lifecycle(
                 deps,
@@ -13524,6 +13691,7 @@ async def _run_extraction(
                 degraded_context=dream_degraded_context,
                 counts=dream_counts,
             )
+            dream_model_active = True
             _report_turn_progress("extraction_provider_start")
             # dream 也走组件的会话（见上面 open_dream_session 那段）；
             # prompt/parse/parse_retry 只是占位，会话模式下 extract() 不看它们。
@@ -13535,6 +13703,10 @@ async def _run_extraction(
                 parse_retry=parse_retry,
                 session=_capture_session,
                 step_sink=_step_sink,
+                **({"success_out": pending_provider_success.append}
+                   if lane == "dream" and dream_budget.current.get() is not None else {}),
+                **({"absolute_deadline": dream_budget.current.get().provider_deadline}
+                   if lane == "dream" and dream_budget.current.get() is not None else {}),
                 timeout_sec=v2_extraction.wire_deadline_for_lane(lane),
                 wire_deadline_sec=v2_extraction.wire_deadline_for_lane(lane),
                 max_tokens=v2_extraction.max_output_tokens_for_lane(lane),
@@ -13542,6 +13714,7 @@ async def _run_extraction(
                     v2_extraction.truncation_retry_max_output_tokens_for_lane(lane)
                 ),
                 failure_detail_out=extraction_failure_detail.update,
+                provider_failure_observer=_observe_provider_failure,
                 progress_cb=lambda stage, attempt: _report_turn_progress(
                     f"extraction_provider_{stage}_{attempt}"
                 ),
@@ -13578,6 +13751,14 @@ async def _run_extraction(
                      "truncated_cards": len(dream_disclosure.truncated_ids)},
                     best_effort=True,
                 )
+        if lane == "dream" and (
+            reason == dream_budget.EXHAUSTED or (not reason and dream_budget.exhausted())
+        ):
+            return await _settle_dream_budget(
+                job_id, user_id, claimed_by, deps, tm, trace_id,
+                counts=dream_counts, degraded_context=dream_degraded_context,
+                model_active=dream_model_active,
+            )
         if lane == "dream" and dream_skip_reason:
             await _complete_extraction(item_count=0, skip_reason=dream_skip_reason)
             await _emit_v2_dream_lifecycle(
@@ -13595,6 +13776,7 @@ async def _run_extraction(
             dream_terminal_emitted = True
             if tm is not None:
                 tm.flush(failed=False, status="dream_skipped")
+            await _finish_provider_success()
             return "completed"
         if reason:
             if lane == "dream":
@@ -13611,8 +13793,18 @@ async def _run_extraction(
                     degraded_context=dream_degraded_context,
                     counts=dream_counts,
                 )
-            raise RuntimeError(reason)
+            failure = RuntimeError(reason)
+            if (
+                provider_failure_snapshot is not None
+                and v2_extraction.provider_failure_code_from_reason(reason) is not None
+                and provider_failure_snapshot["error_code"] == _extraction_failure_code(failure)
+            ):
+                # Bind the exact exception raised for this returned reason.
+                # A health/usage/lifecycle error with the same code is different.
+                returned_provider_error = failure
+            raise failure
         if lane == "dream":
+            dream_model_active = False
             await _emit_v2_dream_lifecycle(
                 deps,
                 user_id,
@@ -13631,6 +13823,12 @@ async def _run_extraction(
         # 2026-08-05 复盘拆掉了这里的逐提案语义审查(弱模型自审自查既误放也误杀,
         # 每条提案还多烧一次 BYOK 调用)。出口防线现在全部是确定性的:parse 层的
         # 内容闸+卡id泄漏闸、mapper 的结构判据、下方的爆炸半径保险丝。
+        if lane == "dream" and dream_budget.exhausted():
+            return await _settle_dream_budget(
+                job_id, user_id, claimed_by, deps, tm, trace_id,
+                counts=dream_counts, degraded_context=dream_degraded_context,
+                model_active=dream_model_active,
+            )
         if not items and lane != "capture":
             await _complete_extraction(item_count=0)
             await _emit_v2_dream_lifecycle(
@@ -13648,6 +13846,7 @@ async def _run_extraction(
             dream_terminal_emitted = True
             if tm is not None:
                 tm.flush(failed=False, status="ok")
+            await _finish_provider_success()
             return "completed"
 
         if lane == "dream":
@@ -13860,6 +14059,12 @@ async def _run_extraction(
             return "completed"
 
         if lane == "dream":
+            if dream_budget.exhausted():
+                return await _settle_dream_budget(
+                    job_id, user_id, claimed_by, deps, tm, trace_id,
+                    counts=dream_counts, degraded_context=dream_degraded_context,
+                    model_active=dream_model_active,
+                )
             dream_stage = "write"
         write_result = await asyncio.to_thread(
             deps.apply_memory_actions, user_id, actions
@@ -13923,6 +14128,7 @@ async def _run_extraction(
             dream_terminal_emitted = True
         if tm is not None:
             tm.flush(failed=False, status="ok")
+        await _finish_provider_success()
         return "completed"
     except LostJobLease:
         # A stale owner must not mutate Capture state/backoff or replace the
@@ -13964,6 +14170,7 @@ async def _run_extraction(
             tm.flush(failed=True, status="turns_halted")
         return "failed"
     except Exception as e:  # noqa: BLE001 — 背景 job：静默 mark_failed，绝不 surface/写气泡
+        await _finish_provider_success()
         code = _extraction_failure_code(e)
         if lane == "dream" and not dream_terminal_emitted:
             if dream_terminal_outcome == "failed":
@@ -14001,6 +14208,8 @@ async def _run_extraction(
             "error_code": code,
         }
         failure_payload.update(extraction_failure_detail)
+        if e is returned_provider_error and provider_failure_snapshot is not None:
+            failure_payload["provider_failure"] = provider_failure_snapshot
         await _record_trajectory(
             trajectory_recorder,
             "turn_exception",
@@ -14140,6 +14349,24 @@ def _inject_tail_images(
     so a later turn never re-sends old pixels or repeats a paid observer call.
     """
     active_ids = set(active_image_ids or ())
+    from memory import recall_attachments
+    proofs = {}
+    for row in tail:
+        mid = str(row.get("id") or "")
+        if mid in active_ids and row.get("has_image") and row.get("_recall_row_proof") is not None:
+            proof = row.get("_recall_attachment_proof")
+            if not isinstance(proof, recall_attachments.AttachmentProof):
+                raise recall_contract.RecallFailure("attachment_unconfirmed")
+            proofs[mid] = proof
+
+    def bound_images(ids):
+        result = {mid: recall_attachments.image_payload(proofs[mid], user_id, mid)
+                  for mid in ids if mid in proofs}
+        remaining_ids = [mid for mid in ids if mid not in proofs]
+        if remaining_ids and read_images is not None:
+            result.update(read_images(user_id, remaining_ids) or {})
+        return result
+
 
     def image_items(payload: dict | None) -> list[dict]:
         if not isinstance(payload, dict):
@@ -14176,6 +14403,7 @@ def _inject_tail_images(
         {
             "message_id": str(row["id"]),
             "route_id": str(row.get("vision_route_id") or ""),
+            **({"_recall_attachment_proof": proofs[str(row["id"])]} if str(row["id"]) in proofs else {}),
         }
         for row in targets
         if str(row.get("vision_route_id") or "")
@@ -14332,7 +14560,7 @@ def _inject_tail_images(
             try:
                 # Deliberate second read: this is the auditable disclosure gate.
                 # Successful dedicated targets are absent from this exact list.
-                fallback_fetched = read_images(user_id, selected_ids) or {}
+                fallback_fetched = bound_images(selected_ids)
             except Exception:  # noqa: BLE001 — preserve dedicated identity
                 raise_dedicated("vision fallback image read failed")
             if any(
@@ -14361,7 +14589,7 @@ def _inject_tail_images(
     fetched: dict[str, dict] = {}
     if wanted and read_images is not None:
         try:
-            fetched = read_images(user_id, wanted) or {}
+            fetched = bound_images(wanted)
         except Exception as exc:  # noqa: BLE001 — preserve follow-main behavior
             log.warning("[v2.worker] read_images failed for %s: %s", user_id, exc)
 
@@ -14445,14 +14673,23 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
     让模型不会误以为自己已经读过附件。两种情况都不产生 UI error chip。
     """
     if read_files is None:
+        if any(r.get("has_file") and r.get("_recall_row_proof") is not None for r in tail):
+            raise recall_contract.RecallFailure("attachment_read_failed")
         return tail
     targets = [r for r in tail if r.get("has_file") and r.get("id")]
     if not targets:
         return tail
     wanted = [str(r["id"]) for r in targets[-_TAIL_FILE_LIMIT:]]
+    proofs = {str(row["id"]): row["_recall_attachment_proof"] for row in targets
+              if row.get("_recall_attachment_proof") is not None and str(row["id"]) in wanted}
+    if any(row.get("_recall_row_proof") is not None and str(row["id"]) in wanted
+           and str(row["id"]) not in proofs for row in targets):
+        raise recall_contract.RecallFailure("attachment_unconfirmed")
     try:
-        fetched = read_files(user_id, wanted) or {}
+        fetched = (read_files(user_id, wanted, proofs=proofs) if proofs else read_files(user_id, wanted)) or {}
     except Exception as e:  # noqa: BLE001
+        if proofs:
+            raise recall_contract.RecallFailure("attachment_read_failed") from e
         log.warning("[v2.worker] read_files failed for %s: %s", user_id, e)
         return tail
 
@@ -14461,6 +14698,8 @@ def _inject_tail_files(tail: list[dict], *, user_id: str, read_files) -> list[di
         got = fetched.get(str(row.get("id"))) if row.get("has_file") else None
         text = str((got or {}).get("text") or "")
         error = str((got or {}).get("error") or "")
+        if str(row.get("id")) in proofs and (error or not text):
+            raise recall_contract.RecallFailure("attachment_read_failed")
         if error:
             marker = core_util.text_of(row.get("content")) or "[file]"
             out.append(
@@ -14656,6 +14895,7 @@ async def process_job(
     )
     provider_reply_signal = _ProviderReplySignal()
 
+    recall_mode_token = None
     try:
         if not claimed_by or not await asyncio.to_thread(
             jobs_store.mark_running, job_id, claimed_by=claimed_by
@@ -14664,6 +14904,7 @@ async def process_job(
         lease_keepalive_task = asyncio.create_task(
             _keep_active_job_lease(job_id, claimed_by, lease_keepalive_stop)
         )
+
 
         async def _renew_lease() -> None:
             if not await asyncio.to_thread(
@@ -14745,6 +14986,16 @@ async def process_job(
             )
 
         await _ensure_runtime_mode()
+
+        if lane in {"chat", "heartbeat", "scheduled", "manual_wake", "screen_watch"} and deps.read_recall_mode is not None:
+            try:
+                mode = await asyncio.to_thread(deps.read_recall_mode, user_id)
+                recall_mode_token = recall_contract.bind_operation_mode(user_id, mode)
+            except recall_contract.RecallFailure:
+                raise
+            except Exception as exc:
+                raise recall_contract.RecallFailure("account_unconfirmed") from exc
+
 
         if lane == "maintenance":
             # 自成一体的压缩路径：自己的 try/except（见 `_run_compaction`），绝不落到本
@@ -15051,6 +15302,25 @@ async def process_job(
             tm.flush(failed=False, status=jobs_store.CHAT_TURN_STATUS_OK)
             return "completed"
 
+        turn_memory_payload = None
+
+        async def _validate_chat_before_media(raw_rows, semaphore_held=False):
+            nonlocal turn_memory_payload
+            required = [*raw_rows, *coalesced]
+            if turn_memory_payload is None:
+                turn_memory_payload = await _load_turn_memory_context(
+                    deps, user_id, cursor_seq, enclave_sem,
+                    coordinates=_turn_coordinates(
+                        lane, job["id"], job.get("trace_id"), job.get("attempt_count")),
+                    required_rows=required,
+                    required_ids=[row["id"] for row in coalesced],
+                    prompt_through_seq=max(int(cursor_seq), int(through_seq)),
+                    semaphore_held=semaphore_held)
+            elif turn_memory_payload.get("account_mode") == "off":
+                recall_contract.validate_prompt_rows(
+                    required, user_id, max(int(cursor_seq), int(through_seq)),
+                    required_ids=[row["id"] for row in coalesced])
+
         # Load after recovery and empty-input finalization so a workspace outage
         # cannot block a reply that was already committed by a previous worker.
         # It still precedes every provider/prompt-coverage call, preventing an
@@ -15208,6 +15478,7 @@ async def process_job(
                 deps=deps,
                 through_seq=through_seq,
                 target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
+                before_media=_validate_chat_before_media,
                 provider_config=provider_config,
                 enclave_sem=enclave_sem,
                 claimed_by=claimed_by,
@@ -15229,6 +15500,7 @@ async def process_job(
                 )
         else:
             summary, tail = "", []
+            await _validate_chat_before_media([])
 
         # World Book is independently rebuilt from authoritative entries and a
         # frozen real-chat window, never from the compacted/budgeted replay.
@@ -16952,11 +17224,7 @@ async def process_job(
         if ordered_chat_replies:
             turn_trusted_system_blocks += (context.ORDERED_REPLY_TARGET_POLICY,)
 
-        turn_memory_payload = await _load_turn_memory_context(
-            deps, user_id, cursor_seq, enclave_sem,
-            coordinates=_turn_coordinates(
-                lane, job["id"], job.get("trace_id"), job.get("attempt_count")),
-        )
+
         turn_memory_observation: dict = {}
 
         caption_probe = _AttachmentCaptionProbe()
@@ -17050,6 +17318,7 @@ async def process_job(
                     deps=deps,
                     through_seq=through_seq,
                     target_turns=_CHAT_TAIL_ANCHOR_MAX_TURNS,
+                before_media=_validate_chat_before_media,
                     provider_config=provider_config,
                     enclave_sem=enclave_sem,
                     claimed_by=claimed_by,
@@ -17580,6 +17849,18 @@ async def process_job(
                     ),
                 )
         message = _safe_failure_code("turn_failed", failure_exc)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id=str(job.get("trace_id") or ""),
+            exc=e,
+            stage="chat",
+            lane=lane,
+            code=message,
+            classify=lambda: _turn_failure_error_class(failure_exc),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         # A registered exception code (e.g. generated_image_too_large) is the
         # only clue to WHICH check raised; "turn_failed:valueerror" alone cost a
         # day on usr_7f30 (T620). Anything outside the allowlist is dropped —
@@ -17648,6 +17929,8 @@ async def process_job(
         tm.flush(failed=True, status=message)
         return "failed"
     finally:
+        if recall_mode_token is not None:
+            recall_contract.reset_operation_mode(recall_mode_token)
         lease_keepalive_stop.set()
         if lease_keepalive_task is not None:
             lease_keepalive_task.cancel()
@@ -17724,6 +18007,8 @@ async def _run_turn(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     # Execution only; queue-inclusive elapsed time is terminal.ts - enqueued.ts.
     started_ns = time.monotonic_ns()
     outcome = await _run_turn_body(job, deps, enclave_sem=enclave_sem)
+    if outcome == dream_budget.LEASE_LOST:
+        return outcome
     # Deliberately NOT a finally: a finally also runs for CancelledError and for
     # any unhandled BaseException, and would then emit outcome="failed" for a
     # turn that was merely drained -- inventing a failure that never happened.
@@ -17880,6 +18165,10 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
     claimed_by = str(job.get("claimed_by") or "")
     lane = str(job.get("lane") or "chat")
     tm = TurnMetrics(job_id=job_id, user_id=user_id, lane=lane)
+    if lane == "dream" and dream_budget.exhausted():
+        return await _settle_dream_budget(
+            job_id, user_id, claimed_by, deps, tm, str(job.get("trace_id") or "")
+        )
 
     async def _settle_legacy_traced_chat_failure(code: str) -> None:
         trace_id = str(job.get("trace_id") or "")
@@ -18264,6 +18553,8 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
             tm=tm,
             trajectory_recorder=recorder,
         )
+        if outcome == dream_budget.LEASE_LOST:
+            return outcome
         await _record_trajectory(
             recorder,
             "turn_terminal",
@@ -18275,6 +18566,18 @@ async def _run_turn_body(job: dict, deps: TurnDeps, *, enclave_sem=None) -> str:
         raise
     except Exception as e:  # noqa: BLE001 — claimed work must always terminalize visibly
         message = _safe_failure_code("turn_setup_failed", e)
+        await failure_provenance.observe(
+            deps.emit_debug_trace,
+            user_id=user_id,
+            job_id=job_id,
+            trace_id=str(job.get("trace_id") or ""),
+            exc=e,
+            stage="setup",
+            lane=lane,
+            code=message,
+            classify=lambda: _turn_failure_error_class(e),
+            public_codes=PUBLIC_FAILURE_CODES,
+        )
         await _record_trajectory(
             recorder,
             "turn_exception",
@@ -18393,6 +18696,7 @@ async def _slot_loop(
     slot_generation: str = "g0",
     progress_cb: "Callable[[slot_protocol.SlotProgress], None] | None" = None,
     enclave_sem=None,
+    turn_absolute_budget_sec: float | None = None,
 ) -> None:
     """一个 job-slot：抢一个 job 就跑一回合，抢不到就等待（poll_interval 兜底，
     wake_event 命中时立刻醒——见 `_wait_for_job_or_stop`）。stop_event 置位后不再抢新活，
@@ -18486,12 +18790,17 @@ async def _slot_loop(
                 _signal_progress(stage, turn_start)
 
             progress_token = _TURN_PROGRESS_CB.set(_active_turn_progress)
+            budget_token = dream_budget.current.set(
+                dream_budget.from_start(turn_start, turn_absolute_budget_sec)
+                if active_job.lane == "dream" and turn_absolute_budget_sec is not None else None
+            )
             try:
                 if enclave_sem is None:
                     await _run_turn(job, deps)
                 else:
                     await _run_turn(job, deps, enclave_sem=enclave_sem)
             finally:
+                dream_budget.current.reset(budget_token)
                 _TURN_PROGRESS_CB.reset(progress_token)
             _signal_progress("durable_completion", turn_start)
             active_job = None

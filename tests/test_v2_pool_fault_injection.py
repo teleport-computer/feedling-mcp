@@ -37,6 +37,7 @@ def _fleet_fault_target(
     slot_id,
     _lanes,
     _db_pool_max,
+    _turn_absolute_budget_sec,
     events,
     slot_generation,
 ) -> None:

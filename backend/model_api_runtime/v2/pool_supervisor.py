@@ -9,6 +9,7 @@ from typing import Callable
 
 from model_api_runtime.v2 import (
     child_supervisor,
+    dream_budget,
     enclave_broker,
     pool_config,
     slot_protocol,
@@ -39,6 +40,8 @@ class SlotFleet:
         self._specs: dict[SlotKey, pool_config.SlotSpec] = {}
         self._supervisors: dict[SlotKey, child_supervisor.ChildSupervisor] = {}
         for spec in config.slots:
+            if "dream" in spec.lanes:
+                dream_budget.validate_slot_budget(spec.absolute_budget_sec)
             key = SlotKey(spec.pool, spec.index)
             self._specs[key] = spec
             self._supervisors[key] = supervisor_factory(
@@ -51,6 +54,7 @@ class SlotFleet:
                     spec.slot_id,
                     tuple(sorted(spec.lanes)),
                     int(db_pool_max),
+                    float(spec.absolute_budget_sec),
                 ),
                 broker=broker,
                 pool=spec.pool,

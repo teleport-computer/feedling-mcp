@@ -268,6 +268,33 @@ class ChildSupervisor:
             "current_turn_stall_age_sec": current_turn_stall_age_sec,
         }
 
+    def drain_witness(self) -> dict:
+        """Content-free process/slot evidence; absence is unknown, never idle.
+
+        Parent and child use the same host's system-wide monotonic clock. The
+        consumer must establish a causal post-fence baseline before comparing
+        progress_monotonic; a fresh DB heartbeat alone is not that baseline.
+        """
+        with self._lock:
+            proc, snapshot = self._proc, self._snapshot
+            valid = (proc is not None and proc.is_alive() and snapshot is not None
+                     and snapshot.slot_id == self._slot_id
+                     and snapshot.slot_generation == self._slot_generation)
+            state = 'unknown'
+            if valid:
+                if snapshot.active_job is not None:
+                    state = 'busy'
+                elif snapshot.stage == 'idle':
+                    state = 'idle'
+            return {
+                'slot_id': self._slot_id,
+                'slot_generation': self._slot_generation,
+                'pid': None if proc is None else proc.pid,
+                'sample_monotonic': time.monotonic(),
+                'progress_monotonic': snapshot.monotonic_at if valid else None,
+                'state': state,
+            }
+
     def snapshot(self) -> slot_protocol.SlotProgress | None:
         """Return the immutable latest snapshot for this one-slot child."""
         with self._lock:

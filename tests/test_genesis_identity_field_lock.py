@@ -97,7 +97,7 @@ def test_locked_identity_fields_are_not_overlaid():
 
 
 def test_whole_card_fail_safe_returns_locked_without_write(monkeypatch):
-    monkeypatch.setattr(identity_service, "_load_identity", lambda _store: {"id": "identity"})
+    monkeypatch.setattr(genesis_service.db, "get_blob_strict", lambda _uid, _kind: {"id": "identity"})
     monkeypatch.setattr(
         genesis_service,
         "_existing_identity_plain_for_update",
@@ -134,7 +134,7 @@ def test_final_identity_write_applies_only_unlocked_fields(monkeypatch):
     encrypted_plaintexts: list[dict] = []
     saved: list[dict] = []
     audits: list[dict] = []
-    monkeypatch.setattr(identity_service, "_load_identity", lambda _store: dict(snapshot))
+    monkeypatch.setattr(genesis_service.db, "get_blob_strict", lambda _uid, _kind: dict(snapshot))
     monkeypatch.setattr(
         genesis_service,
         "_existing_identity_plain_for_update",

@@ -503,6 +503,8 @@ def _safe_job_metadata(metadata: Any) -> dict:
     for key, value in metadata.items():
         name = str(key or "").strip()
         lower = name.lower()
+        if lower.startswith("managed_worker_"):
+            continue
         if (
             name in SAFE_JOB_METADATA_KEYS
             or lower.endswith("_hash")
@@ -1010,7 +1012,13 @@ def finalize_upload(store: UserStore, job_id: str) -> tuple[dict, list[int]]:
     if missing:
         write_genesis_state(store, {**job, "status": "uploading"})
         return job, missing
-    finalized = db.genesis_mark_finalized(store.user_id, job_id) or job
+    finalized = db.genesis_mark_finalized(store.user_id, job_id)
+    if finalized is None:
+        current = db.genesis_get_job(store.user_id, job_id) or job
+        import genesis_managed_store as managed_store
+        if managed_store.MARKER in (current.get("metadata") or {}):
+            raise managed_store.ClaimRejected("managed_claim_requires_outputs")
+        finalized = current
     write_genesis_state(store, finalized, status="uploaded")
     return finalized, []
 
@@ -1023,9 +1031,14 @@ def mark_failed(
     # can use its status_code/type instead of only re-parsing `error`'s text.
     # V2 note: pre's serve-worker/daemon.py equivalent should pass its own
     # caught exception through the same way when it lands this call.
-    job = db.genesis_set_job_status(store.user_id, job_id, status=FAILED_JOB_STATUS, error=error)
+    job = db.genesis_set_job_status(store.user_id, job_id, status=FAILED_JOB_STATUS, error=error, reject_managed=True)
     if job:
         write_genesis_state(store, job, status=FAILED_JOB_STATUS, exc=exc)
+    else:
+        import genesis_managed_store as managed_store
+        current = db.genesis_get_job(store.user_id, job_id)
+        if managed_store.MARKER in ((current or {}).get("metadata") or {}):
+            return None
     # emit unconditionally: only needs store + job_id + error, not the job row
     # (a race where the job row is already gone shouldn't silence the notice).
     ec = catalog.classify_upstream(error) or "genesis_failed"
@@ -1530,12 +1543,27 @@ def _identity_payload_from_existing_plain(identity: dict | None) -> dict:
     return payload
 
 
+def _identity_snapshot_for_write(store: UserStore) -> dict | None:
+    """Only a successful missing-row lookup permits Genesis initialization.
+
+    Keep this strict read scoped to Genesis writers; other legacy readers still
+    have their own best-effort contracts. Never include stored content in errors.
+    """
+    stored = db.get_blob_strict(store.user_id, "identity")
+    if stored is not None and (not isinstance(stored, dict) or not stored):
+        raise ValueError("identity_snapshot_invalid")
+    return stored
+
+
 def _existing_identity_plain_for_update(
     store: UserStore,
     api_key: str | None,
     runtime_token: str = "",
+    *,
+    stored: dict | None = None,
 ) -> tuple[dict | None, str]:
-    stored = identity_service._load_identity(store)
+    if stored is None:
+        stored = identity_service._load_identity(store)
     shape = core_envelope.classify_envelope_shape(stored)
     if shape in ("plaintext_text", "plaintext_binary"):
         try:
@@ -1579,20 +1607,23 @@ def init_identity_if_absent(
     output: dict,
     api_key: str | None = None,
     runtime_token: str = "",
+    *, managed=None,
 ) -> str:
-    existing = identity_service._load_identity(store)
+    existing = managed.read_identity() if managed else _identity_snapshot_for_write(store)
     payload = _identity_payload_from_output(output)
     if not payload:
         return "not_provided"
 
     base_payload = {"agent_name": "", "self_introduction": "", "dimensions": []}
     if existing:
-        existing_plain, err = _existing_identity_plain_for_update(
-            store, api_key, runtime_token)
+        existing_plain, err = ((managed.identity_plain(existing), "") if managed else
+                               _existing_identity_plain_for_update(store, api_key, runtime_token, stored=existing))
         if existing_plain is not None:
             base_payload = _identity_payload_from_existing_plain(existing_plain)
-        elif str(existing.get("relationship_anchor_source") or "") != GENESIS_SOURCE:
-            return "already_initialized"
+        else:
+            # An existing but unreadable card is never an empty base payload,
+            # regardless of who originally created it.
+            return "identity_plain_unavailable"
 
     # Genesis owns the derived name/dimensions. Preserve the profile fields that
     # the live agent writes after respawn, especially self_introduction/signature.
@@ -1629,7 +1660,7 @@ def init_identity_if_absent(
     )
     if len(evidence) < 8:
         evidence = f"{GENESIS_SOURCE}:derived from uploaded import"
-    envelope, err = core_envelope._build_shared_envelope_for_store(
+    envelope, err = (managed.build_envelope if managed else core_envelope._build_shared_envelope_for_store)(
         store,
         json.dumps(merged_payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"),
         item_id=(existing or {}).get("id") or None,
@@ -1645,7 +1676,8 @@ def init_identity_if_absent(
         "created_at": (existing or {}).get("created_at") or now,
         "updated_at": now,
         "replaced_at": now,
-        "relationship_started_at": _relationship_anchor_from_output(store, output, days_int),
+        "relationship_started_at": (managed.relationship_anchor(output, days_int) if managed else
+                                    _relationship_anchor_from_output(store, output, days_int)),
         "relationship_anchor_source": GENESIS_SOURCE,
         "relationship_anchor_evidence": evidence,
         "identity_agent_name_present": bool(merged_payload.get("agent_name")),
@@ -1653,23 +1685,21 @@ def init_identity_if_absent(
     }
     if envelope.get("K_enclave"):
         identity_doc["K_enclave"] = envelope["K_enclave"]
-    # KNOWN RESIDUAL (not fixed here — same shape as identity/actions.py's
-    # _identity_relationship_days_set, see that comment): this is a plain
-    # overwrite, not the CAS `_save_identity_cas` used by profile_patch /
-    # dimension_nudge / replace_identity_preserving_anchor, and it isn't under
-    # identity_mutation_lock either. The `existing`/`base_payload` snapshot
-    # above was read at the TOP of this function, so a concurrent
-    # profile_patch/dimension_nudge CAS win landing after that read (this
-    # function's own enclave round trip for `_existing_identity_plain_for_update`
-    # included) can be silently clobbered here — and this can happen even when
-    # a card ALREADY exists (the `existing and relationship_anchor_source ==
-    # GENESIS_SOURCE` re-init branch above), not just on first init. Low
-    # real-world likelihood (genesis init/re-init is a one-shot onboarding
-    # path, not a hot path) but worth flagging alongside the C1 fix rather
-    # than presenting profile_patch/dimension_nudge/rewrap as the only
-    # writers on this row — relationship_days_set (identity/actions.py) has
-    # the same residual.
-    identity_service._save_identity(store, identity_doc)
+    if managed:
+        managed.write(store.user_id, "identity", identity_doc)
+    else:
+        # Bind the merge to the raw snapshot taken before any plaintext read.
+        # Atomic create also protects a genuine miss from a concurrent creator.
+        # No retry here: a loser reports failure without clobbering the winner
+        # or emitting successful bootstrap/change events.
+        saved = (identity_service._save_identity_cas(store, existing, identity_doc)
+                 if existing is not None else
+                 identity_service._save_identity_create_if_absent(store, identity_doc))
+        if not saved:
+            return "identity_write_conflict"
+    if managed:
+        managed.after_identity = "updated" if existing else "initialized"
+        return managed.after_identity
     boot_gates._log_bootstrap_event(store, "genesis_identity_written_v1", success=True)
     identity_service._append_identity_change(store, {
         "action": "replace" if existing else "init",
@@ -1861,7 +1891,7 @@ def replace_identity_preserving_anchor(
     clobbering it. This retires the prior plain-overwrite behavior noted as a
     KNOWN RESIDUAL in identity/actions.py::_identity_replace_action.
     """
-    if not identity_service._load_identity(store):
+    if _identity_snapshot_for_write(store) is None:
         init_output = dict(output)
         anchor = output.get("relationship_anchor")
         if isinstance(anchor, dict):
@@ -1916,11 +1946,11 @@ def replace_identity_preserving_anchor(
             # as identity/actions.py::_load_identity_snapshot_for_write; a
             # write landing during the enclave call must fail the CAS, not be
             # silently clobbered by it).
-            snapshot = identity_service._load_identity(store)
+            snapshot = _identity_snapshot_for_write(store)
             if not snapshot:
                 return "identity_not_initialized"
             existing_plain, _plain_err = _existing_identity_plain_for_update(
-                store, api_key, runtime_token)
+                store, api_key, runtime_token, stored=snapshot)
             if existing_plain is None:
                 return "identity_plain_unavailable"
 
@@ -1975,7 +2005,7 @@ def replace_identity_preserving_anchor(
 
 
 def _write_persona_artifact(
-    store: UserStore, job_id: str, output: dict,
+    store: UserStore, job_id: str, output: dict, *, managed=None,
 ) -> tuple[str, str, str]:
     content, prompt_version = _persona_content_from_output(output)
     if not content:
@@ -1984,7 +2014,8 @@ def _write_persona_artifact(
     source_family = _persona_source_family_from_output(output)
     source_kind = _text(output.get("source_kind"), 80)
     new_priority = _persona_source_priority(source_family)
-    existing = db.get_blob(store.user_id, GENESIS_PERSONA_BLOB)
+    existing = (managed.read(GENESIS_PERSONA_BLOB) if managed else
+                db.get_blob(store.user_id, GENESIS_PERSONA_BLOB))
     if isinstance(existing, dict):
         try:
             existing_priority = int(existing.get("source_priority") or 0)
@@ -1997,14 +2028,14 @@ def _write_persona_artifact(
                 "preserved",
             )
     now = _now_iso()
-    envelope, err = core_envelope._build_shared_envelope_for_store(
+    envelope, err = (managed.build_envelope if managed else core_envelope._build_shared_envelope_for_store)(
         store,
         content.encode("utf-8"),
         item_id=f"genesis_persona_{job_id}",
     )
     if envelope is None:
         raise RuntimeError(f"persona_envelope_failed:{err}")
-    db.set_blob(store.user_id, GENESIS_PERSONA_BLOB, {
+    (managed.write if managed else db.set_blob)(store.user_id, GENESIS_PERSONA_BLOB, {
         "v": 1,
         "job_id": job_id,
         "source": GENESIS_SOURCE,
@@ -2034,7 +2065,7 @@ def write_persona_artifact(
 
 
 def _write_voice_artifact(
-    store: UserStore, job_id: str, output: dict,
+    store: UserStore, job_id: str, output: dict, *, managed=None,
 ) -> tuple[str, str, str]:
     voice_doc = _safe_voice_workset(output)
     if not voice_doc:
@@ -2042,7 +2073,7 @@ def _write_voice_artifact(
     raw = json.dumps(voice_doc, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     digest = _sha256_hex(raw)
     now = _now_iso()
-    envelope, err = core_envelope._build_shared_envelope_for_store(
+    envelope, err = (managed.build_envelope if managed else core_envelope._build_shared_envelope_for_store)(
         store,
         raw,
         item_id=f"genesis_voice_{job_id}",
@@ -2050,7 +2081,7 @@ def _write_voice_artifact(
     if envelope is None:
         raise RuntimeError(f"voice_envelope_failed:{err}")
     founding_count = len([item for item in voice_doc["exemplars"] if item.get("founding")])
-    db.set_blob(store.user_id, GENESIS_VOICE_BLOB, {
+    (managed.write if managed else db.set_blob)(store.user_id, GENESIS_VOICE_BLOB, {
         "v": 1,
         "job_id": job_id,
         "source": GENESIS_SOURCE,
@@ -2222,14 +2253,28 @@ def apply_reducer_output(
     *,
     runtime_token: str = "",
     complete_job: bool = True,
+    managed_witness=None,
 ) -> dict:
     job = db.genesis_get_job(store.user_id, job_id)
     if not job:
         raise LookupError("genesis_job_not_found")
+    import genesis_managed_store as managed_store
+    metadata = job.get("metadata") or {}
+    if managed_store.MARKER in metadata:
+        if not complete_job:
+            raise managed_store.ClaimRejected("managed_complete_required")
+        from genesis import managed_apply
+        return managed_apply.apply(store, job_id, output, managed_witness)
+    if managed_witness is not None:
+        raise managed_store.ClaimRejected("managed_claim_required")
     output = dict(output)
     _reject_raw_reducer_fields(output)
     output["job_id"] = job_id
-    db.genesis_set_job_status(store.user_id, job_id, status="processing", output={"stage": "apply_outputs"})
+    admitted = db.genesis_set_job_status(
+        store.user_id, job_id, status="processing", output={"stage": "apply_outputs"},
+        reject_managed=True)
+    if admitted is None:
+        raise managed_store.ClaimRejected("managed_claim_state_changed")
     write_genesis_state(store, {**job, "status": "processing"})
     # this run is starting -> clear any stale failure/partial notice for this
     # user's genesis flow *before* we emit any new ones below, so a partial

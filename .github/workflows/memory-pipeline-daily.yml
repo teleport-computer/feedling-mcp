@@ -28,6 +28,15 @@ on:
   schedule: [{ cron: '30 1 * * *' }]
   workflow_dispatch:
     inputs:
+      operation:
+        description: Read-only observation operation
+        type: choice
+        options: [daily-report, test-worker-flags]
+        default: daily-report
+      expected_sha:
+        description: Full deployed Test SHA (required for test-worker-flags)
+        type: string
+        default: ""
       day:
         description: "北京日期 YYYY-MM-DD；留空 = 昨天"
         required: false
@@ -48,6 +57,7 @@ concurrency:
 
 jobs:
   report:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.operation != 'test-worker-flags')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -83,3 +93,26 @@ jobs:
             args+=(--dry-run)
           fi
           python3 tools/memory_pipeline_daily_report.py "${args[@]}"
+
+  test-worker-flags:
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test' && inputs.operation == 'test-worker-flags'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Read fixed Test worker projection
+        env:
+          EXPECTED_SHA: ${{ inputs.expected_sha }}
+          TEST_ADMIN_PASSWORD: ${{ secrets.TEST_FEEDLING_ADMIN_PASSWORD }}
+        run: python tools/collect_test_worker_flags.py --expected-sha "$EXPECTED_SHA" --run
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-worker-flags
+          path: test-worker-flags.json
+          if-no-files-found: error
+          retention-days: 3

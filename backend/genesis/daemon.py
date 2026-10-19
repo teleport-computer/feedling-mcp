@@ -3,8 +3,8 @@
 Extracted from ``agent_runtime.supervisor`` (2026-07-10). It lived there for one
 reason — supervisor was the only long-running non-request process inside a CVM,
 so it was the only place with a ``while True`` to hang a poller on. It never had
-anything to do with the resident CLI runtime: it needs an enclave URL (to decrypt
-E2E chunk envelopes), a runtime-token secret (to mint genesis-scoped tokens), and
+anything to do with the resident CLI runtime: it needs a runtime-token secret (to mint genesis-scoped tokens), an optional
+enclave URL for encrypted inputs, and
 a loop. Nothing else.
 
 Framework-neutral on purpose: this module imports neither runtime package. The
@@ -27,13 +27,13 @@ def _truthy(value: str) -> bool:
 
 
 def should_start(*, enabled: str, secret: str, enclave_url: str) -> bool:
-    """Activate the genesis worker only when explicitly enabled AND its
-    prerequisites are present (runtime-token secret to mint scoped tokens, enclave
-    URL to decrypt chunks). Default OFF — landing the hook must not run genesis
-    until the env opts in; missing prereqs stay dormant rather than fail jobs."""
-    if not _truthy(enabled):
-        return False
-    return bool(str(secret or "").strip()) and bool(str(enclave_url or "").strip())
+    """Explicit opt-in plus a runtime secret; no URL selects guarded local work.
+
+    Eligibility is decided per job by the worker. Missing or sealed dependencies
+    stay uploaded without provider calls. An enclave URL retains the legacy lane.
+    """
+    return _truthy(enabled) and bool(str(secret or "").strip())
+
 
 
 def _beat(on_beat: Callable[[], None] | None) -> None:

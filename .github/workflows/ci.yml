@@ -17,6 +17,15 @@ on:
           - check-test-transport
           - diagnose-test-photo
           - restart-test-cvm
+          - reconcile-test-compose
+      recovery_authorization:
+        description: Exact operator-reviewed recovery authorization JSON
+        required: false
+        type: string
+      recovery_authorization_sha256:
+        description: SHA256 of exact reviewed authorization bytes
+        required: false
+        type: string
 
 # Pull-request validation is replaceable, but branch pushes may already be
 # between the main-CVM and runner-CVM mutations. Never cancel a release unit.
@@ -25,6 +34,70 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  reconcile-test-compose:
+    name: reconcile test compose authorization
+    needs: [compose-publisher-tests]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/test' && inputs.operation == 'reconcile-test-compose'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    # Same lock as the normal test runner deployment. No cancellation/retry.
+    concurrency:
+      group: deploy-test-runner-cvm
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install pinned publisher dependencies
+        run: |
+          python -m pip install -r deploy/publisher-requirements.txt
+          npm install -g phala@1.1.19
+      - name: Reconcile only the approved frozen transaction
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PRIVATE_KEY: ${{ secrets.ETH_DEPLOYER_KEY }}
+          PHALA_CLOUD_API_KEY: ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          RECOVERY_OPERATION: ${{ inputs.operation }}
+          RECOVERY_HOLD: ${{ vars.TEST_COMPOSE_RECOVERY_HOLD }}
+          RECOVERY_AUTHORIZATION: ${{ inputs.recovery_authorization }}
+          RECOVERY_AUTHORIZATION_SHA256: ${{ inputs.recovery_authorization_sha256 }}
+          RECOVERY_EVIDENCE_DIR: ${{ runner.temp }}/compose-recovery-evidence
+        run: python deploy/reconcile_compose.py
+      - name: Preserve recovery outcome including failures
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compose-recovery-evidence
+          if-no-files-found: error
+          retention-days: 90
+
+  compose-publisher-tests:
+    name: compose publisher offline boundaries
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r deploy/publisher-requirements.txt pytest==9.1.1
+      - run: python -m pytest -q deploy/tests
+        env:
+          NO_PROXY: '*'
+          DATABASE_URL: postgresql://postgres@127.0.0.1/feedling_ci
+          FEEDLING_TEST_PG: postgresql://postgres@127.0.0.1/postgres
+
   # Operate on the existing Test CVM without changing its compose, image,
   # sealed environment, database, or on-chain authorization. This is
   # dispatch-only and branch-locked so it can never target prod by accident.
@@ -217,6 +290,7 @@ jobs:
   # Solidity — FeedlingAppAuth contract tests
   # -------------------------------------------------------------------------
   forge-test:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: forge test (contracts)
     runs-on: ubuntu-24.04
     defaults:
@@ -244,6 +318,7 @@ jobs:
   # Python — backend API tests (multi-tenant only; SINGLE_USER mode retired)
   # -------------------------------------------------------------------------
   python-tests:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: test_api.py (multi-tenant)
     runs-on: ubuntu-24.04
     env:
@@ -429,6 +504,8 @@ jobs:
             tests/test_agent_call_failure_codes.py \
             tests/test_memory_lane_user_unavailable.py \
             tests/test_extraction_output_truncation.py \
+            tests/test_extraction_exhausted_truncation.py \
+            tests/test_extraction_mixed_retry_budget.py \
             tests/test_memory_store_conformance.py \
             tests/test_memory_integrity.py \
             tests/test_dream_stagger_admission.py \
@@ -504,6 +581,12 @@ jobs:
             tests/test_history_view_extraction.py \
             tests/test_plaintext_recall.py \
             tests/test_resident_recall.py \
+            tests/test_recall_isolated_candidates.py \
+            tests/test_recall_turn_projection.py \
+            tests/test_recall_review_regressions.py \
+            tests/test_recall_resident_identity.py \
+            tests/test_recall_references.py \
+            tests/test_recall_attachments.py \
             tests/test_recall_observability.py \
             tests/test_memory_vectors_route_pg.py \
             tests/test_garden_selection_pluggable.py \
@@ -649,6 +732,11 @@ jobs:
             tests/test_genesis_checkpoint.py \
             tests/test_genesis_worker.py \
             tests/test_genesis_reclaim_worker.py \
+            tests/test_genesis_managed_admission.py \
+            tests/test_genesis_managed_artifacts.py \
+            tests/test_genesis_managed_execution.py \
+            tests/test_genesis_managed_pipeline.py \
+            tests/test_genesis_managed_profile_races.py \
             -v
 
       - name: Redis retirement and recovery asset guards
@@ -810,7 +898,7 @@ jobs:
             tests/test_v2_quoted_memory.py \
             -v
 
-      - name: Run CI security tier 2 (74 files)
+      - name: Run CI security tier 2 (83 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -846,6 +934,7 @@ jobs:
             tests/test_enclave_reqlog.py \
             tests/test_enclave_routes_frames.py \
             tests/test_enclave_routes_health.py \
+            tests/test_enclave_declared_metadata.py \
             tests/test_enclave_routes_identity.py \
             tests/test_enclave_routes_storage.py \
             tests/test_enclave_runtime_token.py \
@@ -876,6 +965,14 @@ jobs:
             tests/test_identity_replace_guard.py \
             tests/test_identity_value_write_path.py \
             tests/test_io_cli_auth.py \
+            tests/test_io_cli_image.py \
+            tests/test_io_cli_plaintext_chat_image.py \
+            tests/test_io_cli_plaintext_voice.py \
+            tests/test_io_cli_plaintext_identity.py \
+            tests/test_io_cli_doctor_mode.py \
+            tests/test_identity_strict_read.py \
+            tests/test_identity_read_consumers.py \
+            tests/test_genesis_identity_init_safety.py \
             tests/test_io_cli_identity.py \
             tests/test_io_cli_identity_read.py \
             tests/test_io_cli_identity_write_full.py \
@@ -1016,6 +1113,7 @@ jobs:
             tests/test_provider_usage_normalize.py \
             tests/test_provider_malformed_tool_fallback.py \
             tests/test_provider_client.py \
+            tests/test_provider_probe_http.py \
             tests/test_provider_assistant_prefill.py \
             tests/test_provider_tools_gemini.py \
             tests/test_provider_tools_local_markers.py \
@@ -1030,7 +1128,6 @@ jobs:
             tests/test_memgarden_public_api_only.py \
             tests/test_web_search_duckduckgo.py \
             tests/test_image_generation_model.py \
-            tests/test_t534_caption_hop_trace.py \
             tests/test_perception_tool_surface_contract.py \
             tests/test_v2_tool_trace_privacy.py \
             tests/test_capabilities_chat.py \
@@ -1082,6 +1179,10 @@ jobs:
             tests/test_tcp_connect_monitor.py \
             tests/test_distillation_ledger.py \
             tests/test_e2e_tools.py \
+            tests/test_release_window_slice.py \
+            tests/test_release_phase_deadlines.py \
+            tests/test_release_coordinator.py \
+            tests/test_runtime_drain_witness.py \
             tests/test_e2e_p0_fallback_gate.py \
             tests/test_e2e_relay_model_preflight.py \
             tests/test_e2e_deep_target_gate.py \
@@ -1094,6 +1195,7 @@ jobs:
             tests/test_v2_pool_config.py \
             tests/test_v2_pool_fault_injection.py \
             tests/test_v2_pool_supervisor.py \
+            tests/test_dream_shared_deadline.py \
             tests/test_capture_prompt_contract.py \
             tests/test_garden_io_capture_policy.py \
             tests/test_capture_request_index_and_naming.py \
@@ -1131,11 +1233,16 @@ jobs:
             tests/test_v2_serve_worker.py \
             tests/test_v2_serve_worker_screen_watch.py \
             tests/test_v2_worker_unit_telemetry.py \
+            tests/test_v2_wake_correction_error_metadata.py \
+            tests/test_v2_failure_provenance.py \
             tests/test_v2_attachment_caption_trace.py \
             tests/test_t550_empty_diagnostics_and_retry.py \
             tests/test_resident_failure_diagnostics.py \
             tests/test_resident_cli_output_cap.py \
             tests/test_agent_runtime_supervisor.py \
+            tests/test_resident_admission_fence.py \
+            tests/test_resident_admission_isolation.py \
+            tests/test_resident_admission_reads.py \
             tests/test_v2_p0_unified_loop.py \
             tests/test_v2_p0_history_safety.py \
             tests/test_v2_p0_pool_safety.py \
@@ -1212,6 +1319,7 @@ jobs:
           if-no-files-found: ignore
 
   runtime-v2-coverage:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: Runtime V2 coverage (profile=${{ matrix.profile_enabled }})
     runs-on: ubuntu-24.04
     env:
@@ -1302,7 +1410,7 @@ jobs:
 
   ci-execution-evidence-report:
     name: CI execution evidence (report only)
-    if: always()
+    if: always() && (github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose')
     continue-on-error: true
     needs: [python-tests, runtime-v2-coverage]
     runs-on: ubuntu-24.04
@@ -1352,6 +1460,7 @@ jobs:
   # Docker — confirm the hash-pinned build stays reproducible
   # -------------------------------------------------------------------------
   docker-build:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: docker compose build (hash-verified)
     runs-on: ubuntu-24.04
     steps:
@@ -1392,6 +1501,7 @@ jobs:
   # image intentionally does NOT carry trafilatura and is not checked here.
   # -------------------------------------------------------------------------
   docker-build-worker-deps:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: docker build (serve-worker deps in main image)
     runs-on: ubuntu-24.04
     steps:
@@ -1415,6 +1525,7 @@ jobs:
   # Syntax + quick static checks
   # -------------------------------------------------------------------------
   lint:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: syntax + static
     runs-on: ubuntu-24.04
     steps:
@@ -1615,6 +1726,7 @@ jobs:
   # DCAP parser — Python reference tests
   # -------------------------------------------------------------------------
   dcap-python:
+    if: github.event_name != 'workflow_dispatch' || inputs.operation != 'reconcile-test-compose'
     name: DCAP parser (python reference)
     runs-on: ubuntu-24.04
     steps:
@@ -1626,74 +1738,91 @@ jobs:
         run: cd tools/dcap && python3 -m unittest test_dcap_parse.py -v
 
   # =========================================================================
-  # DEPLOY — detect whether this push affects CVM image or compose
+  # DEPLOY — compare with a proven complete main + runner release
   #
   # The CVM is expensive to redeploy (on-chain tx + iOS consent modal) so
-  # we skip it for docs-only / ci-only commits.
+  # we skip unchanged deployment content only after verifying release history.
+  # Unknown/partial releases require the normal gates; unreadable history fails
+  # closed. A successful CI run alone is not deployment evidence.
   # =========================================================================
   detect-cvm-changes:
     name: detect CVM changes
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
       cvm: ${{ steps.filter.outputs.cvm }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - uses: dorny/paths-filter@v3
+          fetch-depth: 0
+      - name: Compare with the last complete deployment
         id: filter
-        with:
-          filters: |
-            cvm:
-              - 'backend/**'
-              - 'tools/deploy_canary.py'
-              - 'deploy/attestation-gate.sh'
-              - 'deploy/Dockerfile'
-              - 'deploy/Dockerfile.agent-runner'
-              - 'deploy/docker-compose.phala.yaml'
-              - 'deploy/docker-compose.phala.prod.runner.yaml'
-              - 'deploy/e2b/runtime-v2/**'
-              - 'deploy/pin-runtime-release.sh'
-              - 'deploy/check-database-topology.py'
-              - 'deploy/prod-cvm-id.txt'
-              - 'deploy/prod-runner-cvm-ids.txt'
-              - 'deploy/list-prod-runner-cvm-ids.sh'
-              - 'deploy/check-prod-runner-topology.sh'
-              - 'deploy/check-v2-runner-fleet.py'
-              - 'deploy/publish-compose-hash.sh'
-              - '.github/workflows/ci.yml'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_PATHS: |
+            backend/**
+            tools/chat_resident_consumer.py
+            tools/deploy_canary.py
+            deploy/attestation-gate.sh
+            deploy/Dockerfile
+            deploy/Dockerfile.agent-runner
+            deploy/docker-compose.phala.yaml
+            deploy/docker-compose.phala.prod.runner.yaml
+            deploy/e2b/runtime-v2/**
+            deploy/pin-runtime-release.sh
+            deploy/check-database-topology.py
+            deploy/prod-cvm-id.txt
+            deploy/prod-runner-cvm-ids.txt
+            deploy/list-prod-runner-cvm-ids.sh
+            deploy/check-prod-runner-topology.sh
+            deploy/check-v2-runner-fleet.py
+            deploy/publish-compose-hash.sh
+            deploy/compose_publisher.py
+            deploy/publisher-requirements.txt
+            .github/workflows/ci.yml
+            deploy/deployment_changes.py
+        run: python3 deploy/deployment_changes.py
 
   detect-cvm-changes-test:
     name: detect CVM changes (test)
     if: github.ref == 'refs/heads/test' && github.event_name == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
       cvm: ${{ steps.filter.outputs.cvm }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - uses: dorny/paths-filter@v3
+          fetch-depth: 0
+      - name: Compare with the last complete deployment
         id: filter
-        with:
-          filters: |
-            cvm:
-              - 'backend/**'
-              - 'tools/chat_resident_consumer.py'
-              - 'tools/deploy_canary.py'
-              - 'deploy/attestation-gate.sh'
-              - 'deploy/Dockerfile'
-              - 'deploy/Dockerfile.agent-runner'
-              - 'deploy/docker-compose.phala.test.yaml'
-              - 'deploy/docker-compose.phala.runner.yaml'
-              - 'deploy/e2b/runtime-v2/**'
-              - 'deploy/pin-runtime-release.sh'
-              - 'deploy/check-database-topology.py'
-              - 'deploy/test-cvm-id.txt'
-              - 'deploy/test-runner-cvm-id.txt'
-              - 'deploy/publish-compose-hash.sh'
-              - '.github/workflows/ci.yml'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_PATHS: |
+            backend/**
+            tools/chat_resident_consumer.py
+            tools/deploy_canary.py
+            deploy/attestation-gate.sh
+            deploy/Dockerfile
+            deploy/Dockerfile.agent-runner
+            deploy/docker-compose.phala.test.yaml
+            deploy/docker-compose.phala.runner.yaml
+            deploy/e2b/runtime-v2/**
+            deploy/pin-runtime-release.sh
+            deploy/check-database-topology.py
+            deploy/test-cvm-id.txt
+            deploy/test-runner-cvm-id.txt
+            deploy/publish-compose-hash.sh
+            deploy/compose_publisher.py
+            deploy/publisher-requirements.txt
+            .github/workflows/ci.yml
+            deploy/deployment_changes.py
+        run: python3 deploy/deployment_changes.py
 
   validate-test-runtime-prerequisites:
     name: validate test Runtime V2 deploy prerequisites
@@ -2216,32 +2345,40 @@ jobs:
     name: detect CVM changes (pre)
     if: github.ref == 'refs/heads/pre' && github.event_name == 'push'
     runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
     outputs:
       cvm: ${{ steps.filter.outputs.cvm }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 2
-      - uses: dorny/paths-filter@v3
+          fetch-depth: 0
+      - name: Compare with the last complete deployment
         id: filter
-        with:
-          filters: |
-            cvm:
-              - 'backend/**'
-              - 'tools/deploy_canary.py'
-              - 'tools/prompt_cache_canary.py'
-              - 'deploy/attestation-gate.sh'
-              - 'deploy/Dockerfile'
-              - 'deploy/Dockerfile.agent-runner'
-              - 'deploy/docker-compose.phala.pre.yaml'
-              - 'deploy/docker-compose.phala.pre.runner.yaml'
-              - 'deploy/e2b/runtime-v2/**'
-              - 'deploy/pin-runtime-release.sh'
-              - 'deploy/check-database-topology.py'
-              - 'deploy/pre-cvm-id.txt'
-              - 'deploy/pre-runner-cvm-id.txt'
-              - 'deploy/publish-compose-hash.sh'
-              - '.github/workflows/ci.yml'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_PATHS: |
+            backend/**
+            tools/chat_resident_consumer.py
+            tools/deploy_canary.py
+            tools/prompt_cache_canary.py
+            deploy/attestation-gate.sh
+            deploy/Dockerfile
+            deploy/Dockerfile.agent-runner
+            deploy/docker-compose.phala.pre.yaml
+            deploy/docker-compose.phala.pre.runner.yaml
+            deploy/e2b/runtime-v2/**
+            deploy/pin-runtime-release.sh
+            deploy/check-database-topology.py
+            deploy/pre-cvm-id.txt
+            deploy/pre-runner-cvm-id.txt
+            deploy/publish-compose-hash.sh
+            deploy/compose_publisher.py
+            deploy/publisher-requirements.txt
+            .github/workflows/ci.yml
+            deploy/deployment_changes.py
+        run: python3 deploy/deployment_changes.py
 
   # Dual-runtime coexistence (2026-07-21 design, Task 11): the pre runner CVM
   # is V1 agent-runner again (P1 dual-fleet validation), and pooled Runtime V2
@@ -2550,7 +2687,7 @@ jobs:
 
   deploy-cvm:
     name: deploy CVM
-    needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes, validate-prod-runner-topology, prod-plaintext-shadow-gate2]
+    needs: [compose-publisher-tests, forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes, validate-prod-runner-topology, prod-plaintext-shadow-gate2]
     if: |
       always() && !failure() && !cancelled() &&
       github.ref == 'refs/heads/main' &&
@@ -2558,6 +2695,7 @@ jobs:
       needs.detect-cvm-changes.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
       packages: read
     concurrency:
@@ -2817,7 +2955,11 @@ jobs:
           ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
 
       - name: Publish live compose_hash on Sepolia
+        id: compose-prepare
         env:
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_PHASE: prepare
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
           PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.FEEDLING_APP_AUTH_CONTRACT }}
@@ -2829,24 +2971,42 @@ jobs:
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.yaml
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pyyaml
-          publish_status=1
-          for attempt in 1 2 3; do
-            if ./deploy/publish-compose-hash.sh eth_sepolia; then
-              publish_status=0
-              break
-            fi
-            # Do NOT capture `publish_status=$?` here: a failed `if cmd; then …; fi`
-            # with no else makes the whole `if` statement exit 0, so $? reads 0 and
-            # the step false-greens even when the publish reverted. Leave
-            # publish_status=1 until an attempt actually succeeds above.
-            if [ "$attempt" -lt 3 ]; then
-              echo "::warning::compose_hash publish failed (attempt $attempt/3); retrying in 20s"
-              sleep 20
-            fi
-          done
-          exit "$publish_status"
-
+          python3 -m pip install -r deploy/publisher-requirements.txt
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Archive compose intent before broadcasting
+        if: steps.compose-prepare.outputs.target_key != ''
+        id: compose-intent
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-intent-${{ steps.compose-prepare.outputs.target_key }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Send prepared compose authorization once
+        env:
+          FEEDLING_PUBLISH_PHASE: send
+          FEEDLING_PUBLISH_ARTIFACT_ID: ${{ steps.compose-intent.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.FEEDLING_APP_AUTH_CONTRACT }}
+          # Live-CVM mode: publish whatever hash dstack actually computed at
+          # boot, not our local synthesis (which always drifts — see the
+          # block comment in publish-compose-hash.sh).
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.yaml
+        run: |
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Preserve compose publisher evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-publish-${{ github.run_id }}-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: warn
+          retention-days: 90
       # §2 incident guardrail: fail the deploy RED within minutes if the live
       # enclave content pk ever diverges from the recorded baseline (a real KMS /
       # OS / config key event), instead of a user reporting "decrypt failed" days
@@ -2895,26 +3055,30 @@ jobs:
       # deploy isn't done until the runner CVM(s) redeploy. It lives in the
       # notify-lark-prod-deploy job (needs: deploy-cvm + deploy-prod-runner-cvm).
 
-  # 手动重部署 test（代码没变、只想重新走一遍部署）：workflow_dispatch 不行——
-  # 下面的 if 要求 event_name == 'push'，且 detect-cvm-changes-test 的 paths-filter
-  # 必须命中。空 commit 同样无效。办法是对 filter 白名单里的文件（backend/**、
-  # deploy/docker-compose.phala.test.yaml、本文件……）做一处无害改动后 push 到 test，
-  # 且 commit message 不要带 [skip ci]。
+  # Only branch pushes enter deployment. The detector compares deployment content
+  # with the last proven complete release, so a docs-only fix after failed CI
+  # retains pending code changes. HOLD and publisher gates remain independent.
   deploy-test-cvm:
     name: deploy CVM (test)
-    needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]
+    needs: [compose-publisher-tests, forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-test, validate-test-runtime-prerequisites]
     if: |
       github.ref == 'refs/heads/test' &&
       github.event_name == 'push' &&
       needs.detect-cvm-changes-test.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
       packages: read
     concurrency:
       group: deploy-test-cvm
       cancel-in-progress: false
     steps:
+      - name: Refuse automatic deployment during explicit compose recovery hold
+        if: vars.TEST_COMPOSE_RECOVERY_HOLD == 'true'
+        run: |
+          echo '::error::TEST_COMPOSE_RECOVERY_HOLD is active; no deploy/sign/broadcast permitted by this job'
+          exit 1
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -3088,10 +3252,15 @@ jobs:
           ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
 
       - name: Publish live compose_hash on Sepolia (test contract)
+        id: compose-prepare
         env:
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_PHASE: prepare
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
           PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_PUBLISH_MAX_GAS: 8000000
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
           # Separate test account key (see deploy step above) — reads the live
           # CVM's compose_hash; publish itself is signed by ETH_DEPLOYER_KEY.
@@ -3099,24 +3268,42 @@ jobs:
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.test.yaml
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pyyaml
-          publish_status=1
-          for attempt in 1 2 3; do
-            if ./deploy/publish-compose-hash.sh eth_sepolia; then
-              publish_status=0
-              break
-            fi
-            # Do NOT capture `publish_status=$?` here: a failed `if cmd; then …; fi`
-            # with no else makes the whole `if` statement exit 0, so $? reads 0 and
-            # the step false-greens even when the publish reverted. Leave
-            # publish_status=1 until an attempt actually succeeds above.
-            if [ "$attempt" -lt 3 ]; then
-              echo "::warning::compose_hash publish failed (attempt $attempt/3); retrying in 20s"
-              sleep 20
-            fi
-          done
-          exit "$publish_status"
-
+          python3 -m pip install -r deploy/publisher-requirements.txt
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Archive compose intent before broadcasting
+        if: steps.compose-prepare.outputs.target_key != ''
+        id: compose-intent
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-intent-${{ steps.compose-prepare.outputs.target_key }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Send prepared compose authorization once
+        env:
+          FEEDLING_PUBLISH_PHASE: send
+          FEEDLING_PUBLISH_ARTIFACT_ID: ${{ steps.compose-intent.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_PUBLISH_MAX_GAS: 8000000
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          # Separate test account key (see deploy step above) — reads the live
+          # CVM's compose_hash; publish itself is signed by ETH_DEPLOYER_KEY.
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.test.yaml
+        run: |
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Preserve compose publisher evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-publish-${{ github.run_id }}-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: warn
+          retention-days: 90
       # §2 attestation gate (test). Inert until BOTH repo vars are set:
       #   TEST_MAIN_ENCLAVE_URL            = https://<test-app-id>-5003s.dstack-pha-prod9.phala.network
       #   TEST_ENCLAVE_CONTENT_PK_BASELINE = <test enclave content pk, from a manual /attestation read>
@@ -3172,12 +3359,18 @@ jobs:
       !cancelled()
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
       packages: read
     concurrency:
       group: deploy-test-runner-cvm
       cancel-in-progress: false
     steps:
+      - name: Refuse automatic deployment during explicit compose recovery hold
+        if: vars.TEST_COMPOSE_RECOVERY_HOLD == 'true'
+        run: |
+          echo '::error::TEST_COMPOSE_RECOVERY_HOLD is active; no deploy/sign/broadcast permitted by this job'
+          exit 1
       # The ordering dependency is intentional: a runner from the new release
       # can require backend interfaces that the old main CVM does not have. Do
       # not deploy across a failed main-CVM release. Still start this job so the
@@ -3334,7 +3527,11 @@ jobs:
           ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
 
       - name: Publish live runner compose_hash on Sepolia (test contract)
+        id: compose-prepare
         env:
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_PHASE: prepare
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
           PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           # The runner is a distinct dstack app → distinct compose_hash. Reuses the
@@ -3342,25 +3539,50 @@ jobs:
           # per-hash; the iOS audit card only checks the MAIN app's hashes, so the
           # runner hash is harmless there). Override with TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_PUBLISH_MAX_GAS: 8000000
           FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
           PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.runner.yaml
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pyyaml
-          publish_status=1
-          for attempt in 1 2 3; do
-            if ./deploy/publish-compose-hash.sh eth_sepolia; then
-              publish_status=0
-              break
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              echo "::warning::runner compose_hash publish failed (attempt $attempt/3); retrying in 20s"
-              sleep 20
-            fi
-          done
-          exit "$publish_status"
-
+          python3 -m pip install -r deploy/publisher-requirements.txt
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Archive compose intent before broadcasting
+        if: steps.compose-prepare.outputs.target_key != ''
+        id: compose-intent
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-intent-${{ steps.compose-prepare.outputs.target_key }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Send prepared compose authorization once
+        env:
+          FEEDLING_PUBLISH_PHASE: send
+          FEEDLING_PUBLISH_ARTIFACT_ID: ${{ steps.compose-intent.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          # The runner is a distinct dstack app → distinct compose_hash. Reuses the
+          # same FeedlingAppAuth contract by default (addComposeHash is onlyOwner +
+          # per-hash; the iOS audit card only checks the MAIN app's hashes, so the
+          # runner hash is harmless there). Override with TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.TEST_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.TEST_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_PUBLISH_MAX_GAS: 8000000
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.runner.yaml
+        run: |
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Preserve compose publisher evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-publish-${{ github.run_id }}-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: warn
+          retention-days: 90
       # No post-deploy Runtime V2 fleet gate here — this CVM runs the V1
       # agent-runner, which has no v2_worker_heartbeats identity to check.
       # The main test CVM's serve-worker liveness is proved separately by the
@@ -3368,13 +3590,14 @@ jobs:
 
   deploy-pre-cvm:
     name: deploy CVM (pre)
-    needs: [forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-pre, validate-pre-runtime-prerequisites]
+    needs: [compose-publisher-tests, forge-test, python-tests, docker-build, docker-build-worker-deps, lint, dcap-python, detect-cvm-changes-pre, validate-pre-runtime-prerequisites]
     if: |
       github.ref == 'refs/heads/pre' &&
       github.event_name == 'push' &&
       needs.detect-cvm-changes-pre.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: write
       packages: read
     concurrency:
@@ -3533,7 +3756,11 @@ jobs:
             --wait
 
       - name: Publish live compose_hash on Sepolia (pre contract)
+        id: compose-prepare
         env:
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_PHASE: prepare
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
           PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PRE_FEEDLING_APP_AUTH_CONTRACT }}
@@ -3544,24 +3771,41 @@ jobs:
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.pre.yaml
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pyyaml
-          publish_status=1
-          for attempt in 1 2 3; do
-            if ./deploy/publish-compose-hash.sh eth_sepolia; then
-              publish_status=0
-              break
-            fi
-            # Do NOT capture `publish_status=$?` here: a failed `if cmd; then …; fi`
-            # with no else makes the whole `if` statement exit 0, so $? reads 0 and
-            # the step false-greens even when the publish reverted. Leave
-            # publish_status=1 until an attempt actually succeeds above.
-            if [ "$attempt" -lt 3 ]; then
-              echo "::warning::compose_hash publish failed (attempt $attempt/3); retrying in 20s"
-              sleep 20
-            fi
-          done
-          exit "$publish_status"
-
+          python3 -m pip install -r deploy/publisher-requirements.txt
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Archive compose intent before broadcasting
+        if: steps.compose-prepare.outputs.target_key != ''
+        id: compose-intent
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-intent-${{ steps.compose-prepare.outputs.target_key }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Send prepared compose authorization once
+        env:
+          FEEDLING_PUBLISH_PHASE: send
+          FEEDLING_PUBLISH_ARTIFACT_ID: ${{ steps.compose-intent.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PRE_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          # Separate test account key (see deploy step above) — reads the live
+          # CVM's compose_hash; publish itself is signed by ETH_DEPLOYER_KEY.
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.pre.yaml
+        run: |
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Preserve compose publisher evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-publish-${{ github.run_id }}-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: warn
+          retention-days: 90
       # §2 attestation gate (pre). Inert until BOTH repo vars are set:
       #   PRE_MAIN_ENCLAVE_URL            = https://<pre-app-id>-5003s.dstack-pha-prod9.phala.network
       #   PRE_ENCLAVE_CONTENT_PK_BASELINE = <pre enclave content pk, from a manual /attestation read>
@@ -3619,6 +3863,7 @@ jobs:
       needs.detect-cvm-changes-pre.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
       packages: read
     concurrency:
@@ -3728,7 +3973,11 @@ jobs:
           ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
 
       - name: Publish live runner compose_hash on Sepolia (pre contract)
+        id: compose-prepare
         env:
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_PHASE: prepare
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
           PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           # The runner is a distinct dstack app → distinct compose_hash. Reuses the
@@ -3741,19 +3990,43 @@ jobs:
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.pre.runner.yaml
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pyyaml
-          publish_status=1
-          for attempt in 1 2 3; do
-            if ./deploy/publish-compose-hash.sh eth_sepolia; then
-              publish_status=0
-              break
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              echo "::warning::runner compose_hash publish failed (attempt $attempt/3); retrying in 20s"
-              sleep 20
-            fi
-          done
-          exit "$publish_status"
+          python3 -m pip install -r deploy/publisher-requirements.txt
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Archive compose intent before broadcasting
+        if: steps.compose-prepare.outputs.target_key != ''
+        id: compose-intent
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-intent-${{ steps.compose-prepare.outputs.target_key }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Send prepared compose authorization once
+        env:
+          FEEDLING_PUBLISH_PHASE: send
+          FEEDLING_PUBLISH_ARTIFACT_ID: ${{ steps.compose-intent.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          # The runner is a distinct dstack app → distinct compose_hash. Reuses the
+          # same FeedlingAppAuth contract by default (addComposeHash is onlyOwner +
+          # per-hash; the iOS audit card only checks the MAIN app's hashes, so the
+          # runner hash is harmless there). Override with PRE_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PRE_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.PRE_FEEDLING_APP_AUTH_CONTRACT }}
+          FEEDLING_CVM_ID:            ${{ steps.cvmid.outputs.cvm_id }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.TEST_PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.pre.runner.yaml
+        run: |
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Preserve compose publisher evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-publish-${{ github.run_id }}-${{ github.job }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: warn
+          retention-days: 90
       # No post-deploy Runtime V2 fleet gate here — this CVM runs the V1
       # agent-runner, which has no v2_worker_heartbeats identity to check.
       # The main pre CVM's serve-worker still gets its own liveness proof via
@@ -3789,11 +4062,15 @@ jobs:
       needs.detect-cvm-changes.outputs.cvm == 'true'
     runs-on: ubuntu-24.04
     permissions:
+      actions: read
       contents: read
       packages: read
     concurrency:
       group: deploy-prod-runner-cvm
       cancel-in-progress: false
+    outputs:
+      ids_json: ${{ steps.ids.outputs.ids_json }}
+      publisher_sha: ${{ steps.ids.outputs.publisher_sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -3848,6 +4125,10 @@ jobs:
           printf '%s\n' "$IDS"
           # stash newline-joined ids for later steps
           { echo 'ids<<EOF'; printf '%s\n' "$IDS"; echo 'EOF'; } >> "$GITHUB_OUTPUT"
+
+          IDS_JSON=$(printf '%s\n' "$IDS" | python3 -c 'import json,sys; ids=sys.stdin.read().splitlines(); assert 0 < len(ids) <= 256; print(json.dumps(ids))')
+          printf 'ids_json=%s\n' "$IDS_JSON" >> "$GITHUB_OUTPUT"
+          echo "publisher_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Deploy each prod runner CVM via phala
         env:
@@ -3914,8 +4195,55 @@ jobs:
             ./deploy/wait-cvm-ready.sh "$CVM_ID" "${CVM_READY_TIMEOUT_SEC:-900}"
           done
 
-      - name: Publish live prod runner compose_hash on Sepolia (per CVM)
+  # Serialize complete authorization units, not just broadcasts: each next
+  # CVM estimates/signs only after the previous receipt/readback succeeds.
+  # fail-fast cancels queued units on a failed or unknown first outcome.
+  publish-prod-runner-compose:
+    name: authorize prod runner (${{ matrix.cvm_id }})
+    needs: [deploy-prod-runner-cvm]
+    if: ${{ always() && !cancelled() && needs.deploy-prod-runner-cvm.result == 'success' }}
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        cvm_id: ${{ fromJSON(needs.deploy-prod-runner-cvm.outputs.ids_json) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.deploy-prod-runner-cvm.outputs.publisher_sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Bind matrix target to checked-out prod inventory
+        id: publisher-cvm
         env:
+          REQUESTED_CVM_ID: ${{ matrix.cvm_id }}
+        run: |
+          IDS=$(deploy/list-prod-runner-cvm-ids.sh deploy/prod-runner-cvm-ids.txt)
+          touch "$GITHUB_OUTPUT"
+          printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
+            [ -n "$CVM_ID" ] || continue
+            [ "$CVM_ID" = "$REQUESTED_CVM_ID" ] || continue
+            echo "cvm_id=$CVM_ID" >> "$GITHUB_OUTPUT"
+          done
+          if ! grep -q '^cvm_id=' "$GITHUB_OUTPUT"; then
+            echo "::error::Matrix CVM is absent from the pinned production inventory"
+            exit 1
+          fi
+
+      - name: Install phala CLI
+        run: npm install -g phala@1.1.19
+
+      - name: Publish live prod runner compose_hash on Sepolia (per CVM)
+        id: compose-prepare
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_PHASE: prepare
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
           PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
           ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
           # Distinct dstack app per runner CVM → its own compose_hash (identical
@@ -3925,31 +4253,46 @@ jobs:
           FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PROD_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.FEEDLING_APP_AUTH_CONTRACT }}
           PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
           FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.prod.runner.yaml
-          IDS:                        ${{ steps.ids.outputs.ids }}
+          FEEDLING_CVM_ID:             ${{ steps.publisher-cvm.outputs.cvm_id }}
         run: |
           python3 -m pip install --upgrade pip
-          python3 -m pip install pyyaml
-          printf '%s\n' "$IDS" | while IFS= read -r CVM_ID; do
-            [ -z "$CVM_ID" ] && continue
-            echo ">>> publish compose_hash for prod runner CVM: $CVM_ID"
-            FEEDLING_CVM_ID="$CVM_ID"
-            export FEEDLING_CVM_ID
-            publish_status=1
-            for attempt in 1 2 3; do
-              if ./deploy/publish-compose-hash.sh eth_sepolia; then
-                publish_status=0; break
-              fi
-              if [ "$attempt" -lt 3 ]; then
-                echo "::warning::runner compose_hash publish failed for $CVM_ID (attempt $attempt/3); retrying in 20s"
-                sleep 20
-              fi
-            done
-            [ "$publish_status" -eq 0 ] || { echo "::error::publish failed for $CVM_ID"; exit 1; }
-          done
-      # No post-deploy Runtime V2 fleet gate here — these CVMs run the V1
-      # agent-runner, which has no v2_worker_heartbeats identity to check.
-      # The main prod CVM's serve-worker liveness is proved separately by the
-      # deploy-cvm job's post-deploy canary/attestation gates.
+          python3 -m pip install -r deploy/publisher-requirements.txt
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Archive compose intent before broadcasting
+        if: steps.compose-prepare.outputs.target_key != ''
+        id: compose-intent
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-intent-${{ steps.compose-prepare.outputs.target_key }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: error
+          retention-days: 90
+      - name: Send prepared compose authorization once
+        env:
+          FEEDLING_PUBLISH_PHASE: send
+          FEEDLING_PUBLISH_ARTIFACT_ID: ${{ steps.compose-intent.outputs.artifact-id }}
+          GH_TOKEN: ${{ github.token }}
+          FEEDLING_PUBLISH_EVIDENCE_DIR: ${{ runner.temp }}/compose-publish-evidence
+          PRIVATE_KEY:                ${{ secrets.ETH_DEPLOYER_KEY }}
+          ETH_SEPOLIA_RPC_URL:        ${{ vars.ETH_SEPOLIA_RPC_URL }}
+          # Distinct dstack app per runner CVM → its own compose_hash (identical
+          # compose ⇒ identical hash; addComposeHash is onlyOwner + per-hash, so
+          # publishing per CVM is idempotent). Reuses the prod contract by default;
+          # override with PROD_RUNNER_FEEDLING_APP_AUTH_CONTRACT.
+          FEEDLING_APP_AUTH_CONTRACT: ${{ vars.PROD_RUNNER_FEEDLING_APP_AUTH_CONTRACT || vars.FEEDLING_APP_AUTH_CONTRACT }}
+          PHALA_CLOUD_API_KEY:        ${{ secrets.PHALA_CLOUD_API_KEY }}
+          FEEDLING_COMPOSE_FILE:      deploy/docker-compose.phala.prod.runner.yaml
+          FEEDLING_CVM_ID:             ${{ steps.publisher-cvm.outputs.cvm_id }}
+        run: |
+          ./deploy/publish-compose-hash.sh eth_sepolia
+      - name: Preserve compose publisher evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compose-publish-${{ github.run_id }}-${{ github.job }}-${{ matrix.cvm_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/compose-publish-evidence/
+          if-no-files-found: warn
+          retention-days: 90
 
   # =========================================================================
   # NOTIFY — Lark "deploy finished", sent only after the WHOLE prod deploy
@@ -3960,7 +4303,7 @@ jobs:
   # =========================================================================
   notify-lark-prod-deploy:
     name: notify Lark (prod deploy finished)
-    needs: [deploy-cvm, deploy-prod-runner-cvm]
+    needs: [deploy-cvm, deploy-prod-runner-cvm, publish-prod-runner-compose]
     if: ${{ always() && needs.deploy-cvm.result != 'skipped' }}
     runs-on: ubuntu-24.04
     steps:
@@ -3971,6 +4314,7 @@ jobs:
           LARK_BOT_SECRET: ${{ secrets.LARK_BOT_SECRET }}
           MAIN_STATUS: ${{ needs.deploy-cvm.result }}
           RUNNER_STATUS: ${{ needs.deploy-prod-runner-cvm.result }}
+          RUNNER_AUTH_STATUS: ${{ needs.publish-prod-runner-compose.result }}
           CVM_ID: ${{ needs.deploy-cvm.outputs.cvm_id }}
           REPOSITORY: ${{ github.repository }}
           REF_NAME: ${{ github.ref_name }}
@@ -3984,6 +4328,10 @@ jobs:
             exit 0
           fi
 
+          if [ "$RUNNER_STATUS" = "success" ] && [ "$RUNNER_AUTH_STATUS" != "success" ]; then
+            RUNNER_STATUS="$RUNNER_AUTH_STATUS"
+            [ "$RUNNER_STATUS" != "skipped" ] || RUNNER_STATUS=failure
+          fi
           if [ "$MAIN_STATUS" = "success" ] && { [ "$RUNNER_STATUS" = "success" ] || [ "$RUNNER_STATUS" = "skipped" ]; }; then
             STATUS="success"
             PREFIX="[OK]"

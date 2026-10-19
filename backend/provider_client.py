@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import provider_deadline
 import base64
 import contextvars
 import copy
@@ -13,6 +14,7 @@ import random
 import re
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlsplit
@@ -479,6 +481,169 @@ def _http_client() -> httpx.Client:
         if _shared_client is None:
             _shared_client = _build_shared_client()
     return _shared_client
+
+
+_SETUP_PROBE_OPERATIONS = frozenset({"route_activate", "route_test", "credential_patch"})
+_SETUP_PROBE_OBSERVER: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "setup_probe_http_observer", default=None
+)
+
+
+class _ProbeHTTPObservation:
+    """Constant-space H1 facts, never request/response objects or wire content.
+
+    HTTPX buffers before returning. HTTPcore's request-local trace is the only
+    observation here; missing traces and unverified H2 remain unknown.
+    """
+
+    def __init__(self):
+        self.count = 0
+        self.reset()
+
+    def reset(self):
+        self.valid = True
+        self.phase = "unknown"
+        self.headers = None
+        self.status = None
+        self.pending = None
+        self.failed_id = None
+        self.failed_phase = None
+        self.body_complete = False
+
+    def trace(self, event, info):
+        try:
+            self._trace(event, info)
+        except Exception:
+            self.valid = False  # Sticky until the next original POST.
+
+    def _trace(self, event, info):
+        if not self.valid:
+            return
+        if event.startswith("http2."):
+            self.valid = False  # No verified H2 phase attribution in this release.
+            return
+        # Connection, send, and cleanup events cannot establish response facts.
+        if event.startswith(("connection.", "proxy.")) or event in {
+            "http11.send_request_headers.started", "http11.send_request_headers.complete",
+            "http11.send_request_headers.failed", "http11.send_request_body.started",
+            "http11.send_request_body.complete", "http11.send_request_body.failed",
+            "http11.response_closed.started", "http11.response_closed.complete",
+            "http11.response_closed.failed",
+        }:
+            return
+        parts = event.split(".")
+        if len(parts) != 3 or parts[0] != "http11" or parts[1] not in {
+            "receive_response_headers", "receive_response_body",
+        } or parts[2] not in {"started", "complete", "failed"}:
+            self.valid = False
+            return
+        _, stage, action = parts
+        if self.failed_id is not None:
+            self.valid = False  # A failed response stage is terminal for this POST.
+            return
+        if action == "started":
+            if self.pending is not None:
+                self.valid = False
+                return
+            # CONNECT shares extensions. Read only the method, never the URL.
+            target = info["request"].method == b"POST"
+            self.pending = (stage, target)
+            if target:
+                if stage == "receive_response_headers":
+                    if self.headers is not None:
+                        self.valid = False
+                    self.headers = False
+                elif self.headers is not True or self.body_complete:
+                    self.valid = False
+            return
+        if self.pending is None or self.pending[0] != stage:
+            self.valid = False
+            return
+        _, target = self.pending
+        self.pending = None
+        if not target:
+            return
+        if action == "failed":
+            # HTTPX maps core errors with `raise ... from ...`. Retain only an
+            # identity integer to match the final cause chain, never the error.
+            self.failed_id = id(info["exception"])
+            self.failed_phase = ("response_headers" if stage.endswith("headers")
+                                 else "response_body")
+        elif stage == "receive_response_headers":
+            status = info["return_value"][1]
+            if type(status) is not int or not 100 <= status <= 599:
+                self.valid = False
+                return
+            self.headers, self.status = True, status
+        else:
+            self.body_complete = True
+
+    def finish(self, exc=None):
+        if not self.valid:
+            return
+        if exc is None:
+            if self.headers is True and self.body_complete:
+                self.phase = "buffered_complete"
+            return
+        seen = set()
+        while exc is not None and id(exc) not in seen:
+            seen.add(id(exc))
+            if id(exc) == self.failed_id:
+                self.phase = self.failed_phase
+                return
+            exc = exc.__cause__
+
+    def snapshot(self):
+        valid = self.valid and self.headers is not None
+        return {
+            "version": 1, "phase": self.phase if valid else "unknown",
+            "headers_seen": self.headers if valid else None,
+            "observed_status_code": self.status if valid else None,
+            "observation_valid": valid, "post_attempt_count": self.count,
+        }
+
+
+@contextmanager
+def observe_setup_probe(operation):
+    """Scope only the three route probes; always restore nested caller context."""
+    try:
+        observation = _ProbeHTTPObservation() if operation in _SETUP_PROBE_OPERATIONS else None
+    except Exception:
+        observation = None
+    token = _SETUP_PROBE_OBSERVER.set(observation)
+    try:
+        yield observation
+    finally:
+        _SETUP_PROBE_OBSERVER.reset(token)
+
+
+def _probe_json_post(*args, **kwargs):
+    observation = _SETUP_PROBE_OBSERVER.get()
+    client = _http_client()
+    if observation is None:
+        return client.post(*args, **kwargs)
+    try:
+        observation.reset()
+        observation.count += 1
+        if kwargs.get("extensions"):
+            observation.valid = False  # Preserve another extension owner.
+        else:
+            kwargs["extensions"] = {"trace": observation.trace}
+    except Exception:
+        observation.valid = False
+    try:
+        response = client.post(*args, **kwargs)
+    except BaseException as exc:
+        try:
+            observation.finish(exc)
+        except Exception:
+            observation.valid = False
+        raise
+    try:
+        observation.finish()
+    except Exception:
+        observation.valid = False
+    return response
 
 
 @dataclass(frozen=True)
@@ -3210,7 +3375,7 @@ def _chat_completion_openai_responses(
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
-            return _http_client().post(
+            return _probe_json_post(
                 url, headers=headers, json=request_payload, timeout=timeout
             )
         except httpx.HTTPError as e:
@@ -3797,6 +3962,13 @@ async def _traced_async_json_post(
     }
     try:
         response = await _post_within_wire_deadline(post, request_payload)
+    except asyncio.CancelledError:
+        if provider_deadline.attempt_trace.get() is not None:
+            entry["error_class"] = "cancelled"
+            entry["outcome"] = "cancelled"
+            entry["duration_ms"] = _attempt_duration_ms(started_ns)
+            trace.append(entry)
+        raise
     except Exception as exc:  # noqa: BLE001 -- retain evidence, preserve exception
         status = getattr(exc, "status_code", None)
         entry["status"] = int(status) if isinstance(status, int) else None
@@ -4178,7 +4350,7 @@ def _chat_completion_openai_compatible(
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
-            return _http_client().post(
+            return _probe_json_post(
                 f"{base_url.rstrip('/')}/chat/completions",
                 headers=_headers(ProviderConfig(provider, model, key, base_url)),
                 json=request_payload,
@@ -4408,7 +4580,7 @@ def _chat_completion_anthropic(
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
-            return _http_client().post(
+            return _probe_json_post(
                 f"{base_url.rstrip('/')}/messages",
                 headers={
                     "x-api-key": key,
@@ -4703,7 +4875,7 @@ def _chat_completion_bedrock(
 
     def post_with_payload(request_payload: dict[str, Any]) -> httpx.Response:
         try:
-            return _http_client().post(
+            return _probe_json_post(
                 url, headers=headers, json=request_payload, timeout=timeout
             )
         except httpx.HTTPError as exc:
@@ -4895,7 +5067,7 @@ def _chat_completion_gemini(
     )
 
     try:
-        resp = _http_client().post(url, headers=headers, json=payload, timeout=timeout)
+        resp = _probe_json_post(url, headers=headers, json=payload, timeout=timeout)
     except httpx.HTTPError as e:
         raise ProviderError(f"provider network error: {type(e).__name__}") from e
 
@@ -6134,6 +6306,9 @@ async def chat_completion_async(
     attempt_trace: list[dict[str, Any]] | None = (
         [] if config.capture_attempt_trace else None
     )
+    deadline_trace = provider_deadline.attempt_trace.get()
+    if attempt_trace is not None and deadline_trace is not None:
+        attempt_trace = deadline_trace
     try:
         result = await _chat_completion_async_impl(
             config,
@@ -6276,6 +6451,7 @@ async def reliable_chat_completion_async(
     refusal_out: Any = None,
     retry_refusal: bool = True,
     absolute_deadline: float | None = None,
+    deadline_provenance: bool = False,
     retry_output_truncation: bool = True,
     wire_deadline_sec: float | None = None,
     **kwargs: Any,
@@ -6312,6 +6488,8 @@ async def reliable_chat_completion_async(
     read timeout does, so retry and classification are unchanged. For callers
     whose hosted watchdog stall budget must outlast one wire (Heavy pool).
     """
+    if deadline_provenance and (absolute_deadline is None or not math.isfinite(absolute_deadline)):
+        raise ValueError("deadline provenance requires a finite absolute_deadline")
     if wire_deadline_sec is not None:
         wire_deadline_sec = float(wire_deadline_sec)
         if not math.isfinite(wire_deadline_sec) or wire_deadline_sec <= 0:
@@ -6371,11 +6549,26 @@ async def reliable_chat_completion_async(
                 _WIRE_START_CB.reset(cb_token)
 
     for attempt in range(1, attempts + 1):
+        if deadline_provenance and time.monotonic() >= absolute_deadline:
+            exc = provider_deadline.ProviderAbsoluteDeadlineExceeded(absolute_deadline, "entry")
+            if provider_attempt_trace is not None:
+                _attach_provider_attempt_trace(exc, provider_attempt_trace)
+            raise exc
         started_ns = time.monotonic_ns()
         _progress("attempt_start", attempt)
         try:
             attempt_kwargs = kwargs
-            if absolute_deadline is not None:
+            if deadline_provenance:
+                remaining = absolute_deadline - time.monotonic()
+                attempt_kwargs = dict(kwargs)
+                if "timeout" in attempt_kwargs and remaining > 0:
+                    attempt_kwargs["timeout"] = min(float(attempt_kwargs["timeout"]), remaining)
+                result = await provider_deadline.run_attempt(
+                    lambda: _with_wire_progress(
+                        chat_completion_async(*args, **attempt_kwargs), attempt
+                    ), absolute_deadline,
+                )
+            elif absolute_deadline is not None:
                 remaining = float(absolute_deadline) - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("provider absolute deadline exceeded")
@@ -6419,8 +6612,18 @@ async def reliable_chat_completion_async(
                 exc.provider_refusal = refusal
                 _attach_provider_attempt_trace(exc, _attempts_from_result(result))
                 raise exc
-            await provider_refusal.observe(refusal_out, result, attempt)
+            if deadline_provenance:
+                try:
+                    await provider_refusal.observe(refusal_out, result, attempt)
+                except Exception:
+                    pass
+            else:
+                await provider_refusal.observe(refusal_out, result, attempt)
             _progress("attempt_complete", attempt)
+            if deadline_provenance and time.monotonic() >= absolute_deadline:
+                raise provider_deadline.ProviderAbsoluteDeadlineExceeded(
+                    absolute_deadline, "late_success", result=result
+                )
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
                     provider_attempt_trace,
@@ -6459,9 +6662,36 @@ async def reliable_chat_completion_async(
                 result = _with_provider_attempt_trace(result, provider_attempt_trace)
             return _with_reliable_retry_count(result, attempt - 1)
         except Exception as exc:  # noqa: BLE001 — classify, then re-raise or retry
-            await provider_refusal.observe(refusal_out, exc, attempt)
+            if isinstance(exc, provider_deadline.ProviderAbsoluteDeadlineExceeded):
+                retained = exc.deadline_attempt_trace
+                if not retained:
+                    retained = _attempts_from_result(exc.late_result)
+                    if not retained and exc.__cause__ is not None:
+                        retained = _attempts_from_exception(exc.__cause__)
+                # A late success after our observer already has its outer marker
+                # in provider_attempt_trace. Do not duplicate that entire chain.
+                retained = [item for item in retained if item.get("kind") == "http_attempt"]
+                if retained:
+                    _attach_provider_attempt_trace(exc, retained)
+            # Snapshot provider facts before any observer can cross P.
+            if deadline_provenance:
+                cls = classify_provider_error(exc)
+                intrinsic_terminal = (
+                    cls == "provider_config"
+                    or (not retry_output_truncation and is_output_truncation_error(exc))
+                    or (not retry_refusal and provider_refusal.project(
+                        getattr(exc, "provider_refusal", None)) is not None)
+                    or attempt >= attempts
+                )
+                try:
+                    await provider_refusal.observe(refusal_out, exc, attempt)
+                except Exception:
+                    pass  # observer failure never replaces the captured cause
+            else:
+                await provider_refusal.observe(refusal_out, exc, attempt)
             _progress("attempt_failed", attempt)
-            cls = classify_provider_error(exc)
+            if not deadline_provenance:
+                cls = classify_provider_error(exc)
             last_exc = exc
             deadline_exhausted = (
                 absolute_deadline is not None
@@ -6479,6 +6709,7 @@ async def reliable_chat_completion_async(
                 or refusal_terminal
                 or attempt >= attempts
                 or deadline_exhausted
+                or isinstance(exc, provider_deadline.ProviderAbsoluteDeadlineExceeded)
             )
             if provider_attempt_trace is not None:
                 inner_ordinals = _extend_attempt_trace(
@@ -6516,6 +6747,20 @@ async def reliable_chat_completion_async(
                         },
                     }
                 )
+            if deadline_provenance and (
+                isinstance(exc, provider_deadline.ProviderAbsoluteDeadlineExceeded)
+                or (deadline_exhausted and not intrinsic_terminal)
+            ):
+                budget_exc = exc if isinstance(
+                    exc, provider_deadline.ProviderAbsoluteDeadlineExceeded
+                ) else provider_deadline.ProviderAbsoluteDeadlineExceeded(
+                    absolute_deadline, "retry_admission"
+                )
+                if provider_attempt_trace is not None:
+                    _attach_provider_attempt_trace(budget_exc, provider_attempt_trace)
+                if budget_exc is exc:
+                    raise
+                raise budget_exc from exc
             if terminal:
                 exc.feedling_error_class = (
                     "content_filtered"
@@ -6541,8 +6786,11 @@ async def reliable_chat_completion_async(
                 if remaining <= 0 or delay >= remaining:
                     if remaining > 0:
                         await asyncio.sleep(remaining)
-                    deadline_exc = TimeoutError(
-                        "provider absolute deadline exceeded during retry backoff"
+                    deadline_exc = (
+                        provider_deadline.ProviderAbsoluteDeadlineExceeded(absolute_deadline, "backoff")
+                        if deadline_provenance else TimeoutError(
+                            "provider absolute deadline exceeded during retry backoff"
+                        )
                     )
                     deadline_exc.feedling_error_class = "transient_exhausted"
                     if provider_attempt_trace is not None:

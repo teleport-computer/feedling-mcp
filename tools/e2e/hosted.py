@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import time
 import uuid
+from pathlib import Path
 
 from .client import (
-    E2EClient, VERDICT_FALLBACK, VERDICT_OK,
+    E2EClient, VERDICT_FALLBACK, VERDICT_OK, require_release_execution,
     decrypt_verdict as _decrypt_verdict,
 )
 from .config import HostedCell
@@ -137,8 +138,15 @@ def _hosted_send(c: E2EClient, text: str) -> tuple[float, str]:
     return 0.0, last
 
 
-def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
+def run_hosted_cell(cell: HostedCell, pool: dict[str, str], *,
+                    exact_model: str | None = None,
+                    release_run_id: str | None = None,
+                    release_evidence_dir: Path | None = None) -> dict:
     """Returns {cell, result: ok|fail|skip, steps: [(name, ok|fail|warn|skip, detail)]}."""
+    if release_run_id is not None and (not isinstance(exact_model, str) or not exact_model.strip()):
+        raise ValueError("release requires an exact model; fallback is forbidden")
+    if release_run_id is not None:
+        require_release_execution()
     key = cell.key(pool)
     if not key:
         return {"cell": cell.name, "result": "skip",
@@ -165,6 +173,10 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
         return verdict == VERDICT_OK
 
     models = cell.models or [m for m in [pool.get("E2E_RELAY_MODEL", "")] if m]
+    if exact_model is not None:
+        if not isinstance(exact_model, str) or not exact_model.strip():
+            raise ValueError("exact model must be nonempty")
+        models = [exact_model]
     if not models:
         return {"cell": cell.name, "result": "skip",
                 "steps": [("model", "skip", "no model candidates configured")]}
@@ -179,7 +191,11 @@ def run_hosted_cell(cell: HostedCell, pool: dict[str, str]) -> dict:
         return {"cell": cell.name, "result": RESULT_INSTRUMENT_STALE,
                 "steps": [("model_preflight", RESULT_INSTRUMENT_STALE, pf_detail)]}
 
-    with E2EClient.provision(route="model_api") as c:
+    provision_kw = {}
+    if release_run_id is not None:
+        provision_kw = {"release_run_id": release_run_id,
+                        "release_evidence_dir": release_evidence_dir}
+    with E2EClient.provision(route="model_api", **provision_kw) as c:
         active_client = c
         c.configure_failure_evidence(cell=f"hosted:{cell.name}")
         # Record the preflight outcome as a (non-gating) step for the report.

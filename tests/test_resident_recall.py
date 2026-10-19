@@ -30,7 +30,7 @@ import pytest  # noqa: E402
 
 from chat import resident_recall_core as core  # noqa: E402
 from enclave.routes import chat as enclave_chat  # noqa: E402
-from memory import plaintext_recall, recall_select  # noqa: E402
+from memory import plaintext_recall, recall_select, recall_candidates, recall_contract, recall_operation  # noqa: E402
 from memory.embedding import query_service, recall_policy  # noqa: E402
 from test_plaintext_recall import (  # noqa: E402
     UID, WINDOWS, _embedder, _moments, _rows, _stored_payload, _strip_timing)
@@ -219,6 +219,8 @@ def turn(monkeypatch):
     monkeypatch.setattr(core.accounts_registry, "effective_content_encryption", lambda _u: "off")
     monkeypatch.setattr(core, "_history_page", lambda _u, _s: [dict(r) for r in rows])
     monkeypatch.setattr(core, "_list_moments", lambda _u, _l: _moments())
+    monkeypatch.setattr(recall_candidates, "read_owned", lambda uid, end:
+                        recall_contract.candidate_batch(_moments(), uid))
 
     def enclave(user_id, seq, input_fp=False):
         calls["enclave"] += 1
@@ -236,9 +238,9 @@ def turn(monkeypatch):
                                  request={"message_id": rows[-1]["id"], "seq": rows[-1]["seq"]})
 
 
-def test_mode_off_is_409_and_never_calls_the_enclave(turn):
+def test_mode_off_is_unavailable_and_never_calls_the_enclave(turn):
     body, status = core.select_for_turn(turn.store, turn.request, 3.0)
-    assert (status, body["error"]) == (409, "not_served")
+    assert (status, body["error"]) == (503, "recall_unavailable")
     assert turn.calls["enclave"] == 0
 
 
@@ -265,32 +267,34 @@ def test_mode_on_serves_the_local_lexical_pick_with_its_page(turn, monkeypatch, 
     assert turn.calls["traces"][-1]["detail"]["source"] == "local"
 
 
-def test_mode_on_falls_back_to_the_enclave_exactly_once(turn, monkeypatch):
+def test_mode_on_candidate_failure_never_calls_enclave(turn, monkeypatch):
     monkeypatch.setenv(core.MODE_ENV, "on")
-    monkeypatch.setattr(core, "local_select", lambda *_a, **_k: (_ for _ in ()).throw(
-        plaintext_recall.NotServedHere("sealed_history")))
+    monkeypatch.setattr(recall_operation, "decode", lambda *a: (_ for _ in ()).throw(
+        recall_contract.RecallUnavailable("candidate_payload_invalid")))
     body, status = core.select_for_turn(turn.store, turn.request, 3.0)
-    assert status == 200 and body["source"] == "enclave_fallback"
-    assert turn.calls["enclave"] == 1
-    assert turn.calls["traces"][-1]["detail"]["reason"] == "sealed_history"
+    assert status == 503 and body["category"] == "recall_unavailable"
+    assert body["context_memory_log"]["counts"]["selected"] is None
+    assert turn.calls["enclave"] == 0
 
 
-def test_mode_on_is_503_when_local_and_enclave_both_fail(turn, monkeypatch):
+def test_mode_on_unknown_required_failure_is_hard_without_enclave(turn, monkeypatch):
     monkeypatch.setenv(core.MODE_ENV, "on")
-    monkeypatch.setattr(core, "local_select", lambda *_a, **_k: 1 / 0)
+    monkeypatch.setattr(core, "_history_page", lambda *a: 1 / 0)
     turn.calls["enclave_fails"] = True
     body, status = core.select_for_turn(turn.store, turn.request, 3.0)
-    assert (status, body["error"]) == (503, "recall_unavailable")
-    assert turn.calls["enclave"] == 1
+    assert status == 503 and body["category"] == "content_read_failed"
+    assert turn.calls["enclave"] == 0
 
 
-def test_mode_on_past_the_budget_does_not_wait_for_a_slow_local_pick(turn, monkeypatch):
+def test_mode_on_past_budget_does_not_wait_or_fallback(turn, monkeypatch):
     monkeypatch.setenv(core.MODE_ENV, "on")
-    monkeypatch.setattr(core, "local_select", lambda *_a, **_k: time.sleep(1.0))
+    monkeypatch.setattr(recall_operation, "rank", lambda *a, **k: time.sleep(0.3))
     started = time.monotonic()
-    body, status = core.select_for_turn(turn.store, turn.request, 0.2)
-    assert time.monotonic() - started < 0.9
-    assert status == 503                                   # budget spent: no half fallback
+    body, status = core.select_for_turn(turn.store, turn.request, 0.05)
+    assert time.monotonic() - started < 0.25
+    assert status == 503 and turn.calls["enclave"] == 0
+    assert core._LOCAL_PERMIT.acquire(timeout=0.5)
+    core._LOCAL_PERMIT.release()
 
 
 def test_a_message_outside_the_page_is_422(turn, monkeypatch):
@@ -299,25 +303,18 @@ def test_a_message_outside_the_page_is_422(turn, monkeypatch):
     assert (status, body["error"]) == (422, "message_not_in_window")
 
 
-def test_mode_shadow_returns_the_enclave_answer_and_records_a_comparison(turn, monkeypatch):
+def test_off_account_shadow_is_explicitly_unavailable(turn, monkeypatch):
     monkeypatch.setenv(core.MODE_ENV, "shadow")
     body, status = core.select_for_turn(turn.store, turn.request, 3.0)
-    assert status == 200 and body["source"] == "enclave_shadow"
-    assert turn.calls["enclave"] == 1
-    for _ in range(200):
-        shadow = [t for t in turn.calls["traces"] if t["type"] == "memory.resident_recall.shadow"]
-        if shadow:
-            break
-        time.sleep(0.01)
-    assert shadow[0]["detail"]["verdict"] == "comparable"
-    assert shadow[0]["detail"]["same"] is True
+    assert status == 503 and body["detail"] == "shadow_not_supported_for_off"
+    assert turn.calls["enclave"] == 0
 
 
-def test_a_failing_shadow_keeps_the_enclave_answer(turn, monkeypatch):
+def test_off_shadow_never_starts_selector_or_enclave(turn, monkeypatch):
     monkeypatch.setenv(core.MODE_ENV, "shadow")
-    monkeypatch.setattr(core, "local_select", lambda *_a, **_k: 1 / 0)
+    monkeypatch.setattr(core, "local_select", lambda *a, **k: pytest.fail("shadow started"))
     body, status = core.select_for_turn(turn.store, turn.request, 3.0)
-    assert status == 200 and body["source"] == "enclave_shadow"
+    assert status == 503 and turn.calls["enclave"] == 0
 
 
 def test_the_deadline_is_clamped_to_server_bounds():
@@ -377,11 +374,14 @@ def consumer_env(monkeypatch):
     def get(url, **kw):
         calls["get"].append((url, kw))
         return state["get"]()
-    monkeypatch.setattr(consumer, "_HTTP", types.SimpleNamespace(post=post))
+    state["mode"] = "off"
+    monkeypatch.setattr(consumer, "_HTTP", types.SimpleNamespace(post=post, get=lambda *a, **k:
+                        _Resp(200, {"user_id": UID, "content_encryption_effective": state["mode"]})))
     monkeypatch.setattr(consumer, "_ENCLAVE_CLIENT", types.SimpleNamespace(get=get))
     monkeypatch.setattr(consumer, "FEEDLING_ENCLAVE_URL", "https://enclave.test")
     monkeypatch.setitem(consumer._whoami_cache, "content_encryption_effective", "off")
-    msg = {"id": rows[-1]["id"], "seq": rows[-1]["seq"]}
+    msg = dict(rows[-1])
+    answer.update(user_id=UID, seq=msg["seq"], message_id=msg["id"])
     return types.SimpleNamespace(consumer=consumer, calls=calls, state=state, msg=msg,
                                  answer=answer)
 
@@ -400,18 +400,22 @@ def test_a_plaintext_account_uses_the_backend_and_not_the_enclave(consumer_env):
 @pytest.mark.parametrize("effective", ["on", "", "weird"])
 def test_encrypted_or_unknown_accounts_never_call_the_backend(consumer_env, monkeypatch, effective):
     c = consumer_env
-    monkeypatch.setitem(c.consumer._whoami_cache, "content_encryption_effective", effective)
+    c.state["mode"] = effective
     c.state["post"] = lambda: pytest.fail("the backend route was called")
     assert c.consumer._auto_memory_fetch_for_turn(c.msg) is not None
     assert len(c.calls["get"]) == 1
 
 
 @pytest.mark.parametrize("status", [404, 409])
-def test_404_and_409_fall_back_to_the_enclave_once(consumer_env, status):
+def test_off_404_is_unavailable_and_409_is_hard_neither_falls_back(consumer_env, status):
     c = consumer_env
     c.state["post"] = lambda: _Resp(status, {"error": "not_served"})
-    assert c.consumer._auto_memory_fetch_for_turn(c.msg) is not None
-    assert len(c.calls["get"]) == 1
+    if status == 404:
+        assert c.consumer._auto_memory_fetch_for_turn(c.msg)["selected"] is None
+    else:
+        with pytest.raises(c.consumer._RecallInputError):
+            c.consumer._auto_memory_fetch_for_turn(c.msg)
+    assert c.calls["get"] == []
 
 
 @pytest.mark.parametrize("outcome", ["503", "500", "401", "timeout"])
@@ -419,7 +423,8 @@ def test_other_failures_are_unknown_and_never_retry_the_enclave(consumer_env, ou
     c = consumer_env
     c.state["post"] = ((lambda: TimeoutError("read timeout")) if outcome == "timeout"
                        else (lambda: _Resp(int(outcome), {"error": "x"})))
-    assert c.consumer._auto_memory_fetch_for_turn(c.msg) is None
+    with pytest.raises(c.consumer._RecallInputError):
+        c.consumer._auto_memory_fetch_for_turn(c.msg)
     assert c.calls["get"] == []
 
 
@@ -427,10 +432,12 @@ def test_the_page_check_still_applies_to_the_backend_answer(consumer_env):
     c = consumer_env
     mismatched = {**c.answer, "messages": c.answer["messages"][:-1]}
     c.state["post"] = lambda: _Resp(200, mismatched)
-    assert c.consumer._auto_memory_fetch_for_turn(c.msg) is None      # unknown, not 0
+    with pytest.raises(c.consumer._RecallInputError):
+        c.consumer._auto_memory_fetch_for_turn(c.msg)
     failed = {**c.answer, "context_memory_log": {**c.answer["context_memory_log"], "mode": "failed"}}
     c.state["post"] = lambda: _Resp(200, failed)
-    assert c.consumer._auto_memory_fetch_for_turn(c.msg) is None
+    with pytest.raises(c.consumer._RecallInputError):
+        c.consumer._auto_memory_fetch_for_turn(c.msg)
 
 
 def test_a_healthy_empty_pick_is_zero_not_unknown(consumer_env):
@@ -550,7 +557,7 @@ def test_account_checks_and_diagnostics_cannot_overrun_the_response_budget(turn,
         release.set()
 
 
-def test_shadow_thread_start_failure_keeps_the_enclave_result(turn, monkeypatch):
+def test_off_shadow_does_not_start_a_thread_or_enclave(turn, monkeypatch):
     monkeypatch.setenv(core.MODE_ENV, "shadow")
     original = threading.Thread.start
 
@@ -561,7 +568,7 @@ def test_shadow_thread_start_failure_keeps_the_enclave_result(turn, monkeypatch)
 
     monkeypatch.setattr(threading.Thread, "start", start)
     body, status = core.select_for_turn(turn.store, turn.request, 1)
-    assert status == 200 and body["source"] == "enclave_shadow"
+    assert status == 503 and body["detail"] == "shadow_not_supported_for_off"
     assert core._SHADOW_PERMIT.acquire(blocking=False)
     core._SHADOW_PERMIT.release()
 

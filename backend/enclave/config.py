@@ -1,5 +1,6 @@
 """Enclave configuration constants and utilities."""
 import os
+import re
 
 # For local dev we point at the simulator; in a real CVM, dstack-sdk defaults
 # to /var/run/dstack.sock inside the container.
@@ -56,12 +57,17 @@ SCREEN_VLM_API_KEY = os.environ.get("FEEDLING_SCREEN_VLM_API_KEY", "")
 SCREEN_VLM_MODEL = os.environ.get("FEEDLING_SCREEN_VLM_MODEL", "qwen/qwen3-vl-8b-instruct")
 SCREEN_VLM_BASE_URL = os.environ.get("FEEDLING_SCREEN_VLM_BASE_URL", "https://openrouter.ai/api/v1")
 
-# Release metadata — normally injected via build-time env or read from a
-# sidecar file baked into the image. For Phase 1 we accept env values with
-# obvious placeholders so it's clear this isn't fabricated content.
+def _optional_hex_metadata(name: str, prefix: str, length: int) -> str | None:
+    """Declared metadata only: absent/placeholder values must not look verified."""
+    value = os.environ.get(name, "").strip()
+    return value if re.fullmatch(re.escape(prefix) + rf"[0-9a-fA-F]{{{length}}}", value) else None
+
+
+# Declared release metadata, not a measurement of the running image or KMS.
+# Unknown digest/transaction values are JSON null; never reuse historical data.
 RELEASE = {
     "git_commit": os.environ.get("FEEDLING_GIT_COMMIT", "dev"),
-    "image_digest": os.environ.get("FEEDLING_IMAGE_DIGEST", "sha256:dev"),
+    "image_digest": _optional_hex_metadata("FEEDLING_IMAGE_DIGEST", "sha256:", 64),
     "built_at": os.environ.get("FEEDLING_BUILT_AT", "dev"),
     "compose_yaml_url": os.environ.get(
         "FEEDLING_COMPOSE_YAML_URL",
@@ -73,6 +79,7 @@ RELEASE = {
     ),
 }
 
+# Declared policy for client display; this does not configure or verify dstack KMS.
 # Phase 1 testnet deployment (Ethereum Sepolia, chain 11155111). Will be
 # redeployed to Base Sepolia (chain 84532) before Phase 2, then to Base
 # mainnet (chain 8453) before Phase 5. The default is the live Phase 1
@@ -83,10 +90,7 @@ APP_AUTH = {
         "0x6c8A6f1e3eD4180B2048B808f7C4b2874649b88F",
     ),
     "chain_id": int(os.environ.get("FEEDLING_APP_AUTH_CHAIN_ID", 11155111)),
-    "deploy_tx": os.environ.get(
-        "FEEDLING_APP_AUTH_DEPLOY_TX",
-        "0x752f213ae95f6759a86750dab9545c79c6841ad7838082ddf6ad5271d117915f",
-    ),
+    "deploy_tx": _optional_hex_metadata("FEEDLING_APP_AUTH_DEPLOY_TX", "0x", 64),
     "explorer_base_url": os.environ.get(
         "FEEDLING_APP_AUTH_EXPLORER",
         "https://sepolia.etherscan.io",

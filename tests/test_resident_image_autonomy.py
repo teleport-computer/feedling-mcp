@@ -189,3 +189,15 @@ def test_v1_and_v2_share_one_detector_implementation():
 def test_detector_cases_on_the_v1_lane(text, expected):
     """把判定用例固化在 V1 这一侧,确保共享没被人悄悄改回各写一份。"""
     assert crc._claims_image_delivered(text) is expected
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(crc, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

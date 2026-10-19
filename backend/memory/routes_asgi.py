@@ -23,15 +23,19 @@ All store / enclave work is blocking, so it runs off the event loop via
 
 from __future__ import annotations
 
+import asyncio
+
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 
 from accounts import auth_core
 from accounts.auth_core import AuthResult
+from asgi import context as asgi_context
 from asgi import threadpool
 from asgi.deps import require_auth, require_scope
 from asgi import http as asgi_http
 from memory import memory_core
+from memory.index_timing import IndexTiming
 import memory_readside_core
 
 router = APIRouter()
@@ -66,11 +70,26 @@ def _post_enclave_for(runtime_token):
 async def memory_index(request: Request, auth: AuthResult = Depends(require_auth)):
     payload = (await asgi_http.read_json_silent(request)) or {}
     runtime_token = auth_core.extract_runtime_token(request.headers)
-    body, status = await threadpool.run_db(
-        memory_core.index, auth.store, auth.api_key, payload,
-        post_enclave=_post_enclave_for(runtime_token),
+    # Start after authentication/body parsing. This is not client/network time.
+    timing = IndexTiming(
+        lane="search" if str(payload.get("query") or "").strip() else "index",
+        request_id=asgi_context.current_request_id.get(),
     )
-    return JSONResponse(body, status_code=status)
+    status = None
+    outcome = "error"
+    try:
+        body, status = await threadpool.run_db(
+            timing.run_core, memory_core.index, auth.store, auth.api_key, payload,
+            post_enclave=timing.upstream(_post_enclave_for(runtime_token)),
+        )
+        response = JSONResponse(body, status_code=status)
+        outcome = "ok" if status < 400 else "error"
+        return response
+    except asyncio.CancelledError:
+        outcome = "cancelled"
+        raise
+    finally:
+        timing.emit(auth.store, status=outcome, http_status=status)
 
 
 @router.post("/v1/memory/fetch")

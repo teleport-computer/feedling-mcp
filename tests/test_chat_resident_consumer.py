@@ -2,6 +2,7 @@
 Regression tests for tools/chat_resident_consumer.py
 =====================================================
 
+
 Run with: pytest tests/test_chat_resident_consumer.py -v
 """
 
@@ -71,6 +72,11 @@ def _reset_proactive_guard_state_between_tests(tmp_path, monkeypatch):
     the agent call entirely. The foreground notice throttle is also process
     global; clear it both before and after each test so this module cannot
     suppress notices in a subsequently collected test module."""
+    # These pre-existing prompt/lifecycle cases exercise the encrypted lane.
+    # Model the new operation-bound identity read explicitly, independent of
+    # the mutable best-effort whoami cache. Off-mode tests override this seam
+    # and validate source envelopes rather than these decoded-only fixtures.
+    monkeypatch.setattr(crc, "_recall_account", lambda: ("legacy-test-user", "on"))
     monkeypatch.setattr(crc, "FEEDLING_HOME", tmp_path / "resident-home")
     crc._self_wake_streak = 0
     crc._proactive_fail_streak = 0
@@ -16867,3 +16873,301 @@ def test_no_visible_reply_turn_keeps_existing_success_semantics(monkeypatch, kin
     assert actions.call_count == int(kind == "actions")
     assert len([row for row in traces if row[0][1] == "agent.turn.success"]) == 1
     assert not [row for row in traces if row[0][1] == "agent.turn.reply_delivery"]
+
+
+@pytest.mark.parametrize('media', [False, True], ids=['text', 'image_only'])
+@pytest.mark.parametrize('lane', ['chat', 'proactive'])
+@pytest.mark.parametrize('fault', ['candidate_payload', 'candidate_owner', 'required_body'])
+def test_off_recall_actual_consumer_lifecycle(monkeypatch, lane, fault, media):
+    """Actual consumer entrypoints bridge to production recall + real candidate SQL."""
+    import conftest
+    import db
+    from chat import resident_recall_core as recall_core
+    from core import store as core_store
+    uid = f'u_t820_resident_{lane}_{fault}'
+    conftest.seed_user(uid)
+    source = dict(id='required', seq=1, ts=1000.0, role='user', v=1,
+                  owner_user_id=uid, body='current question', content='current question')
+    if media:
+        source.pop('body')
+        source.update(content_type='image', image_mime='image/png', body_b64=base64.b64encode(b'synthetic-image').decode(), content='')
+    if media:
+        if fault == 'invalid_b64': source['body_b64'] = '!'
+        if fault == 'oversize': source['body_b64'] = 'A' * 2_666_672
+        if fault == 'sealed': source['body_ct'] = 'sealed'
+        if fault == 'foreign_attachment': source['owner_user_id'] = 'foreign'
+    if fault == 'required_body':
+        source['body'] = 123
+    if media:
+        from psycopg.types.json import Jsonb
+        with db.get_pool().connection() as conn:
+            source['seq']=conn.execute(
+                'INSERT INTO chat_messages (user_id,msg_id,ts,doc) VALUES (%s,%s,%s,%s) RETURNING seq',
+                (uid,source['id'],source['ts'],Jsonb({k:v for k,v in source.items() if k!='seq'}))).fetchone()[0]
+    source_snapshot = dict(source)
+    if media and fault in {'missing_attachment', 'changed_attachment', 'seq_attachment'}:
+        with db.get_pool().connection() as conn:
+            if fault == 'missing_attachment':
+                conn.execute('DELETE FROM chat_messages WHERE user_id=%s', (uid,))
+            else:
+                conn.execute("UPDATE chat_messages SET doc=jsonb_set(doc,'{caption_body}',%s) WHERE user_id=%s", (Jsonb('changed'),uid))
+        if fault == 'seq_attachment': source_snapshot['seq'] += 1
+    candidate = dict(id='optional', owner_user_id='foreign' if fault == 'candidate_owner' else uid,
+                     body='{', visibility='shared', occurred_at='2026-01-01')
+    assert db.memory_upsert(uid, candidate['id'], candidate['occurred_at'], candidate)
+    monkeypatch.setattr(crc, '_recall_account', lambda: (uid, 'off'))
+    monkeypatch.setattr(recall_core.accounts_registry, 'effective_content_encryption', lambda _: 'off')
+    def history_page(*args):
+        if not media:
+            return [source]
+        from memory.recall_attachments import HistoryPage
+        public={k:v for k,v in source_snapshot.items() if k!='body_b64'}
+        public.update(body_omitted=True,body_omitted_reason='image')
+        return HistoryPage([public],[source_snapshot])
+    monkeypatch.setattr(recall_core, '_history_page', history_page)
+    monkeypatch.setenv(recall_core.MODE_ENV, 'on')
+    class Reply:
+        def __init__(self, body, status):
+            self.body, self.status_code = body, status
+        def json(self):
+            return self.body
+    def post(url, **kwargs):
+        assert url.endswith('/v1/memory/turn-selection')
+        body, status = recall_core.select_for_turn(core_store.get_store(uid), kwargs['json'], 3)
+        return Reply(body, status)
+    monkeypatch.setattr(crc, '_HTTP', types.SimpleNamespace(post=post))
+    monkeypatch.setattr(crc, '_turn_selection_from_enclave', lambda *a: pytest.fail('off enclave fallback'))
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls, replies, statuses = [], [], []
+    monkeypatch.setattr(crc, 'call_agent', lambda *a, **k: calls.append(a) or ['validated reply'])
+    monkeypatch.setattr(crc, 'post_reply', lambda *a, **k: replies.append(a) or {'id':'reply'})
+    monkeypatch.setattr(crc, '_emit_debug_trace', lambda *a, **k: None)
+    monkeypatch.setattr(crc, '_save_agent_session', lambda *a, **k: None, raising=False)
+    if lane == 'chat':
+        latest = crc._process_messages([source])
+        assert latest == (1000.0 if fault == 'candidate_payload' else 0.0)
+        if fault != 'candidate_payload':
+            assert 'required' not in crc._seen_ids
+    else:
+        monkeypatch.setattr(crc, 'claim_proactive_job', lambda _: True)
+        monkeypatch.setattr(crc, 'update_proactive_job_status',
+                            lambda job, status, reason='', **kw: statuses.append(status))
+        monkeypatch.setattr(crc, '_screen_context_for_frame_ids', lambda _: ('', [], []))
+        context = crc._proactive_chat_context_from_history([source], limit=4, now=1001)
+        monkeypatch.setattr(crc, 'recent_chat_context_for_proactive', lambda *a, **k: context)
+        crc._process_proactive_jobs([_proactive_job_fixture()])
+        if fault != 'candidate_payload':
+            assert statuses[-1] == 'failed'
+            assert 'realizing' not in statuses
+        else:
+            assert 'realizing' in statuses
+    assert len(calls) == (1 if fault == 'candidate_payload' else 0)
+    assert len(replies) == (1 if fault == 'candidate_payload' else 0)
+    if fault == 'candidate_payload':
+        assert crc._RECALL_TURN_STATE['selected'] is None
+        assert crc._RECALL_TURN_STATE['injected'] == 0
+
+
+@pytest.mark.parametrize('fault', ['none', 'missing', 'foreign', 'sealed'])
+def test_off_explicit_reference_is_required_before_resident_dispatch(monkeypatch, fault):
+    import conftest
+    import db
+    from chat import resident_recall_core as recall_core
+    from core import store as core_store
+    uid = f'u_t820_required_reference_{fault}'
+    conftest.seed_user(uid)
+    source = dict(id='required-reference-message', seq=1, ts=1000.0, role='user', v=1,
+                  owner_user_id=uid, body='Explain this', content='Explain this', quoted_memory_ids='reference')
+    card = dict(id='reference', owner_user_id='foreign' if fault=='foreign' else uid,
+                body=json.dumps({'summary':'The explicit reference body'}), visibility='shared', occurred_at='2026-01-01')
+    if fault == 'sealed':
+        card['body_ct'] = 'sealed'
+    if fault != 'missing':
+        assert db.memory_upsert(uid, 'reference', card['occurred_at'], card)
+    monkeypatch.setattr(crc, '_recall_account', lambda: (uid, 'off'))
+    monkeypatch.setattr(recall_core.accounts_registry, 'effective_content_encryption', lambda _: 'off')
+    monkeypatch.setattr(recall_core, '_history_page', lambda *a: [dict(source)])
+    monkeypatch.setenv(recall_core.MODE_ENV, 'off')
+    class Reply:
+        def __init__(self, body, status): self.body, self.status_code = body, status
+        def json(self): return self.body
+    def post(url, **kwargs):
+        body, status = recall_core.select_for_turn(core_store.get_store(uid), kwargs['json'], 3)
+        return Reply(body, status)
+    monkeypatch.setattr(crc, '_HTTP', types.SimpleNamespace(post=post))
+    monkeypatch.setattr(crc, '_turn_selection_from_enclave', lambda *a: pytest.fail('off enclave fallback'))
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    calls = []
+    monkeypatch.setattr(crc, 'call_agent', lambda *a, **k: calls.append(a) or ['reply'])
+    monkeypatch.setattr(crc, 'post_reply', lambda *a, **k: {'id':'reply'})
+    monkeypatch.setattr(crc, '_emit_debug_trace', lambda *a, **k: None)
+    monkeypatch.setattr(crc, '_save_agent_session', lambda *a, **k: None, raising=False)
+    latest = crc._process_messages([source])
+    if fault == 'none':
+        assert latest == 1000.0 and len(calls) == 1
+        assert 'The explicit reference body' in str(calls[0])
+        assert crc._RECALL_TURN_STATE['selected'] is None
+    else:
+        assert latest == 0 and not calls
+        assert source['id'] not in crc._seen_ids
+
+
+@pytest.mark.parametrize('lane', ['chat', 'proactive'])
+@pytest.mark.parametrize('fault', ['missing_attachment', 'changed_attachment', 'seq_attachment',
+                                  'foreign_attachment', 'invalid_b64', 'oversize', 'sealed'])
+def test_off_resident_attachment_negative_lifecycle(monkeypatch, lane, fault):
+    test_off_recall_actual_consumer_lifecycle(monkeypatch, lane, fault, True)
+
+
+def test_off_history_proof_excludes_future_and_rejects_invalid_used_caption():
+    historical = dict(id='old', owner_user_id='u', seq=1, body='old text', content='old text')
+    future = dict(id='future', owner_user_id='u', seq=3, body='future', content='future')
+    assert crc._require_recall_history([historical, future], 'u', before_seq=2) == [historical]
+    image = dict(id='image', owner_user_id='u', seq=1, content_type='image',
+                 body_omitted=True, caption_body='caption', content='tampered')
+    with pytest.raises(crc._RecallInputError):
+        crc._require_recall_history([image], 'u')
+    image['content'] = 'caption'
+    assert crc._require_recall_history([image], 'u') == [image]
+    image['caption_owner_user_id'] = 'foreign'
+    with pytest.raises(crc._RecallInputError):
+        crc._require_recall_history([image], 'u')
+
+
+def test_explicit_references_are_not_absorbed_into_another_backlog_anchor():
+    row = dict(id='reference-backlog', role='user', content='Explain this', quoted_memory_ids='reference')
+    assert not crc._collapse_eligible(row)
+
+
+@pytest.mark.parametrize("encryption", ["on", "off"])
+@pytest.mark.parametrize("receipt", [b"not-json-SECRET", b"null", b"[]", b"{}", b'{"ok":true}', b'{"id":""}', b'{"id":42}', b'{"status":"ignored","reason":"unknown"}', b'{"reason":"voice_call_finalized"}', b'{"status":"ignored","reason":[]}'])
+def test_reply_receipt_failure_retains_turn_until_valid_receipt(monkeypatch, encryption, receipt):
+    """Exercise real post_reply/HTTP decoding, then prove the same turn can recover."""
+    import httpx
+
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    traces, requests = [], []
+    responses = iter([receipt, b'{"id":"durable-reply","ts":100.5,"v":1}'])
+
+    def transport(request):
+        assert request.url.path == "/v1/chat/response"
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, content=next(responses), request=request)
+
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: traces.append((a, kw)))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *a, **kw: "")
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_whoami_cache", {
+        "user_id": "usr_receipt", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32,
+        "content_encryption_effective": encryption,
+    })
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {
+        "v": 1, "id": kw.get("item_id") or "reply", "body_ct": "sealed",
+    })
+    msg = {"id": "receipt-parent", "role": "user", "content": "hello", "ts": 100.0}
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        monkeypatch.setattr(crc, "_HTTP", client)
+        with patch.object(crc, "call_agent", return_value="visible reply") as agent:
+            assert crc._process_messages([msg]) == 0.0
+            assert crc._msg_key(msg) not in crc._seen_ids
+            assert not any(a[1] == "agent.turn.success" for a, _ in traces)
+            assert crc._process_messages([msg]) == 100.0
+            assert agent.call_count == 2
+    assert len(requests) == 2
+    assert all(r["reply_to_message_id"] == msg["id"] for r in requests)
+    if encryption == "on":
+        assert requests[0]["resident_delivery_id"] == requests[1]["resident_delivery_id"]
+    assert sum(a[1] == "agent.turn.success" for a, _ in traces) == 1
+
+
+@pytest.mark.parametrize("body", [b"SECRET-not-json", b"null", b"[]", b"{}", b'{"id":false}', b'{"id":"  "}'])
+def test_invalid_reply_receipt_error_does_not_expose_body(body):
+    import httpx
+
+    response = httpx.Response(200, content=body, request=httpx.Request("POST", "https://example.invalid/v1/chat/response"))
+    with pytest.raises(RuntimeError, match="chat_response_invalid_receipt") as caught:
+        crc._handle_post_reply_response(response)
+    assert str(caught.value) == "chat_response_invalid_receipt"
+
+
+@pytest.mark.parametrize("receipt", [b"{}", b"bad-json"])
+def test_proactive_invalid_receipt_is_failed_not_posted(monkeypatch, receipt):
+    import httpx
+
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    _wire_proactive_harness(monkeypatch, replies=["visible wake"], post_result=None)
+    statuses = []
+    response = httpx.Response(200, content=receipt, request=httpx.Request("POST", "https://example.invalid/v1/chat/response"))
+    monkeypatch.setattr(crc, "post_reply", lambda *a, **kw: crc._handle_post_reply_response(response))
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *a, **kw: statuses.append((a, kw)))
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=202.0)])
+    assert list(crc._worldbook_signal_window) == []
+    assert not any(a[1] == "posted" for a, _ in statuses)
+    assert statuses[-1][0][1:] == ("failed", "chat_response_invalid_receipt")
+
+
+@pytest.mark.parametrize("encryption", ["on", "off"])
+@pytest.mark.parametrize("reason", ["voice_call_finalized", "voice_call_cancelled", "voice_call_finalizing"])
+def test_voice_terminal_receipt_settles_foreground_without_success(monkeypatch, encryption, reason):
+    """Real post_reply/HTTP decoder must settle terminal voice and continue the batch."""
+    import httpx
+
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    traces, requests = [], []
+    monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: traces.append((a, kw)))
+    monkeypatch.setattr(crc, "_worldbook_context_for_foreground", lambda *a, **kw: "")
+    monkeypatch.setattr(crc, "_note_agent_turn_success", lambda: None)
+    monkeypatch.setattr(crc, "_ENCRYPTION_AVAILABLE", True)
+    monkeypatch.setattr(crc, "_refresh_whoami_for_encrypted_reply", lambda: True)
+    monkeypatch.setattr(crc, "_whoami_cache", {
+        "user_id": "usr_receipt", "user_pk": b"u" * 32, "enclave_pk": b"e" * 32,
+        "content_encryption_effective": encryption,
+    })
+    monkeypatch.setattr(crc, "_build_envelope", lambda **kw: {
+        "v": 1, "id": kw.get("item_id") or "reply", "body_ct": "sealed",
+    })
+    msgs = [{"id": f"voice-terminal-{i}", "role": "user", "content": "hello", "ts": ts}
+            for i, ts in enumerate([100.0, 200.0])]
+
+    def transport(request):
+        assert request.url.path == "/v1/chat/response"
+        requests.append(json.loads(request.content))
+        return httpx.Response(200, json={"status": "ignored", "reason": reason}, request=request)
+
+    with httpx.Client(transport=httpx.MockTransport(transport)) as client:
+        monkeypatch.setattr(crc, "_HTTP", client)
+        with patch.object(crc, "call_agent", return_value="visible reply") as agent:
+            assert crc._process_messages(msgs) == 200.0
+            assert agent.call_count == 2
+    assert [r["reply_to_message_id"] for r in requests] == [m["id"] for m in msgs]
+    assert all(crc._msg_key(m) in crc._seen_ids for m in msgs)
+    assert not any(a[1] == "agent.turn.success" for a, _ in traces)
+    deliveries = [kw["detail"] for a, kw in traces if a[1] == "agent.turn.reply_delivery"]
+    assert len(deliveries) == 2
+    assert all(d["outcome"] == "skipped" and d["accepted_reply_count"] == 0
+               and d["terminal_errors"] == [reason] for d in deliveries)
+
+
+@pytest.mark.parametrize("reason", ["voice_call_finalized", "voice_call_cancelled", "voice_call_finalizing"])
+def test_proactive_voice_terminal_receipt_is_not_posted(monkeypatch, reason):
+    import httpx
+
+    crc._seen_ids.clear()
+    crc._seen_ids_order.clear()
+    _wire_proactive_harness(monkeypatch, replies=["visible wake"], post_result=None)
+    statuses = []
+    response = httpx.Response(200, json={"status": "ignored", "reason": reason},
+                             request=httpx.Request("POST", "https://example.invalid/v1/chat/response"))
+    monkeypatch.setattr(crc, "post_reply", lambda *a, **kw: crc._handle_post_reply_response(response))
+    monkeypatch.setattr(crc, "update_proactive_job_status", lambda *a, **kw: statuses.append((a, kw)))
+    crc._process_proactive_jobs([_proactive_job_for_worldbook(ts=202.0)])
+    assert list(crc._worldbook_signal_window) == []
+    assert not any(a[1] == "posted" for a, _ in statuses)
+    assert statuses[-1][0][1:] == ("failed", reason)

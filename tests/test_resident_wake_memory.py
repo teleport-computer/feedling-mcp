@@ -201,4 +201,21 @@ def test_wake_unknown_selection_is_distinct_from_healthy_zero(wake, case):
 def test_stale_tail_keeps_latest_user_anchor_without_historical_quotes():
     context = consumer._proactive_chat_context_from_history(HISTORY, limit=1, now=100000)
     assert "收到啦" in context.text and "露营灯的事情" not in context.text
-    assert context.memory_anchor == {"id": "u_latest", "seq": 10}
+    assert context.memory_anchor["id"] == "u_latest"
+    assert context.memory_anchor["seq"] == 10
+    assert context.memory_anchor["content"] == HISTORY[1]["content"]
+    assert context.memory_anchor["quoted_memories"] == []
+    assert context.memory_anchor["quoted_memory_ids"] == ""
+    assert context.memory_anchor["_recall_historical_anchor"] is True
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(consumer, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

@@ -94,7 +94,7 @@ from memory.embedding import serve as embedding_serve
 from memory.embedding import sweep as memory_embedding_sweep
 from memory import garden_component
 from memory import memory_core
-from memory import plaintext_recall
+from memory import plaintext_recall, recall_attachments, recall_contract, recall_operation, recall_projection, recall_references
 from screen import screen_read_core
 from model_api_runtime.v2 import context as v2_context
 from model_api_runtime.v2 import compaction as v2_compaction
@@ -936,15 +936,39 @@ def _decrypt_chat_rows_inner(
     explicit safe placeholder instead of disappearing before the durable
     cursor advances past its identity.
     """
+    effective = recall_contract.checked_operation_mode(user_id, _read_recall_mode(user_id))
+    off_views = None
+    if effective == "off" and not include_capture_metadata:
+        if not rows:
+            return []
+        seq = max(row.get("seq", 0) for row in rows if isinstance(row, dict))
+        projection = recall_projection.turn(rows, user_id, seq, require_current=False)
+        off_views = {row["id"]: row for row in projection.projected}
     token = _mint_runtime_token(user_id)
     out: list[dict] = []
     for m in rows:
+        raw_source_json = json.dumps(m, sort_keys=True, ensure_ascii=True) if off_views is not None else None
         raw_role = str(m.get("role") or "").strip().lower()
         if user_only and raw_role not in _USER_ROLES:
             continue
         mid, ts = m.get("id"), m.get("ts")
         role = "assistant" if raw_role in _ASSISTANT_ROLES else "user"
-        if m.get("content_type") == "image":
+        if off_views is not None and (m.get("caption_body_ct") or m.get("caption_K_enclave")):
+            # Projection already checked caption owner; excluded ciphertext must
+            # not reach the legacy caption reader even when the body is plain.
+            m = {key: value for key, value in m.items() if not key.startswith("caption_")}
+        projected = off_views.get(mid) if off_views is not None else None
+        if projected is not None and projected.get("body_unavailable_reason"):
+            # Only independently validated plaintext caption content survives a
+            # sealed body. Do not reattach its quoted IDs or media routes below.
+            readable_caption = bool(str(projected.get("content") or "").strip())
+            if user_only and not readable_caption:
+                raise recall_contract.RecallFailure("unreadable_current_message")
+            m = projected
+            item = {**projected, "role": role}
+            if not readable_caption:
+                item["unreadable"] = True
+        elif m.get("content_type") == "image":
             item = _image_row(
                 m,
                 mid=mid,
@@ -1057,6 +1081,11 @@ def _decrypt_chat_rows_inner(
                     value = m.get(key)
                     if isinstance(value, int) and not isinstance(value, bool):
                         item[key] = max(0, value)
+        if off_views is not None:
+            item["_recall_source_json"] = raw_source_json
+            item["_recall_row_proof"] = recall_contract.TurnRowProof(
+                user_id, mid, item["seq"], str(item.get("content") or ""),
+                bool(item.get("unreadable")))
         out.append(item)
     return out
 
@@ -1416,8 +1445,8 @@ def _expand_quoted_memories(user_id: str, rows: list[dict]) -> list[dict]:
     问「你怎么看待这个」,模型只看到那句话和 app 附的时间戳块,于是答非所问(2026-08-10)。
 
     没有任何一行带引用时**直接返回**,不碰记忆库:绝大多数轮次都没有引用。
-    取卡失败/卡已被删一律降级成内容无关的 unavailable 提示,绝不让这一轮失败
-    —— 用户的话必须照常送达,模型也不能凭空猜卡片正文。
+    Effective-off references are required content and fail before dispatch.
+    Encrypted compatibility retains its unavailable-reference notice.
     """
     wanted: list[str] = []
     for row in rows:
@@ -1435,44 +1464,53 @@ def _expand_quoted_memories(user_id: str, rows: list[dict]) -> list[dict]:
         return rows
 
     by_id: dict[str, dict] = {}
-    try:
-        store = core_store.get_store_per_load_mode(
-            user_id, reason="memory quoted-card reads are DB/readside backed"
-        )
-        token = _mint_runtime_token(user_id)
-
-        def _post(api_key, candidates, *, operation, payload=None):
-            return memory_readside_core.post_enclave_readside(
-                api_key,
-                candidates,
-                operation=operation,
-                payload=payload,
-                runtime_token=token,
+    off = any(isinstance(row.get("_recall_row_proof"), recall_contract.TurnRowProof) for row in rows)
+    if off:
+        deadline = time.monotonic() + plaintext_recall.local_timeout_seconds()
+        cards = recall_operation._stage(
+            lambda: recall_references.read(user_id, wanted, deadline), deadline, _LOCAL_RECALL_PERMIT)
+        by_id = {card["id"]: card for card in cards}
+    if not off:
+        try:
+            store = core_store.get_store_per_load_mode(
+                user_id, reason="memory quoted-card reads are DB/readside backed"
             )
+            token = _mint_runtime_token(user_id)
 
-        fetched, status = memory_core.fetch(
-            store,
-            None,
-            # An explicit Garden click authorizes both non-current lifecycle
-            # shapes. Ambient recall still excludes archived and superseded
-            # cards unless they are explicitly requested here.
-            {
-                "ids": wanted,
-                "limit": len(wanted),
-                "include_archived": True,
-                "include_superseded": True,
-            },
-            post_enclave=_post,
-        )
-        items = fetched.get("items") if isinstance(fetched, dict) else None
-        if status == 200 and isinstance(items, list):
-            for card in items:
-                if isinstance(card, dict) and str(card.get("id") or "").strip():
-                    by_id[str(card["id"]).strip()] = card
-    except Exception as e:  # noqa: BLE001 — 引用取不回来绝不能拖垮这一轮聊天
-        log.warning(
-            "[v2.serve_worker] quoted memory fetch failed for %s: %s", user_id, e
-        )
+            def _post(api_key, candidates, *, operation, payload=None):
+                return memory_readside_core.post_enclave_readside(
+                    api_key,
+                    candidates,
+                    operation=operation,
+                    payload=payload,
+                    runtime_token=token,
+                )
+
+            fetched, status = memory_core.fetch(
+                store,
+                None,
+                # An explicit Garden click authorizes both non-current lifecycle
+                # shapes. Ambient recall still excludes archived and superseded
+                # cards unless they are explicitly requested here.
+                {
+                    "ids": wanted,
+                    "limit": len(wanted),
+                    "include_archived": True,
+                    "include_superseded": True,
+                },
+                post_enclave=_post,
+            )
+            items = fetched.get("items") if isinstance(fetched, dict) else None
+            if status == 200 and isinstance(items, list):
+                for card in items:
+                    if isinstance(card, dict) and str(card.get("id") or "").strip():
+                        by_id[str(card["id"]).strip()] = card
+        except recall_contract.RecallFailure:
+            raise
+        except Exception as e:  # noqa: BLE001 — encrypted compatibility only
+            log.warning(
+                "[v2.serve_worker] quoted memory fetch failed for %s: %s", user_id, e
+            )
 
     out: list[dict] = []
     for row in rows:
@@ -1489,6 +1527,13 @@ def _expand_quoted_memories(user_id: str, rows: list[dict]) -> list[dict]:
         )
         if block:
             row["content"] = f"{block}\n\n{row.get('content') or ''}"
+        if off:
+            previous = row.get("_recall_row_proof")
+            if not isinstance(previous, recall_contract.TurnRowProof):
+                raise recall_contract.RecallFailure("turn_content_unconfirmed")
+            row["_recall_row_proof"] = recall_contract.TurnRowProof(
+                previous.user_id, previous.message_id, previous.seq,
+                str(row.get("content") or ""), previous.excluded)
         out.append(row)
     return out
 
@@ -2389,7 +2434,13 @@ def _read_vision_observations_with_deadline(
     ):
         raise RuntimeError("vision_targets_invalid")
 
-    images = _read_images(user_id, [item["message_id"] for item in normalized])
+    proofs = {str(item.get("message_id")): item["_recall_attachment_proof"]
+              for item in targets if item.get("_recall_attachment_proof") is not None}
+    images = {mid: recall_attachments.image_payload(proof, user_id, mid)
+              for mid, proof in proofs.items()}
+    remaining_ids = [item["message_id"] for item in normalized if item["message_id"] not in proofs]
+    if remaining_ids:
+        images.update(_read_images(user_id, remaining_ids))
     token = _mint_runtime_token(user_id)
     configs: dict[str, provider_client.ProviderConfig] = {}
     outcomes: dict[str, v2_worker.VisionObservationOutcome] = {}
@@ -2516,7 +2567,7 @@ def _read_vision_observations_with_deadline(
     )
 
 
-def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
+def _read_files(user_id: str, message_ids: list[str], *, proofs=None) -> dict[str, dict]:
     """Read cached artifact text views or materialize through a real sandbox.
 
     Upload/storage remains unchanged. A cache miss acquires the configured
@@ -2569,11 +2620,19 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
             if isinstance(row, dict) and row.get("id")
         }
         for mid in message_ids:
-            meta = rows_by_id.get(str(mid)) or {}
+            proof = (proofs or {}).get(str(mid))
+            if proof is not None and (not isinstance(proof, recall_attachments.AttachmentProof)
+                                      or proof.user_id != user_id or proof.message_id != str(mid)):
+                raise recall_contract.RecallFailure("attachment_binding_invalid", category="binding_error")
+            meta = proof.source if proof is not None else rows_by_id.get(str(mid)) or {}
             name = str(meta.get("file_name") or "file")
             mime = str(meta.get("file_mime") or "application/octet-stream")
             view_path = artifact_text_view_path(str(mid), name)
             try:
+                if proof is not None:
+                    # The historical text-view cache is not version-bound to
+                    # this proof. Materialize the already-validated bytes.
+                    raise WorkspaceNotFound(view_path)
                 entry = artifacts.read_text_view(view_path)
             except WorkspaceNotFound:
                 try:
@@ -2614,14 +2673,14 @@ def _read_files(user_id: str, message_ids: list[str]) -> dict[str, dict]:
                     }
                     continue
                 try:
-                    res = cap_registry.run_capability(
-                        "chat_file_read",
-                        store,
-                        api_key=None,
-                        runtime_token=token,
-                        params={"message_id": mid},
-                    )
-                    data = (res.to_dict() or {}).get("data") or {}
+                    if proof is not None:
+                        data = {"file_b64": base64.b64encode(proof.body).decode("ascii"),
+                                "file_name": name, "file_mime": mime}
+                    else:
+                        res = cap_registry.run_capability(
+                            "chat_file_read", store, api_key=None,
+                            runtime_token=token, params={"message_id": mid})
+                        data = (res.to_dict() or {}).get("data") or {}
                     b64 = data.get("file_b64")
                     if not b64:
                         raise RuntimeError("artifact body unavailable")
@@ -4891,7 +4950,48 @@ def _read_capture_state(user_id: str) -> dict:
     )
 
 
-def _read_context_memories(user_id: str, *, through_seq: int, coordinates: dict | None = None) -> dict:
+def _read_recall_mode(user_id):
+    status, value = plaintext_recall.run_bounded(
+        lambda: accounts_registry.effective_content_encryption(user_id),
+        plaintext_recall.local_timeout_seconds(), _LOCAL_RECALL_PERMIT)
+    if status != "ok":
+        raise recall_contract.RecallFailure("account_unconfirmed")
+    return recall_contract.exact_mode(value)
+
+
+def _prepare_recall_attachments(user_id, rows, *, required_ids, deadline):
+    def prepare():
+        mode = recall_contract.checked_operation_mode(
+            user_id, accounts_registry.effective_content_encryption(user_id))
+        if mode != "off":
+            return {}
+        proofs = {}
+        required = set(required_ids)
+        required.update(str(row["id"]) for row in [r for r in rows if r.get("has_file") and r.get("id")][-v2_worker._TAIL_FILE_LIMIT:])
+        for row in rows:
+            if row.get("id") not in required or not (row.get("has_image") or row.get("has_file")):
+                continue
+            raw = row.get("_recall_source_json")
+            if not isinstance(raw, str):
+                raise recall_contract.RecallFailure("attachment_unconfirmed")
+            source = json.loads(raw)
+            mid = row["id"]
+            if mid in proofs:
+                if proofs[mid].source != source:
+                    raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
+                continue
+            proofs[mid] = recall_attachments.read(source, user_id, deadline)
+        return proofs
+    status, result = plaintext_recall.run_bounded(
+        prepare, deadline - time.monotonic(), _LOCAL_RECALL_PERMIT)
+    if status == "ok" and time.monotonic() <= deadline:
+        return result
+    if isinstance(result, recall_contract.RecallFailure):
+        raise result
+    raise recall_contract.RecallFailure("attachment_unconfirmed")
+
+
+def _read_context_memories(user_id: str, *, through_seq: int, coordinates: dict | None = None, deadline: float | None = None, attachment_proofs=None, source_snapshots=None) -> dict:
     """Pick this turn's context cards.
 
     ``FEEDLING_V2_PLAINTEXT_RECALL`` (T779 step 2b): ``off`` (default) is the
@@ -4899,18 +4999,23 @@ def _read_context_memories(user_id: str, *, through_seq: int, coordinates: dict 
     selects locally for comparison; ``on`` serves plaintext accounts locally and
     keeps the enclave path for everything else.
     """
+    deadline = deadline if deadline is not None else time.monotonic() + plaintext_recall.local_timeout_seconds()
     mode = plaintext_recall.mode()
-    if mode == "on":
-        deps = _plaintext_recall_deps()
-        status, value = plaintext_recall.run_bounded(
-            lambda: plaintext_recall.select(user_id, through_seq, deps),
-            plaintext_recall.local_timeout_seconds(), _LOCAL_RECALL_PERMIT)
-        if status == "ok":
-            return value.payload
-        if status == "error" and not isinstance(value, plaintext_recall.NotServedHere):
-            log.warning("[v2.memory] local recall failed: %s", type(value).__name__)
-        elif status in {"timeout", "busy"}:
-            log.warning("[v2.memory] local recall %s; this turn uses the enclave", status)
+    status, effective = plaintext_recall.run_bounded(
+        lambda: accounts_registry.effective_content_encryption(user_id),
+        deadline - time.monotonic(), _LOCAL_RECALL_PERMIT)
+    if status != "ok":
+        raise recall_contract.RecallFailure("account_unconfirmed")
+    effective = recall_contract.checked_operation_mode(user_id, effective)
+    if effective == "off":
+        payload, _status = recall_operation.select_off(
+            user_id, through_seq, _plaintext_recall_deps(), deadline=deadline,
+            permit=_LOCAL_RECALL_PERMIT, rollout=mode,
+            # Explicit references are validated by the prompt reader.
+            include_references=False, query_args=plaintext_recall.V2_QUERY_ARGS,
+            attachment_proofs=attachment_proofs, source_snapshots=source_snapshots,
+            hybrid=recall_policy.hybrid_enabled())
+        return {**payload, "account_mode": "off"}
     rpc_started = time.monotonic()
     payload, diagnostics = _read_context_memories_enclave(
         user_id, through_seq=through_seq, input_fp=(mode == "shadow"))
@@ -4960,13 +5065,18 @@ def _plaintext_history_page(user_id: str, through_seq: int) -> list:
     # prints on import, and a slot process with the mode off must not load it.
     from chat import chat_core
 
+    from memory.recall_attachments import HistoryPage
+    raw_page = []
     body, status = chat_core.history(
         _plaintext_recall_store(user_id),
         query={"limit": "4", "before_seq": str(int(through_seq) + 1), "include_image_body": "0"},
-        user_agent="v2-plaintext-recall", remote_addr="")
+        user_agent="v2-plaintext-recall", remote_addr="", raw_page_observer=lambda rows: raw_page.extend(json.loads(json.dumps(rows))))
     if status != 200 or not isinstance(body, dict):
         raise plaintext_recall.NotServedHere("history_unavailable")
-    return list(body.get("messages") or [])
+    rows = body.get("messages")
+    if not isinstance(rows, list):
+        raise recall_contract.RecallFailure("history_shape_invalid")
+    return HistoryPage(rows, raw_page)
 
 
 def _plaintext_list_moments(user_id: str, limit: int) -> list:
@@ -5519,6 +5629,8 @@ def build_production_deps() -> v2_worker.TurnDeps:
         read_messages_since=_read_messages,
         read_messages_after_seq=_read_messages_after_seq,
         read_context_memories=_read_context_memories,
+        read_recall_mode=_read_recall_mode,
+        prepare_recall_attachments=_prepare_recall_attachments,
         ordered_chat_replies=True,
         runtime_mode_enabled=lambda user_id: (
             hosted_config_store.hosted_runtime_v2_enabled_strict(
@@ -5851,6 +5963,8 @@ async def _r2_cleanup_loop(
     )
 
 
+_DRAIN_PARENT_GENERATION = uuid.uuid4().hex
+
 _HEARTBEAT_INTERVAL_SEC = _positive_float_env(
     "FEEDLING_V2_HEARTBEAT_INTERVAL_SEC", "10"
 )
@@ -5967,20 +6081,34 @@ def _fleet_memory_snapshot(fleet) -> dict:
     The container's cgroup reading is taken once here and must not be summed
     with anything; per-process RSS and PSS are reported separately (PSS is the
     one that can be summed across processes)."""
+    from model_api_runtime.v2 import process_flags
+
     slots = []
+    flag_sampling = process_flags.enabled()
+    parent_pid = os.getpid()
+    full_sha = os.environ.get("FEEDLING_GIT_COMMIT", "")
     for key in fleet.keys():
         supervisor = fleet.supervisor(key)
         pid_fn = getattr(supervisor, "child_pid", None)
         pid = pid_fn() if callable(pid_fn) else None
-        slots.append({"slot": f"{key.pool}:{key.index}", "pid": pid,
-                      **v2_process_memory.process(pid)})
-    return {
+        slot = {"slot": f"{key.pool}:{key.index}", "pid": pid,
+                **v2_process_memory.process(pid)}
+        if flag_sampling:
+            slot["process_flags"] = process_flags.sample(pid, parent_pid, full_sha)
+        slots.append(slot)
+    result = {
         "sampled_at": round(time.time(), 1),
         "release": str(os.environ.get("FEEDLING_GIT_COMMIT", "dev"))[:12],
         "parent": {"pid": os.getpid(), **v2_process_memory.process(os.getpid())},
         "slots": slots,
         "cgroup_kb": v2_process_memory.cgroup_kb(),
     }
+    if flag_sampling:
+        result["process_flags"] = {
+            **process_flags.context(_CAPTURE_ENABLED),
+            "parent": process_flags.sample(parent_pid, parent_pid, full_sha),
+        }
+    return result
 
 
 # procfs reads (smaps_rollup walks each process's mappings) can be slow; they
@@ -6070,6 +6198,19 @@ async def _fleet_heartbeat_loop(
                         "restarting": max(0, configured - capacity),
                     }
                 }
+                try:
+                    runtime_state['drain'] = {
+                        'parent_generation': _DRAIN_PARENT_GENERATION,
+                        'slots': [fleet.supervisor(key).drain_witness()
+                                  for key in fleet.keys() if key.pool == pool],
+                    }
+                except Exception as exc:
+                    # An unavailable drain reading must fail cleanup proof,
+                    # without suppressing the rest of the fleet heartbeat.
+                    runtime_state['drain'] = {
+                        'parent_generation': _DRAIN_PARENT_GENERATION,
+                        'unavailable': type(exc).__name__,
+                    }
                 if pool == "foreground":
                     # T779 step 2c: memory and encoder state measured from the
                     # database (no shell access to the test machine).
@@ -6754,8 +6895,7 @@ def _start_genesis_thread(worker_id: str):
         if enabled:
             log.warning(
                 "[v2.serve_worker] FEEDLING_GENESIS_WORKER_ENABLED set but "
-                "prerequisites missing (need FEEDLING_RUNTIME_TOKEN_SECRET + "
-                "FEEDLING_ENCLAVE_URL) — genesis worker dormant"
+                "runtime-token secret missing — genesis worker dormant"
             )
         return None
 
@@ -6872,7 +7012,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     )
     fleet = v2_pool_supervisor.SlotFleet(
         config,
-        spawn_target=turn_child.main,
+        spawn_target=turn_child.main_with_turn_budget,
         worker_id=worker_id,
         poll_interval=poll_interval,
         db_pool_max=_runtime_db_pool_limits(config)[1],

@@ -53,6 +53,15 @@ except ModuleNotFoundError:
     sys.modules.setdefault("content_encryption", _fake_enc)
 
 import tools.chat_resident_consumer as crc  # noqa: E402  (after env setup)
+
+
+@pytest.fixture(autouse=True)
+def _encrypted_operation_identity(monkeypatch):
+    # Existing decoded-image fixtures model the encrypted compatibility lane.
+    # Effective-off source-envelope/canonical-body cases live in the real
+    # lifecycle tests, rather than treating these decoded fixtures as proof.
+    monkeypatch.setattr(crc, "_recall_account", lambda: ("image-compat-user", "on"))
+
 from core import chat_images  # noqa: E402
 
 

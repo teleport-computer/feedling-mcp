@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import base64
 import concurrent.futures
+from contextlib import contextmanager, ExitStack
 import json
 import logging
 import math
@@ -58,7 +59,7 @@ if str(_BACKEND_DIR) not in sys.path:
 import db
 from core import runtime_token
 from core.store import get_store_per_load_mode
-from agent_runtime import leases, spawners
+from agent_runtime import admission, leases, spawners
 from agent_runtime.heartbeat_policy import SUPERVISOR_HEARTBEAT_MAX_AGE_SEC
 # One-shot introduction machinery is shared with chat.chat_core so BOTH the
 # supervisor recovery path AND the resident chat_loop_verified fast-path enqueue
@@ -71,6 +72,21 @@ from notices import core as notices
 from notices import catalog
 
 log = logging.getLogger("feedling.agent_runtime.supervisor")
+
+_ADMISSION_UNKNOWN = object()
+
+
+@contextmanager
+def _isolated_admission(user_id, entry, *, expected=None):
+    # Catch only entry/read/lock errors. Never swallow an exception from the
+    # guarded acquire/spawn body or reinterpret it as configuration deletion.
+    with ExitStack() as stack:
+        try:
+            current = stack.enter_context(admission.guard(user_id, entry, expected=expected))
+        except Exception as exc:  # per-user DB/lock failure, no admission granted
+            log.warning('admission unknown for %s (%s); deferring', user_id, type(exc).__name__)
+            current = _ADMISSION_UNKNOWN
+        yield current
 
 # Scopes on the per-user runtime token minted for the hosted consumer. "web" lets
 # its io_cli reach /v1/agent/web/{search,fetch} (require_runtime_scope("web") —
@@ -455,6 +471,17 @@ class Supervisor:
                     user_id, child["pid"])
         return False
 
+    def _revoke_admission(self, user_id: str) -> None:
+        """Only this owner may cancel its lease, and only after confirmed exit."""
+        with self._lock:
+            child = self.children.get(user_id)
+            if child is not None:
+                if not self._stop_child(user_id, child):
+                    return
+                self.children.pop(user_id, None)
+            leases.release(user_id, self.owner, now=self._now())
+            self._restart_ledger.pop(user_id, None)
+
     def tick(self, roster: list[dict], *, pre_spawn=None) -> None:
         """One supervision pass: heartbeat live children, reap dead ones, drop
         children whose user left the roster, and acquire+spawn for any user we
@@ -492,156 +519,169 @@ class Supervisor:
                 self._restart_ledger.pop(user_id, None)
 
         spawned_this_tick = 0
-        newly_acquired: list[tuple[str, dict, str]] = []  # (user_id, entry, home)
+        newly_acquired: list[tuple[str, dict, str, tuple]] = []
         for entry in roster:
             user_id = str(entry.get("user_id") or "")
             if not user_id:
                 continue
-            with self._lock:
-                child = self.children.get(user_id)
-
-            if child and self.alive_fn(child["pid"]):
-                self._keyless_since.pop(user_id, None)  # running → no longer awaiting a key
-                if not leases.renew(user_id, self.owner, ttl=self.lease_ttl,
-                                    pid=child["pid"], status="running", now=self._now()):
-                    # Lost the lease (another supervisor took over after an expiry
-                    # window). Kill our now-orphaned child so we don't double-run
-                    # alongside the new owner ("exactly one consumer per user").
-                    log.warning("lost lease for %s; terminating orphaned child", user_id)
-                    with self._lock:
-                        if self._stop_child(user_id, child):
-                            self.children.pop(user_id, None)
-                            self._restart_ledger.pop(user_id, None)
-                elif _spawn_identity(entry) != _spawn_identity(child["entry"]):
-                    self._mark_child_healthy(user_id, child, now=self._now())
-                    # Config changed for a still-running user (driver/provider/model/
-                    # key) — the consumer's env + home are stale. Respawn in place;
-                    # we keep our live lease (just renewed) so no reacquire needed.
-                    log.info("config changed for %s; respawning consumer", user_id)
-                    home = child["home"]
-                    # Serialize the whole kill→spawn→renew→swap against the renew
-                    # thread. Otherwise renew_live could snapshot the OLD child, see
-                    # its (just-killed) pid dead, and release the lease this branch is
-                    # renewing for the replacement pid — leaving the new consumer
-                    # lease-less and reaped next tick. Holding the lock across the swap
-                    # keeps renew_live's `is child` check observing the new child.
-                    # Per-user try/except: a respawn failure here must not propagate
-                    # up through tick() and abort the whole roster loop (that would
-                    # strand every OTHER still-healthy user this tick, including
-                    # ones already renewed above). The old child is already killed;
-                    # on failure we remove it and enter the same restart backoff as
-                    # an unexpected child exit.
-                    spawn_ok = False
-                    with self._lock:
-                        if not self._stop_child(user_id, child):
-                            continue
-                        # Stop AND liveness were checked before releasing the old
-                        # consumer's in-flight reply claims. A failed stop keeps
-                        # the child tracked and cannot grant a second execution
-                        # (chat/service.py:66-70's double-provider-burn risk).
-                        # This lets the fresh consumer pick the message up on its
-                        # next poll instead of waiting out CHAT_POLL_CLAIM_TTL_SEC
-                        # (600s) for the lost-turn redelivery backstop. Best-effort:
-                        # chat_expire_reply_claims already swallow-and-logs; the
-                        # committed UPDATE's DB trigger owns cross-worker wake;
-                        # the respawn's real job remains kill→spawn→swap.
-                        try:
-                            db.chat_expire_reply_claims(user_id)
-                        except Exception:  # noqa: BLE001
-                            log.exception("claim release failed for %s", user_id)
-                        started_at = self._now()
-                        try:
-                            pid = self.spawn_fn(entry, user_id, home)
-                        except Exception as e:  # noqa: BLE001
-                            detail = f"{type(e).__name__}:{e}"
-                            self.children.pop(user_id, None)
-                            self._record_restart_failure(user_id, detail)
-                            log.exception("respawn failed for %s", user_id)
-                        else:
-                            spawn_ok = True
-                            self._write_token(user_id, home)
-                            leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
-                                         status="running", driver=entry.get("driver"),
-                                         now=self._now())
-                            self.children[user_id] = {
-                                "pid": pid,
-                                "entry": entry,
-                                "home": home,
-                                "started_at": started_at,
-                            }
-                    if spawn_ok:
-                        # respawn ok -> clear spawn/decrypt notices only; NOT degraded
-                        # (token health is independent — see _write_token).
-                        self._resolve_after_spawn(user_id)
-                        self._enqueue_introduction(user_id, entry)
-                    else:
-                        self._emit_runner_notice(user_id, "runner_spawn_failed", detail)
-                else:
-                    self._write_token(user_id, child["home"])  # refresh short-lived token
-                    self._mark_child_healthy(user_id, child, now=self._now())
-                continue
-
-            if child:  # tracked but dead → reap
-                self._reap_crashed_child(user_id, child)
-
-            now = self._now()
-            if self._restart_is_deferred(user_id, now=now):
-                leases.renew(
-                    user_id,
-                    self.owner,
-                    ttl=self.lease_ttl,
-                    status="error",
-                    now=now,
-                )
-                continue
-
-            if not _genesis_ready_to_spawn(user_id):
-                # "先 genesis 后 spawn" (spec §5): don't boot a blank consumer while
-                # an import genesis is still distilling persona/facts. Fresh-start
-                # (no genesis) and done/failed both fall through to spawn.
-                log.info("genesis in progress for %s; deferring spawn this tick", user_id)
-                continue
-            if _entry_has_no_credential(entry):
-                first = self._keyless_since.setdefault(user_id, now)
-                if not _keyless_defer_expired(first, now, self._keyless_defer_cap_sec):
-                    # Cold-start race: the consumer would spawn before _resolve_one
-                    # has fetched+decrypted this user's provider-key envelope, so its
-                    # first CLI turn hits "Not logged in" and posts a premature
-                    # fallback. Defer — the queued message waits (chat claim) and gets
-                    # a REAL reply once the key resolves next tick. provider_key is in
-                    # _spawn_identity, so no other wiring is needed for the self-heal.
-                    log.info("provider key not resolved yet for %s; deferring spawn "
-                             "(%.0fs waited)", user_id, now - first)
+            if entry.get('_admission_unresolved'):
+                continue  # present but unknown; never admission or confirmed removal
+            with _isolated_admission(user_id, entry) as admission_witness:
+                if admission_witness is _ADMISSION_UNKNOWN:
                     continue
-                # Cap exceeded — resolution is stuck; spawn anyway so the existing
-                # keyless fallback / runner_key_decrypt_failed notice still surfaces.
-                log.warning("provider key still unresolved for %s after %.0fs; "
-                            "spawning keyless (fallback path)", user_id, now - first)
-            else:
-                self._keyless_since.pop(user_id, None)
-            with self._lock:
-                # Count this tick's not-yet-spawned acquisitions toward the cap so
-                # a single tick can't blow past max_children before they're tracked.
-                at_capacity = (self.max_children
-                               and len(self.children) + len(newly_acquired) >= self.max_children)
-            if at_capacity:
-                # At capacity: don't acquire a new user — leave it for another runner.
-                # Existing children above were already renewed, never force-reaped.
-                continue
-            if self.max_spawns_per_tick and spawned_this_tick >= self.max_spawns_per_tick:
-                # Per-tick spawn cap reached — spawn the remaining users next tick
-                # (don't even acquire, so another supervisor could take them).
-                continue
-            home = self._home(user_id)
-            if not leases.acquire(user_id, driver=entry.get("driver", "claude"),
-                                  runtime_home=home, lease_owner=self.owner,
-                                  ttl=self.lease_ttl, now=self._now()):
-                continue  # another supervisor holds a live lease
-            # Acquired — defer the spawn so any pre-spawn side-channel can be
-            # configured for the whole batch first (the in-CVM LiteLLM gateway
-            # route this used to serve is retired).
-            spawned_this_tick += 1
-            newly_acquired.append((user_id, entry, home))
+                if admission_witness is None:
+                    self._revoke_admission(user_id)
+                    continue
+                with self._lock:
+                    child = self.children.get(user_id)
+                if (child and child.get("admission_witness") != admission_witness
+                        and _spawn_identity(entry) == _spawn_identity(child["entry"])):
+                    self._revoke_admission(user_id)
+                    continue
+
+                if child and self.alive_fn(child["pid"]):
+                    self._keyless_since.pop(user_id, None)  # running → no longer awaiting a key
+                    if not leases.renew(user_id, self.owner, ttl=self.lease_ttl,
+                                        pid=child["pid"], status="running", now=self._now()):
+                        # Lost the lease (another supervisor took over after an expiry
+                        # window). Kill our now-orphaned child so we don't double-run
+                        # alongside the new owner ("exactly one consumer per user").
+                        log.warning("lost lease for %s; terminating orphaned child", user_id)
+                        with self._lock:
+                            if self._stop_child(user_id, child):
+                                self.children.pop(user_id, None)
+                                self._restart_ledger.pop(user_id, None)
+                    elif _spawn_identity(entry) != _spawn_identity(child["entry"]):
+                        self._mark_child_healthy(user_id, child, now=self._now())
+                        # Config changed for a still-running user (driver/provider/model/
+                        # key) — the consumer's env + home are stale. Respawn in place;
+                        # we keep our live lease (just renewed) so no reacquire needed.
+                        log.info("config changed for %s; respawning consumer", user_id)
+                        home = child["home"]
+                        # Serialize the whole kill→spawn→renew→swap against the renew
+                        # thread. Otherwise renew_live could snapshot the OLD child, see
+                        # its (just-killed) pid dead, and release the lease this branch is
+                        # renewing for the replacement pid — leaving the new consumer
+                        # lease-less and reaped next tick. Holding the lock across the swap
+                        # keeps renew_live's `is child` check observing the new child.
+                        # Per-user try/except: a respawn failure here must not propagate
+                        # up through tick() and abort the whole roster loop (that would
+                        # strand every OTHER still-healthy user this tick, including
+                        # ones already renewed above). The old child is already killed;
+                        # on failure we remove it and enter the same restart backoff as
+                        # an unexpected child exit.
+                        spawn_ok = False
+                        with self._lock:
+                            if not self._stop_child(user_id, child):
+                                continue
+                            # Stop AND liveness were checked before releasing the old
+                            # consumer's in-flight reply claims. A failed stop keeps
+                            # the child tracked and cannot grant a second execution
+                            # (chat/service.py:66-70's double-provider-burn risk).
+                            # This lets the fresh consumer pick the message up on its
+                            # next poll instead of waiting out CHAT_POLL_CLAIM_TTL_SEC
+                            # (600s) for the lost-turn redelivery backstop. Best-effort:
+                            # chat_expire_reply_claims already swallow-and-logs; the
+                            # committed UPDATE's DB trigger owns cross-worker wake;
+                            # the respawn's real job remains kill→spawn→swap.
+                            try:
+                                db.chat_expire_reply_claims(user_id)
+                            except Exception:  # noqa: BLE001
+                                log.exception("claim release failed for %s", user_id)
+                            started_at = self._now()
+                            try:
+                                pid = self.spawn_fn(entry, user_id, home)
+                            except Exception as e:  # noqa: BLE001
+                                detail = f"{type(e).__name__}:{e}"
+                                self.children.pop(user_id, None)
+                                self._record_restart_failure(user_id, detail)
+                                log.exception("respawn failed for %s", user_id)
+                            else:
+                                spawn_ok = True
+                                self.children[user_id] = {
+                                    "pid": pid,
+                                    "entry": entry,
+                                    "home": home,
+                                    "started_at": started_at,
+                                    "admission_witness": admission_witness,
+                                }
+                                self._write_token(user_id, home)
+                                leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
+                                             status="running", driver=entry.get("driver"),
+                                             now=self._now())
+                        if spawn_ok:
+                            # respawn ok -> clear spawn/decrypt notices only; NOT degraded
+                            # (token health is independent — see _write_token).
+                            self._resolve_after_spawn(user_id)
+                            self._enqueue_introduction(user_id, entry)
+                        else:
+                            self._emit_runner_notice(user_id, "runner_spawn_failed", detail)
+                    else:
+                        self._write_token(user_id, child["home"])  # refresh short-lived token
+                        self._mark_child_healthy(user_id, child, now=self._now())
+                    continue
+
+                if child:  # tracked but dead → reap
+                    self._reap_crashed_child(user_id, child)
+
+                now = self._now()
+                if self._restart_is_deferred(user_id, now=now):
+                    leases.renew(
+                        user_id,
+                        self.owner,
+                        ttl=self.lease_ttl,
+                        status="error",
+                        now=now,
+                    )
+                    continue
+
+                if not _genesis_ready_to_spawn(user_id):
+                    # "先 genesis 后 spawn" (spec §5): don't boot a blank consumer while
+                    # an import genesis is still distilling persona/facts. Fresh-start
+                    # (no genesis) and done/failed both fall through to spawn.
+                    log.info("genesis in progress for %s; deferring spawn this tick", user_id)
+                    continue
+                if _entry_has_no_credential(entry):
+                    first = self._keyless_since.setdefault(user_id, now)
+                    if not _keyless_defer_expired(first, now, self._keyless_defer_cap_sec):
+                        # Cold-start race: the consumer would spawn before _resolve_one
+                        # has fetched+decrypted this user's provider-key envelope, so its
+                        # first CLI turn hits "Not logged in" and posts a premature
+                        # fallback. Defer — the queued message waits (chat claim) and gets
+                        # a REAL reply once the key resolves next tick. provider_key is in
+                        # _spawn_identity, so no other wiring is needed for the self-heal.
+                        log.info("provider key not resolved yet for %s; deferring spawn "
+                                 "(%.0fs waited)", user_id, now - first)
+                        continue
+                    # Cap exceeded — resolution is stuck; spawn anyway so the existing
+                    # keyless fallback / runner_key_decrypt_failed notice still surfaces.
+                    log.warning("provider key still unresolved for %s after %.0fs; "
+                                "spawning keyless (fallback path)", user_id, now - first)
+                else:
+                    self._keyless_since.pop(user_id, None)
+                with self._lock:
+                    # Count this tick's not-yet-spawned acquisitions toward the cap so
+                    # a single tick can't blow past max_children before they're tracked.
+                    at_capacity = (self.max_children
+                                   and len(self.children) + len(newly_acquired) >= self.max_children)
+                if at_capacity:
+                    # At capacity: don't acquire a new user — leave it for another runner.
+                    # Existing children above were already renewed, never force-reaped.
+                    continue
+                if self.max_spawns_per_tick and spawned_this_tick >= self.max_spawns_per_tick:
+                    # Per-tick spawn cap reached — spawn the remaining users next tick
+                    # (don't even acquire, so another supervisor could take them).
+                    continue
+                home = self._home(user_id)
+                if not leases.acquire(user_id, driver=entry.get("driver", "claude"),
+                                      runtime_home=home, lease_owner=self.owner,
+                                      ttl=self.lease_ttl, now=self._now()):
+                    continue  # another supervisor holds a live lease
+                # Acquired — defer the spawn so any pre-spawn side-channel can be
+                # configured for the whole batch first (the in-CVM LiteLLM gateway
+                # route this used to serve is retired).
+                spawned_this_tick += 1
+                newly_acquired.append((user_id, entry, home, admission_witness))
 
         # Configure any side-channel the new consumers need at startup for the
         # now-owned batch BEFORE starting them. Lease-scoped: only users we just
@@ -649,42 +689,52 @@ class Supervisor:
         # post-tick reconcile still converges.
         if newly_acquired and pre_spawn is not None:
             try:
-                pre_spawn([uid for uid, _, _ in newly_acquired])
+                pre_spawn([uid for uid, _, _, _ in newly_acquired])
             except Exception as e:  # noqa: BLE001
                 log.warning("pre-spawn reconcile failed; spawning anyway: %s", e)
 
-        for user_id, entry, home in newly_acquired:
-            # Per-user try/except: this loop already fanned out N acquired leases
-            # this tick — one user's spawn_fn raising (e.g. a fork/exec failure)
-            # must not abort the loop and strand the REST of this batch with an
-            # acquired-but-never-spawned lease. Failure marks the lease 'error'
-            # (surfaced to the user via a runner notice) and moves on; the lease
-            # is retried as a fresh acquisition next tick once it's reaped.
-            started_at = self._now()
-            try:
-                pid = self.spawn_fn(entry, user_id, home)
-            except Exception as e:  # noqa: BLE001
-                detail = f"{type(e).__name__}:{e}"
-                self._record_restart_failure(user_id, detail)
-                self._emit_runner_notice(user_id, "runner_spawn_failed", detail)
-                log.exception("spawn failed for %s", user_id)
-                continue   # skip this user only — no cascading failure for the rest of the batch
-            self._write_token(user_id, home)  # initial short-lived token for the child
-            leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
-                         status="running", now=self._now())
-            with self._lock:
-                self.children[user_id] = {
-                    "pid": pid,
-                    "entry": entry,
-                    "home": home,
-                    "started_at": started_at,
-                }
-            log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
-            self._keyless_since.pop(user_id, None)
-            # successful spawn -> clear spawn/decrypt notices only; NOT degraded
-            # (token health is independent — see _write_token).
-            self._resolve_after_spawn(user_id)
-            self._enqueue_introduction(user_id, entry)
+        for user_id, entry, home, admission_witness in newly_acquired:
+            # Config deletion linearizes on this same lock. It cannot finish
+            # between validation and spawn+tracking; a later deletion is revoked
+            # by the owner, retaining its lease until exit is confirmed.
+            with _isolated_admission(user_id, entry, expected=admission_witness) as current:
+                if current is _ADMISSION_UNKNOWN:
+                    continue
+                if current is None:
+                    self._revoke_admission(user_id)
+                    continue
+                # Per-user try/except: this loop already fanned out N acquired leases
+                # this tick — one user's spawn_fn raising (e.g. a fork/exec failure)
+                # must not abort the loop and strand the REST of this batch with an
+                # acquired-but-never-spawned lease. Failure marks the lease 'error'
+                # (surfaced to the user via a runner notice) and moves on; the lease
+                # is retried as a fresh acquisition next tick once it's reaped.
+                started_at = self._now()
+                try:
+                    pid = self.spawn_fn(entry, user_id, home)
+                except Exception as e:  # noqa: BLE001
+                    detail = f"{type(e).__name__}:{e}"
+                    self._record_restart_failure(user_id, detail)
+                    self._emit_runner_notice(user_id, "runner_spawn_failed", detail)
+                    log.exception("spawn failed for %s", user_id)
+                    continue   # skip this user only — no cascading failure for the rest of the batch
+                # Track immediately: a token/DB error must not orphan a live
+                # child or let a later pass release its lease without stopping it.
+                with self._lock:
+                    self.children[user_id] = {
+                        "pid": pid, "entry": entry, "home": home,
+                        "started_at": started_at,
+                        "admission_witness": admission_witness,
+                    }
+                self._write_token(user_id, home)
+                leases.renew(user_id, self.owner, ttl=self.lease_ttl, pid=pid,
+                             status="running", now=self._now())
+                log.info("spawned resident consumer for %s (pid=%s, home=%s)", user_id, pid, home)
+                self._keyless_since.pop(user_id, None)
+                # successful spawn -> clear spawn/decrypt notices only; NOT degraded
+                # (token health is independent — see _write_token).
+                self._resolve_after_spawn(user_id)
+                self._enqueue_introduction(user_id, entry)
 
     def renew_live(self) -> None:
         """Renew leases for every currently-live child — and ONLY that.
@@ -706,6 +756,18 @@ class Supervisor:
         # Reap dead children first so we only renew live ones.
         live: list[tuple[str, dict]] = []
         for user_id, child in snapshot:
+            with _isolated_admission(user_id, child["entry"],
+                                 expected=child.get("admission_witness")) as current:
+                if current is _ADMISSION_UNKNOWN:
+                    # Ownership maintenance is not new admission. Keep a live
+                    # tracked process's lease while its configuration is unknown;
+                    # do not fabricate deletion/exit or allow silent takeover.
+                    if self.alive_fn(child['pid']):
+                        live.append((user_id, child))
+                    continue
+                if current is None:
+                    self._revoke_admission(user_id)
+                    continue
             if not self.alive_fn(child["pid"]):
                 self._reap_crashed_child(user_id, child)
                 continue
@@ -992,10 +1054,15 @@ def _resolve_roster(roster: list[dict],
             log.warning("skipping roster entry: could not resolve user_id")
             continue
         out = {**entry, "user_id": user_id}
+        binding = admission.capture(user_id, out)
+        if binding is None:
+            continue
         if not out.get("provider_key"):
             env = entry.get("provider_key_envelope")
             if not env:
                 env = _fetch_key_envelope(api_url, entry["api_key"])
+            if env and not admission.envelope_matches(binding, env):
+                continue
             if env and enclave_url:
                 key = _decrypt_provider_key(enclave_url, entry["api_key"], env)
                 if key:
@@ -1003,6 +1070,9 @@ def _resolve_roster(roster: list[dict],
                 elif key_decrypt_failures is not None:
                     key_decrypt_failures.append((user_id, "envelope decrypt returned empty"))
             out.pop("provider_key_envelope", None)
+        if admission.capture(user_id, out) != binding:
+            continue
+        out['_admission_binding'] = binding
         resolved.append(out)
     return resolved
 
@@ -1019,7 +1089,7 @@ def _discover_enabled() -> dict[str, dict]:
                            "supports_responses": bool(u.get("supports_responses", False)),
                            "reasoning_effort": u.get("reasoning_effort", ""),
                            "vision_test_status": u.get("vision_test_status", "untested")}
-            for u in db.list_agent_runtime_enabled_users()}
+            for u in db.list_agent_runtime_enabled_users_strict()}
 
 
 def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]:
@@ -1074,8 +1144,17 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
     ``runner_key_decrypt_failed`` error_class. Never called merely because no
     envelope was available (that's "not configured yet", not a failure)."""
     try:
+        binding = admission.capture(uid, info)
+        if binding is None:
+            return None
         tok = mint_token(uid)
         cached = cache.get(uid)
+        # A rotation invalidates envelope AND decrypted-key fallback, even when
+        # provider/model/base_url and TTL are unchanged. Legacy unbound cache
+        # entries are not evidence for the currently selected credential.
+        if cached is None or cached.get('binding') != binding:
+            cache[uid] = {'binding': binding}
+            cached = None
         # T1.2 — reuse the cached envelope within the refetch TTL instead of a
         # backend round-trip every tick. A transient refetch failure (None) keeps
         # the last good envelope so a healthy consumer isn't respawned keyless.
@@ -1094,6 +1173,9 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
                 env = cached["env"]
 
         provider_key = ""
+        if env is not None and not admission.envelope_matches(binding, env):
+            cache.pop(uid, None)
+            return None
         if env and enclave_url:
             sig = json.dumps(env, sort_keys=True)
             if cached and cached.get("sig") == sig:
@@ -1132,6 +1214,10 @@ def _resolve_one(uid: str, info: dict, *, mint_token, api_url: str, enclave_url:
         # from _spawn_identity, so per-tick rotation does not bounce the consumer.
         if tok:
             entry["runtime_token"] = tok
+        if admission.capture(uid, entry) != binding:
+            cache.pop(uid, None)
+            return None
+        entry['_admission_binding'] = binding
         return entry
     except Exception as e:  # noqa: BLE001
         log.warning("resolve_discovered failed for %s; skipping this tick: %s", uid, e)
@@ -1172,7 +1258,8 @@ def _resolve_discovered(enabled: dict, *, mint_token, api_url: str, enclave_url:
                 max_workers=min(workers, len(items)),
                 thread_name_prefix="resolve") as pool:
             results = list(pool.map(_one, items))
-    return [r for r in results if r is not None]
+    return [r if r is not None else {'user_id': uid, '_admission_unresolved': True}
+            for (uid, _), r in zip(items, results)]
 
 
 def _post_verify_loop(api_url: str, headers: dict) -> dict:
@@ -1487,7 +1574,7 @@ def _supervisor_heartbeat_payload(owner: str, *, host_all: bool,
 def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool,
                                  pi: bool, active_children: int, max_children: int,
                                  shard_index: int, shard_count: int, version: str | None,
-                                 ts: float) -> dict:
+                                 ts: float, version_source: str = "unknown") -> dict:
     """Rich per-owner heartbeat row (migration 0009). Beyond the legacy payload's
     host_all/pi, it carries this runner's live capacity (active vs max children)
     and shard config, so multiple runners report independently and the backend
@@ -1496,7 +1583,7 @@ def _supervisor_instance_payload(owner: str, *, host: str | None, host_all: bool
             "host_all": bool(host_all), "pi": bool(pi),
             "active_children": int(active_children), "max_children": int(max_children),
             "shard_index": int(shard_index), "shard_count": int(shard_count),
-            "version": version}
+            "version": version, "version_source": version_source if version else "unknown"}
 
 
 def _runner_heartbeat_owner(cvm_id: str | None, *, hostname: str, pid: int) -> str:
@@ -1717,7 +1804,7 @@ def main() -> int:
             heartbeat_owner, host=hostname, host_all=host_all_active,
             pi=pi_enabled, active_children=active,
             max_children=sup.max_children, shard_index=0, shard_count=1,
-            version=build_version, ts=ts)
+            version=build_version, version_source="image_env" if build_version else "unknown", ts=ts)
 
     # The heartbeat loop's shared 90s retention default removes legacy
     # PID-keyed rows before the 300s deployment grace ends.
@@ -1764,8 +1851,11 @@ def main() -> int:
                 # re-seeds the persona prompt file (only written at spawn) — cutover
                 # gate 4 C. No kill, no in-place prompt rewrite.
                 for _entry in roster:
+                    if _entry.get('_admission_unresolved'):
+                        continue
                     _entry["persona_version"] = _persona_version(_entry.get("user_id", ""))
                 sup.tick(roster)
+                roster = [e for e in roster if not e.get('_admission_unresolved')]
                 # Gate 4 B-3: after the spawn reconcile, top up voice for no-blob users
                 # (bounded + cooldown'd so it never blocks the tick). Off by default.
                 if _lazy_persona_backfill_enabled():

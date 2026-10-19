@@ -1481,12 +1481,28 @@
             "name": "X-Feedling-Consumer-Commit",
             "in": "header",
             "required": false,
-            "description": "Resident consumer source revision.",
+            "description": "Consumer-declared startup distribution/checkout revision; not loaded-source attestation.",
             "schema": {
               "type": "string",
               "maxLength": 80
             },
             "example": "a1b2c3d"
+          },
+          {
+            "name": "X-Feedling-Consumer-Commit-Source",
+            "in": "header",
+            "required": false,
+            "description": "Source of the consumer's frozen startup revision declaration. Optional for older clients; missing provenance is not inferred from the backend release. None of these values proves loaded code.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "consumer_env",
+                "image_env",
+                "git_checkout",
+                "unknown"
+              ]
+            },
+            "example": "image_env"
           },
           {
             "name": "X-Feedling-Consumer-Capabilities",
@@ -1640,12 +1656,28 @@
             "name": "X-Feedling-Consumer-Commit",
             "in": "header",
             "required": false,
-            "description": "Resident consumer source revision.",
+            "description": "Consumer-declared startup distribution/checkout revision; not loaded-source attestation.",
             "schema": {
               "type": "string",
               "maxLength": 80
             },
             "example": "a1b2c3d"
+          },
+          {
+            "name": "X-Feedling-Consumer-Commit-Source",
+            "in": "header",
+            "required": false,
+            "description": "Source of the consumer's frozen startup revision declaration. Optional for older clients; missing provenance is not inferred from the backend release. None of these values proves loaded code.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "consumer_env",
+                "image_env",
+                "git_checkout",
+                "unknown"
+              ]
+            },
+            "example": "image_env"
           },
           {
             "name": "X-Feedling-Consumer-Capabilities",
@@ -2316,11 +2348,11 @@
         "operationId": "genesis_import_list_v1_genesis_imports_get",
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Import jobs, including optional managed eligibility diagnostics.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/GenesisJobListResponse"
                 }
               }
             }
@@ -2634,11 +2666,11 @@
         ],
         "responses": {
           "200": {
-            "description": "Successful Response",
+            "description": "Import state. A managed job with unavailable dependencies remains uploaded; execution after provider start is not automatically replayed.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/GenericJsonResponse"
+                  "$ref": "#/components/schemas/GenesisJobResponse"
                 }
               }
             }
@@ -2899,11 +2931,21 @@
             }
           },
           "202": {
-            "description": "Upload finalized and awaiting reducer output.",
+            "description": "Upload finalized and awaiting reducer output. A previously managed job rejects finalize with 409; deliberate retry requires a new import job and may incur provider cost again.",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/GenericJsonResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Missing chunks or managed_claim_requires_outputs: a managed job cannot be finalized or applied inline.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
                 }
               }
             }
@@ -2963,6 +3005,16 @@
           },
           "default": {
             "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Managed jobs require the worker's private current execution capability. Missing, stale or invalid authority, a duplicate in-flight apply, or changed dependencies are rejected without legacy fallback.",
             "content": {
               "application/json": {
                 "schema": {
@@ -3431,12 +3483,33 @@
                 }
               }
             }
+          },
+          "500": {
+            "description": "identity_storage_invalid: stored identity is not a JSON object (including JSON null).",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "identity_read_unavailable: storage read or explicit enrichment failed; not an absent identity.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
           }
         },
         "tags": [
           "Identity"
         ],
-        "x-feedling-contract-level": "documented"
+        "x-feedling-contract-level": "documented",
+        "description": "Read the authenticated user's raw identity envelope with server-computed days_with_user. A missing row returns identity:null. Storage read or explicit enrichment failure returns 503 identity_read_unavailable; a stored non-object, including JSON null, returns 500 identity_storage_invalid. Errors contain fixed codes, not database exception details. Successful encrypted and plaintext envelopes retain their storage shape; this endpoint does not decrypt."
       }
     },
     "/v1/identity/init": {
@@ -4749,7 +4822,7 @@
     "/v1/memory/turn-selection": {
       "post": {
         "summary": "Resident Turn Selection",
-        "description": "Per-turn memory selection for a plaintext resident account: the cards picked for this message, selected by the backend with the lexical ranker on the same history page the enclave read used (before_seq = seq + 1, limit 4). Returns 409 not_served when the account is not plaintext or the feature is off (the enclave was not called; the resident keeps its enclave path), 503 recall_unavailable on exhausted budget, capacity, or selection failure (at most one backend enclave fallback when budget remains; the consumer must not retry), and 422 message_not_in_window when the message is not in that page.",
+        "description": "Fixed-frontier plaintext recall. Exact off never calls enclave content. Full candidate owner validation precedes exclusions. Invalid same-owner optional payloads yield typed recall_unavailable with uid/message/seq binding; required content, owner/auth and unknown-stage failures are hard. Rollout off/shadow is unavailable for off accounts. Successful encrypted/legacy modes return 409 for compatibility; a plaintext consumer must never follow that response to enclave. 422 preserves the fixed message binding failure.",
         "operationId": "resident_turn_selection_v1_memory_turn_selection_post",
         "responses": {
           "200": {
@@ -4760,6 +4833,9 @@
                   "type": "object",
                   "required": [
                     "source",
+                    "user_id",
+                    "message_id",
+                    "seq",
                     "messages",
                     "context_memories",
                     "context_memory_trace",
@@ -4769,10 +4845,57 @@
                     "source": {
                       "type": "string",
                       "enum": [
-                        "local",
-                        "enclave_fallback",
-                        "enclave_shadow"
+                        "local"
                       ]
+                    },
+                    "user_id": {
+                      "type": "string"
+                    },
+                    "message_id": {
+                      "type": "string"
+                    },
+                    "seq": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "required_references": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    },
+                    "required_attachments": {
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "required": [
+                          "id",
+                          "seq",
+                          "sha256"
+                        ],
+                        "properties": {
+                          "id": {
+                            "type": "string"
+                          },
+                          "seq": {
+                            "type": "integer",
+                            "minimum": 1
+                          },
+                          "sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$"
+                          }
+                        },
+                        "additionalProperties": false
+                      }
                     },
                     "messages": {
                       "type": "array",
@@ -4847,7 +4970,7 @@
             }
           },
           "409": {
-            "description": "not_served: feature off or account not plaintext; enclave was not contacted.",
+            "description": "not_served: successful encrypted/legacy account mode. Off consumers must not fall back.",
             "content": {
               "application/json": {
                 "schema": {
@@ -4877,11 +5000,129 @@
             }
           },
           "503": {
-            "description": "recall_unavailable: deadline, capacity, or selection failure; do not retry the enclave.",
+            "description": "Typed optional unavailability requires matching operation binding; all content/binding errors remain hard failures.",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    },
+                    {
+                      "type": "object",
+                      "required": [
+                        "error",
+                        "category",
+                        "detail",
+                        "user_id",
+                        "message_id",
+                        "seq",
+                        "context_memories",
+                        "context_memory_log"
+                      ],
+                      "properties": {
+                        "error": {
+                          "const": "recall_unavailable"
+                        },
+                        "category": {
+                          "const": "recall_unavailable"
+                        },
+                        "detail": {
+                          "type": "string",
+                          "enum": [
+                            "candidate_read_unavailable",
+                            "candidate_payload_invalid",
+                            "selection_unavailable",
+                            "local_disabled",
+                            "shadow_not_supported_for_off"
+                          ]
+                        },
+                        "user_id": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "message_id": {
+                          "type": "string",
+                          "minLength": 1
+                        },
+                        "seq": {
+                          "type": "integer",
+                          "minimum": 1
+                        },
+                        "required_references": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "id"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              }
+                            }
+                          }
+                        },
+                        "required_attachments": {
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "required": [
+                              "id",
+                              "seq",
+                              "sha256"
+                            ],
+                            "properties": {
+                              "id": {
+                                "type": "string"
+                              },
+                              "seq": {
+                                "type": "integer",
+                                "minimum": 1
+                              },
+                              "sha256": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{64}$"
+                              }
+                            },
+                            "additionalProperties": false
+                          }
+                        },
+                        "context_memories": {
+                          "type": "array",
+                          "maxItems": 0,
+                          "items": {
+                            "type": "object"
+                          }
+                        },
+                        "context_memory_log": {
+                          "type": "object",
+                          "properties": {
+                            "mode": {
+                              "const": "unavailable"
+                            },
+                            "reason": {
+                              "type": "string"
+                            },
+                            "counts": {
+                              "type": "object",
+                              "properties": {
+                                "selected": {
+                                  "type": "null"
+                                },
+                                "candidate_pool": {
+                                  "type": "null"
+                                },
+                                "injected": {
+                                  "const": 0
+                                }
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  ]
                 }
               }
             }
@@ -6944,12 +7185,34 @@
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/FreeFormJsonObject"
+                "type": "object",
+                "additionalProperties": true,
+                "properties": {
+                  "status": {
+                    "description": "Existing status update; diagnostic-only requests remain invalid."
+                  },
+                  "reason": {
+                    "description": "Existing status reason; diagnostic categories do not replace it."
+                  },
+                  "consumer_id": {
+                    "description": "Existing consumer identity. Diagnostic binding additionally requires the original value to be a nonempty, untrimmed string of at most 160 characters matching the stored consumer."
+                  },
+                  "failure_diagnostic": {
+                    "description": "Optional consumer claim, accepted only as exactly {v: 1, reported_error_class: <allowed class>}. Missing, malformed, extra-key, unknown-version or unknown-class claims degrade to unknown without rejecting the original status update. This permissive schema describes that compatibility behavior, not a new strict request validator.",
+                    "examples": [
+                      {
+                        "v": 1,
+                        "reported_error_class": "quota_insufficient"
+                      }
+                    ]
+                  }
+                }
               }
             }
           }
         },
-        "x-feedling-contract-level": "compatibility"
+        "x-feedling-contract-level": "documented",
+        "description": "Update the authenticated user's job with the existing status semantics. Resident proactive failed jobs may expose an optional failure_diagnostic object in the returned job: v=1, reported_error_class, source (consumer_reported or none), and state (reported, missing, invalid, binding_unavailable, conflicting_reports). Other states clear it to null. Allowed reported classes: auth_invalid, quota_insufficient, model_not_found, provider_account_expired, rate_limited, upstream_unavailable, provider_incompatible, cli_config_invalid, resident_agent_cli_logged_out, turn_timeout, content_filtered, context_overflow, reply_parse_failed, provider_error_unclassified, provider_empty_reply, unknown. Every non-reported state has class unknown and source none. These are consumer statements, not verified provider causes or attempt identities. Old clients remain compatible; no reason text is reclassified and outcome statistics, notifications, retry and cooldown behavior are unchanged."
       }
     },
     "/v1/proactive/reviews": {
@@ -9208,6 +9471,76 @@
           }
         },
         "title": "ValidationError"
+      },
+      "GenesisManagedUnavailable": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason",
+          "dependency",
+          "checked_at"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string",
+            "description": "Content-free reason, such as enclave_required, dependency_unavailable, dependency_invalid, or dependency_changed."
+          },
+          "dependency": {
+            "type": "string",
+            "description": "The unavailable dependency category; never the dependency content or credential."
+          },
+          "checked_at": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Time of the represented eligibility check, not a worker heartbeat."
+          }
+        }
+      },
+      "GenesisPublicJob": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object",
+            "description": "Operational metadata. Private worker execution capabilities and witnesses are omitted."
+          },
+          "output": {
+            "type": "object",
+            "additionalProperties": true,
+            "properties": {
+              "managed_unavailable": {
+                "$ref": "#/components/schemas/GenesisManagedUnavailable"
+              }
+            }
+          }
+        }
+      },
+      "GenesisJobResponse": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "job": {
+            "$ref": "#/components/schemas/GenesisPublicJob"
+          }
+        }
+      },
+      "GenesisJobListResponse": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "jobs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/GenesisPublicJob"
+            }
+          }
+        }
       },
       "ProviderTestFailedResponse": {
         "type": "object",
@@ -11614,6 +11947,11 @@
           "seq"
         ],
         "properties": {
+          "include_references": {
+            "type": "boolean",
+            "default": true,
+            "description": "Read explicit references attached to this message. Set false for a historical wake anchor whose references are not used in the prompt."
+          },
           "message_id": {
             "type": "string",
             "minLength": 1,

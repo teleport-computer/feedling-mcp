@@ -469,7 +469,7 @@ def test_apply_reducer_output_can_defer_job_completion(monkeypatch):
         "genesis_get_job",
         lambda *_args: {"job_id": "job_1", "status": "processing"},
     )
-    monkeypatch.setattr(service.db, "genesis_set_job_status", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(service.db, "genesis_set_job_status", lambda *_args, **_kwargs: {"job_id":"job_1","status":"processing"})
     monkeypatch.setattr(service.db, "genesis_upsert_output", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         service.db,
@@ -750,7 +750,7 @@ def test_identity_payload_from_output_sparse_material_with_only_persona_directiv
 def test_init_identity_threads_the_4_user_layer_fields_on_a_new_card(monkeypatch):
     retired_field = "language_" + "preference"
     captured: dict = {}
-    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: None)
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda _uid, _kind: None)
 
     def fake_envelope(_store, plaintext, item_id=None):
         captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
@@ -762,8 +762,8 @@ def test_init_identity_threads_the_4_user_layer_fields_on_a_new_card(monkeypatch
         }, "")
 
     monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
-    monkeypatch.setattr(service.identity_service, "_save_identity",
-                         lambda _store, doc: captured.update({"saved": doc}))
+    monkeypatch.setattr(service.identity_service, "_save_identity_create_if_absent",
+                         lambda _store, doc: (captured.update({"saved": doc}) or True))
     monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_a, **_k: None)
     monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_a, **_k: None)
 
@@ -797,7 +797,7 @@ def test_init_identity_threads_the_4_user_layer_fields_on_a_new_card(monkeypatch
 
 def test_init_identity_without_user_layer_fields_leaves_new_card_empty_no_crash(monkeypatch):
     captured: dict = {}
-    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: None)
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda _uid, _kind: None)
 
     def fake_envelope(_store, plaintext, item_id=None):
         captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
@@ -809,8 +809,8 @@ def test_init_identity_without_user_layer_fields_leaves_new_card_empty_no_crash(
         }, "")
 
     monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
-    monkeypatch.setattr(service.identity_service, "_save_identity",
-                         lambda _store, doc: captured.update({"saved": doc}))
+    monkeypatch.setattr(service.identity_service, "_save_identity_create_if_absent",
+                         lambda _store, doc: (captured.update({"saved": doc}) or True))
     monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_a, **_k: None)
     monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_a, **_k: None)
 
@@ -838,7 +838,7 @@ def test_init_identity_upserts_genesis_fields_and_preserves_agent_profile(monkey
         "relationship_anchor_source": service.GENESIS_SOURCE,
     }
 
-    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda _uid, _kind: existing)
     monkeypatch.setattr(
         service.core_enclave,
         "_enclave_get_json_for_gate",
@@ -872,8 +872,8 @@ def test_init_identity_upserts_genesis_fields_and_preserves_agent_profile(monkey
     monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
     monkeypatch.setattr(
         service.identity_service,
-        "_save_identity",
-        lambda _store, doc: captured.update({"saved": doc}),
+        "_save_identity_cas",
+        lambda _store, expected, doc: (captured.update({"saved": doc}) or True),
     )
     monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_args, **_kwargs: None)
@@ -920,7 +920,7 @@ def test_replace_identity_preserving_anchor_replaces_body_only(monkeypatch):
         "identity_dimension_count": 2,
     }
 
-    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda _uid, _kind: existing)
     monkeypatch.setattr(
         service.core_enclave,
         "_enclave_get_json_for_gate",
@@ -993,7 +993,7 @@ def test_replace_identity_preserving_anchor_replaces_body_only(monkeypatch):
 
 def test_replace_identity_preserving_anchor_initializes_missing_identity(monkeypatch):
     captured: dict = {}
-    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: None)
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda _uid, _kind: None)
 
     def fake_envelope(_store, plaintext, item_id=None):
         captured["plaintext"] = json.loads(plaintext.decode("utf-8"))
@@ -1012,8 +1012,8 @@ def test_replace_identity_preserving_anchor_initializes_missing_identity(monkeyp
     monkeypatch.setattr(service.core_envelope, "_build_shared_envelope_for_store", fake_envelope)
     monkeypatch.setattr(
         service.identity_service,
-        "_save_identity",
-        lambda _store, doc: captured.update({"saved": doc}),
+        "_save_identity_create_if_absent",
+        lambda _store, doc: (captured.update({"saved": doc}) or True),
     )
     monkeypatch.setattr(service.boot_gates, "_log_bootstrap_event", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(service.identity_service, "_append_identity_change", lambda *_args, **_kwargs: None)
@@ -1052,7 +1052,7 @@ def test_replace_identity_preserving_anchor_allows_nameless_nonempty_update(monk
         "identity_agent_name_present": True,
         "identity_dimension_count": 1,
     }
-    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda _uid, _kind: existing)
     monkeypatch.setattr(
         service.core_enclave,
         "_enclave_get_json_for_gate",
@@ -1115,7 +1115,7 @@ def test_replace_identity_preserving_anchor_rejects_empty_update(monkeypatch):
         "identity_agent_name_present": True,
         "identity_dimension_count": 1,
     }
-    monkeypatch.setattr(service.identity_service, "_load_identity", lambda _store: existing)
+    monkeypatch.setattr(service.db, "get_blob_strict", lambda _uid, _kind: existing)
     monkeypatch.setattr(
         service.core_envelope,
         "_build_shared_envelope_for_store",

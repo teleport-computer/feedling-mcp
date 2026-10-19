@@ -39,7 +39,13 @@ def probe_user(client, monkeypatch):
     return user["user_id"], {"X-API-Key": user["api_key"]}
 
 
-def _events(client, headers):
+def _events(client, headers, uid):
+    # Persistence assertions need writer completion, not the route's best-effort
+    # 0.5s visibility window. Keep the real GET and all persisted-event assertions.
+    with debug_trace._pending_condition:
+        assert debug_trace._pending_condition.wait_for(
+            lambda: debug_trace._pending_by_uid.get(uid, 0) == 0, timeout=10,
+        ), "probe trace writer did not complete"
     response = client.get("/v1/debug/trace?subsystem=model_api", headers=headers)
     assert response.status_code == 200
     return [event for event in response.get_json()["events"]
@@ -60,7 +66,7 @@ def test_probe_failure_status_survives_storage_and_readers_without_raw_error(
         response = client.post("/v1/model_api/setup", headers=headers, json=payload)
         assert response.status_code == 200, response.get_json()
         # Drain the successful setup before isolating the manual-test trace.
-        _events(client, headers)
+        _events(client, headers, uid)
         debug_trace.clear_trace(SimpleNamespace(user_id=uid))
         monkeypatch.setattr(config_store, "prepare_model_api_delete", lambda store: None)
 
@@ -76,7 +82,7 @@ def test_probe_failure_status_survives_storage_and_readers_without_raw_error(
     response = client.post(f"/v1/model_api/{operation}", headers=headers, json=payload)
     assert response.status_code == 400
     assert response.get_json()["error"] == "provider_test_failed"
-    events = _events(client, headers)
+    events = _events(client, headers, uid)
     expected_phases = {"started", "finished"}
     if operation == "test":
         expected_phases.add("runtime_fenced")
@@ -115,7 +121,7 @@ def test_probe_trace_status_is_a_closed_http_integer_at_persistence_boundary(
         operation="setup", provider="anthropic", model="claude-sonnet-4-5",
         phase="finished", status_code=value,
     )
-    events = _events(client, headers)
+    events = _events(client, headers, uid)
     assert len(events) == 1
     actual = events[0]["detail"]["status_code"]
     assert actual == expected
@@ -131,6 +137,53 @@ def test_successful_probe_does_not_invent_an_http_status(client, probe_user, mon
         provider_client.ProviderConfig("anthropic", "claude-sonnet-4-5", "sk-test"),
         operation="setup",
     )
-    events = _events(client, headers)
+    events = _events(client, headers, uid)
     assert {event["detail"]["phase"] for event in events} == {"started", "finished"}
     assert all(event["detail"]["status_code"] is None for event in events)
+
+
+def test_probe_reader_waits_for_inflight_writer(client, probe_user, monkeypatch):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    uid, headers = probe_user
+    entered, release, waiting = (threading.Event() for _ in range(3))
+    append = debug_trace._append_events
+    wait_for = debug_trace._pending_condition.wait_for
+
+    def held_append(target, events):
+        if target == uid:
+            entered.set()
+            assert release.wait(10), "test did not release trace writer"
+        return append(target, events)
+
+    def observed_wait(predicate, timeout=None):
+        waiting.set()
+        return wait_for(predicate, timeout)
+
+    def fail(_config):
+        raise provider_client.ProviderError("PRIVATE_EXCEPTION_KEY", status_code=401)
+
+    monkeypatch.setattr(debug_trace, "_append_events", held_append)
+    monkeypatch.setattr(debug_trace._pending_condition, "wait_for", observed_wait)
+    monkeypatch.setattr(provider_client, "test_provider_key", fail)
+    response = client.post("/v1/model_api/setup", headers=headers, json={
+        "provider": "anthropic", "model": "claude-sonnet-4-5", "api_key": "sk-test",
+    })
+    try:
+        assert response.status_code == 400
+        assert entered.wait(10), "probe never reached writer"
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            reader = executor.submit(_events, client, headers, uid)
+            try:
+                assert waiting.wait(10), "reader did not synchronize with writer"
+                assert not reader.done()
+            finally:
+                release.set()
+            events = reader.result(timeout=10)
+    finally:
+        release.set()
+    assert {event["detail"]["phase"] for event in events} == {"started", "finished"}
+    assert len({event["trace_id"] for event in events}) == 1
+    assert len(db.query_trace_events(user_id=uid, subsystem="model_api")) == 2
+    assert "PRIVATE_EXCEPTION_KEY" not in json.dumps(events)

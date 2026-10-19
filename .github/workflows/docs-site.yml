@@ -58,6 +58,10 @@ jobs:
         working-directory: docs-site
         run: npm ci
 
+      - name: MDX generation shutdown regression
+        working-directory: docs-site
+        run: node scripts/test-mdx-generation.mjs
+
       - name: Type-check
         working-directory: docs-site
         run: npm run types:check

@@ -185,3 +185,15 @@ def test_introduction_is_never_coalesced(spy):
     crc._process_proactive_jobs(jobs)
     assert len(spy["turns"]) == 2
     assert _coalesced(spy) == []
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(crc, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

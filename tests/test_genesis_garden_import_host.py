@@ -199,7 +199,8 @@ def _apply_env(monkeypatch) -> dict:
 
     monkeypatch.setattr(service.distillation_ledger, "ArtifactAttempt", Attempt)
     monkeypatch.setattr(service.db, "genesis_get_job", lambda *_a: {"job_id": "job_1", "status": "processing"})
-    monkeypatch.setattr(service.db, "genesis_set_job_status", lambda *_a, **_k: None)
+    monkeypatch.setattr(service.db, "genesis_set_job_status",
+                        lambda *_a, **_k: {"job_id": "job_1", "status": "processing"})
     monkeypatch.setattr(service.db, "genesis_upsert_output", lambda *_a, **_k: None)
     monkeypatch.setattr(service.db, "genesis_complete_job",
                         lambda *_a, **kw: calls.__setitem__("completed", kw) or None)

@@ -10,7 +10,8 @@ excluded and itemised, never dropped.
 Always read it per model family: on prod 2026-09-17..24 one family was 46% of
 decisions at 7%, so a working prompt change (33% -> 44% elsewhere) showed as a
 flat fleet total. The model comes from the job's ``agent.model.call.done``
-trace events, joined on ``trace_id`` (the model-call events carry no job_id).
+trace events, joined on ``trace_id``. This legacy measurement keeps its original
+join: older start/done events lack job_id; newer V2 events may include it.
 
 Read-only. Output is counts and model labels only, never user ids or text.
 

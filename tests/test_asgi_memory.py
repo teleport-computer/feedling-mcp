@@ -32,7 +32,7 @@ from asgi_test_client import make_client  # noqa: E402
 from core import config as core_config  # noqa: E402
 from core import runtime_token  # noqa: E402
 from core import store as core_store  # noqa: E402
-from fastapi import FastAPI  # noqa: E402
+from fastapi import FastAPI, Request  # noqa: E402
 from memory import memory_core  # noqa: E402
 from memory import routes_asgi as memory_asgi  # noqa: E402
 from memory import service as memory_service  # noqa: E402
@@ -453,6 +453,8 @@ def test_index_database_failure_is_503_not_an_empty_success(user, monkeypatch):
         "POST", "/v1/memory/index", headers=_headers(api_key), json_body={})
 
     assert (status, body) == (503, {"error": "memory_load_failed"})
+    events = [e for e in events if e["type"] == "memory.index.called"]
+    assert len(events) == 1
     assert events[-1]["type"] == "memory.index.called"
     assert events[-1]["status"] == "failed"
     # Both lanes now carry a closed category rather than the exception text. The
@@ -618,6 +620,8 @@ def test_readside_503_body_never_carries_the_enclave_response_text(
     assert body == {"error": "readside_unavailable"}
 
     # ...and the triage that used to live in the body is now in the trace.
+    events = [e for e in events if e["type"] == event_type]
+    assert len(events) == 1
     assert events[-1]["type"] == event_type
     assert events[-1]["detail"]["upstream"] == "enclave_http_403"
     assert _ENCLAVE_CANARY not in json.dumps(events[-1])
@@ -636,6 +640,8 @@ def _readside_failure(monkeypatch, api_key, message: str):
         lambda _store, **event: events.append(event))
     status, body = _asgi(
         "POST", "/v1/memory/index", headers=_headers(api_key), json_body={})
+    events = [e for e in events if e["type"] == "memory.index.called"]
+    assert len(events) == 1
     return status, body, events[-1]["detail"]["upstream"]
 
 
@@ -988,3 +994,272 @@ def test_retired_memory_migration_routes_are_not_found(user, method, path, authe
     status, _body = _asgi(method, path, headers=_headers(api_key) if authenticated else None,
                          json_body={} if method == "POST" else None)
     assert status == 404
+
+
+
+# T810: exercise the real authenticated route and its actual thread bridge.
+def _timing_app():
+    app = _build_asgi_app()
+    app.add_middleware(middleware.AccessLogMiddleware)
+    return app
+
+
+async def _timing_request(app, api_key, payload=None):
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://t",
+    ) as client:
+        return await client.post(
+            "/v1/memory/index", headers=_headers(api_key), json=payload or {},
+        )
+
+
+def _timing_events(events):
+    return [e for e in events if e["type"] == "memory.index.timing"]
+
+
+def test_index_timing_real_readside_persists_segments_and_request_id(user, monkeypatch):
+    from memory import index_timing
+    import debug_trace
+
+    uid, key = user
+    store = core_store.get_store(uid)
+    monkeypatch.setenv("FEEDLING_V1_FLOW_TRACE", "1")
+    monkeypatch.setattr(memory_service, "_load_moments",
+                        lambda _store: [_envelope(uid)])
+    calls = []
+    def post(api_key, candidates, **kw):
+        calls.append((api_key, candidates, kw))
+        return {"items": []}
+    _stub_enclave(monkeypatch, post)
+    ticks = iter([10.0, 12.0, 13.0, 16.0, 17.0, 20.0])
+    monkeypatch.setattr(index_timing, "_now", lambda: next(ticks))
+    response = asyncio.run(_timing_request(_timing_app(), key))
+    assert response.status_code == 200
+    assert len(calls) == 1 and calls[0][0] == key
+    # Real queue -> db writer -> database reader, not a trace_event mock.
+    events = _timing_events(debug_trace.read_trace(store, limit=100))
+    assert len(events) == 1
+    event = events[0]
+    assert event["trace_id"] == response.headers["x-request-id"]
+    assert event["status"] == "ok" and event["dur_ms"] == 10000.0
+    assert event["detail"]["lane"] == "index"
+    assert event["detail"]["http_status"] == 200
+    assert event["detail"]["segments"] == {
+        "queue_ms": 2000.0, "core_ms": 5000.0, "core_state": "completed",
+        "upstream_ms": 3000.0, "upstream_calls": 1,
+        "upstream_state": "completed",
+    }
+    assert key not in json.dumps(event)
+
+
+@pytest.mark.parametrize("failure", [None, "handled", "unexpected"])
+def test_index_timing_preserves_result_and_content_free_failure(user, monkeypatch, failure):
+    uid, key = user
+    events = []
+    canary = "PRIVATE-CONTENT-URL-CREDENTIAL-EXCEPTION"
+    monkeypatch.setattr(memory_core.debug_trace, "trace_event",
+                        lambda _store, **e: events.append(e))
+    monkeypatch.setattr(memory_service, "_load_moments",
+                        lambda _store: [_envelope(uid)])
+    def post(*args, **kwargs):
+        if failure == "handled":
+            raise RuntimeError("enclave_http_503:" + canary)
+        if failure == "unexpected":
+            raise LookupError(canary)
+        return {"items": []}
+    _stub_enclave(monkeypatch, post)
+    if failure == "unexpected":
+        with pytest.raises(LookupError, match=canary):
+            asyncio.run(_timing_request(_timing_app(), key))
+    else:
+        response = asyncio.run(_timing_request(_timing_app(), key))
+        assert response.status_code == (503 if failure else 200)
+        if failure:
+            assert response.json() == {"error": "readside_unavailable"}
+    timing, = _timing_events(events)
+    assert timing["status"] == ("error" if failure else "ok")
+    assert canary not in json.dumps(timing) and key not in json.dumps(timing)
+    assert timing["detail"]["segments"]["upstream_state"] == (
+        "failed" if failure else "completed")
+    assert timing["detail"]["segments"]["core_state"] == (
+        "failed" if failure == "unexpected" else "completed")
+    assert timing["detail"]["http_status"] == (
+        None if failure == "unexpected" else 503 if failure else 200)
+
+
+def test_index_timing_no_upstream_is_null_and_auth_failure_has_no_timing(user, monkeypatch):
+    _, key = user
+    events = []
+    monkeypatch.setattr(memory_core.debug_trace, "trace_event",
+                        lambda _store, **e: events.append(e))
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [])
+    response = asyncio.run(_timing_request(_timing_app(), key))
+    assert response.status_code == 200
+    timing, = _timing_events(events)
+    assert timing["detail"]["segments"]["upstream_ms"] is None
+    assert timing["detail"]["segments"]["upstream_state"] == "not_called"
+    assert timing["detail"]["segments"]["upstream_calls"] == 0
+    events.clear()
+    response = asyncio.run(_timing_request(_timing_app(), "invalid"))
+    assert response.status_code == 401
+    assert not _timing_events(events)
+
+
+@pytest.mark.parametrize("failure", [False, True])
+def test_index_timing_enqueue_failure_does_not_change_business_outcome(user, monkeypatch, failure):
+    import debug_trace
+    _, key = user
+    monkeypatch.setenv("FEEDLING_V1_FLOW_TRACE", "1")
+    attempted = []
+    def broken_enqueue(uid, event):
+        attempted.append(event["type"])
+        raise OSError("telemetry unavailable")
+    monkeypatch.setattr(debug_trace, "_enqueue", broken_enqueue)
+    def read(*a, **kw):
+        if failure:
+            raise LookupError("original failure")
+        return {"items": []}
+    monkeypatch.setattr(memory_readside_core, "memory_index_core", read)
+    if failure:
+        with pytest.raises(LookupError, match="original failure"):
+            asyncio.run(_timing_request(_timing_app(), key))
+    else:
+        assert asyncio.run(_timing_request(_timing_app(), key)).status_code == 200
+    assert "memory.index.timing" in attempted
+
+
+def test_index_timing_clock_failure_is_unknown_not_zero(user, monkeypatch):
+    from memory import index_timing
+    _, key = user
+    events = []
+    monkeypatch.setattr(memory_core.debug_trace, "trace_event",
+                        lambda _store, **e: events.append(e))
+    monkeypatch.setattr(memory_service, "_load_moments", lambda _store: [])
+    # Exercise the timer's error boundary without changing global time.
+    class BrokenClock:
+        @staticmethod
+        def monotonic():
+            raise OSError("private timer failure")
+    monkeypatch.setattr(index_timing, "time", BrokenClock)
+    assert asyncio.run(_timing_request(_timing_app(), key)).status_code == 200
+    timing, = _timing_events(events)
+    assert timing["dur_ms"] is None
+    assert timing["detail"]["segments"]["queue_ms"] is None
+    assert timing["detail"]["segments"]["core_ms"] is None
+    assert "private" not in json.dumps(timing)
+
+
+def test_index_timing_concurrent_requests_keep_identity_and_lane(monkeypatch):
+    import threading
+    from types import SimpleNamespace
+    from accounts.auth_core import AuthResult
+    from asgi.deps import require_auth
+    app = _timing_app()
+    async def auth(request: Request):
+        key = request.headers["x-api-key"]
+        return AuthResult(SimpleNamespace(user_id=key), key, None, key)
+    app.dependency_overrides[require_auth] = auth
+    barrier = threading.Barrier(2)
+    events = []
+    monkeypatch.setattr(memory_core.debug_trace, "trace_event",
+                        lambda store, **e: events.append((store.user_id, e)))
+    def read(store, key, payload, *, post_enclave):
+        barrier.wait(timeout=5)
+        if payload.get("query"):
+            post_enclave(key, [], operation="index", payload=payload)
+        return {"items": []}
+    monkeypatch.setattr(memory_readside_core, "memory_index_core", read)
+    _stub_enclave(monkeypatch, lambda *a, **kw: {"items": []})
+    async def go():
+        return await asyncio.gather(
+            _timing_request(app, "synthetic-a"),
+            _timing_request(app, "synthetic-b", {"query": "private query"}),
+        )
+    a, b = asyncio.run(go())
+    timings = {uid: e for uid, e in events if e["type"] == "memory.index.timing"}
+    assert set(timings) == {"synthetic-a", "synthetic-b"}
+    for uid, response, lane, calls in [
+        ("synthetic-a", a, "index", 0), ("synthetic-b", b, "search", 1),
+    ]:
+        event = timings[uid]
+        assert response.status_code == 200
+        assert event["trace_id"] == response.headers["x-request-id"]
+        assert event["detail"]["lane"] == lane
+        assert event["detail"]["segments"]["upstream_calls"] == calls
+        assert "private query" not in json.dumps(event)
+    assert timings["synthetic-a"]["trace_id"] != timings["synthetic-b"]["trace_id"]
+
+
+@pytest.mark.parametrize("started", [False, True])
+def test_index_timing_cancellation_keeps_incomplete_segments_unknown(user, monkeypatch, started):
+    import threading
+    import anyio
+    from memory import index_timing
+    _, key = user
+    events = []
+    entered = threading.Event()
+    release = threading.Event()
+    observations = []
+    original_init = index_timing.IndexTiming.__init__
+    def init(self, **kwargs):
+        original_init(self, **kwargs)
+        observations.append(self)
+    monkeypatch.setattr(index_timing.IndexTiming, "__init__", init)
+    monkeypatch.setattr(memory_core.debug_trace, "trace_event",
+                        lambda _store, **e: events.append(e))
+    def read(store, api_key, payload, *, post_enclave):
+        return post_enclave(api_key, [], operation="index")
+    def post(*a, **kw):
+        entered.set()
+        assert release.wait(timeout=5)
+        return {"items": []}
+    monkeypatch.setattr(memory_readside_core, "memory_index_core", read)
+    _stub_enclave(monkeypatch, post)
+    # Authenticate before occupying the worker token: the queue under test is
+    # the index dispatch, not the separate authentication database dispatch.
+    from accounts.auth_core import AuthResult
+    from asgi.deps import require_auth
+    app = _timing_app()
+    store = core_store.get_store(user[0])
+    async def authenticated():
+        return AuthResult(store=store, user_id=user[0], runtime_token_claims=None, api_key=key)
+    app.dependency_overrides[require_auth] = authenticated
+    async def go():
+        limiter = anyio.to_thread.current_default_thread_limiter()
+        old = limiter.total_tokens
+        limiter.total_tokens = 1
+        if not started:
+            await limiter.acquire()
+        try:
+            task = asyncio.create_task(_timing_request(app, key))
+            async def ready():
+                while not (entered.is_set() if started else observations):
+                    await asyncio.sleep(0)
+            await asyncio.wait_for(ready(), timeout=3)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            timing, = _timing_events(events)
+            snapshot = json.dumps(timing, sort_keys=True)
+            assert timing["status"] == "cancelled"
+            assert timing["detail"]["http_status"] is None
+            seg = timing["detail"]["segments"]
+            assert seg["core_ms"] is None and seg["upstream_ms"] is None
+            assert seg["core_state"] == ("running" if started else "not_started")
+            assert seg["upstream_state"] == ("running" if started else "not_called")
+            if not started:
+                assert seg["queue_ms"] is None
+            release.set()
+            if started:
+                async def done():
+                    while observations[0].core_state == "running":
+                        await asyncio.sleep(0)
+                await asyncio.wait_for(done(), timeout=3)
+            assert len(_timing_events(events)) == 1
+            assert json.dumps(timing, sort_keys=True) == snapshot
+        finally:
+            release.set()
+            if not started:
+                limiter.release()
+            limiter.total_tokens = old
+    asyncio.run(go())

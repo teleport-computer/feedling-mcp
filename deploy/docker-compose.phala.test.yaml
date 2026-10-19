@@ -148,11 +148,19 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:c2274b1
+    image: &enclave-image ghcr.io/teleport-computer/feedling:c3df2e0
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
       <<: &enclave-environment
+        # Declared test metadata; NOT proof of effective platform KMS policy.
+        # Both enclave listeners inherit these literals. Unavailable digest and
+        # deployment transaction remain null in the attestation response.
+        FEEDLING_APP_AUTH_CONTRACT: "0x9AC034AAEf6Bb80690Be4d1f698b51796Bb7F2D5"
+        FEEDLING_APP_AUTH_CHAIN_ID: "11155111"
+        FEEDLING_APP_AUTH_DEPLOY_TX: ""
+        FEEDLING_IMAGE_DIGEST: ""
+        FEEDLING_COMPOSE_YAML_URL: "https://github.com/teleport-computer/feedling-mcp/raw/test/deploy/docker-compose.phala.test.yaml"
         FEEDLING_DATA_DIR: "/data"
         FEEDLING_FLASK_URL: "http://backend:5001"
         # Stage-D runtime token secret — lets the enclave verify a caller's runtime
@@ -239,7 +247,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:c2274b1
+    image: ghcr.io/teleport-computer/feedling:c3df2e0
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -441,7 +449,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:c2274b1
+    image: ghcr.io/teleport-computer/feedling:c3df2e0
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -578,7 +586,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:c2274b1
+    image: ghcr.io/teleport-computer/feedling:c3df2e0
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped
@@ -608,7 +616,7 @@ services:
         condition: service_healthy
 
   log-shipper:
-    image: ghcr.io/teleport-computer/feedling:c2274b1
+    image: ghcr.io/teleport-computer/feedling:c3df2e0
     container_name: log-shipper
     command: ["python", "-u", "ops/log_shipper.py"]
     restart: unless-stopped

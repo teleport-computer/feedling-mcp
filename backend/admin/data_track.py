@@ -1469,6 +1469,8 @@ def _effective_responder(
                 "consumer_id": consumer_id,
                 "consumer_name": str(state.get("consumer_name") or ""),
                 "responder": responder,
+                # Legacy global identity can be changed by a later response;
+                # it cannot establish which revision sent the old poll.
                 "last_poll_at": str(state.get("last_poll_at") or ""),
                 "last_poll_epoch": state.get("last_poll_epoch"),
             }
@@ -1508,6 +1510,7 @@ def _effective_responder(
             {
                 "identity": str(identity),
                 "responder": responder,
+                **chat_consumer.consumer_version_fields(value),
                 "last_poll_at": str(value.get("last_poll_at") or ""),
                 "last_poll_epoch": last_epoch,
                 "last_poll_status": last_poll_status,

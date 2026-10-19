@@ -137,6 +137,17 @@ def _strip_timing(value):
     return value
 
 
+def _stop_service_and_join_encoders():
+    # stop()/Scheduler.close() signal shutdown; they do not join the worker.
+    # A retiring worker must not enter the next test's thread-count baseline.
+    workers = _encoder_threads()
+    query_service.stop()
+    for worker in workers:
+        worker.join(timeout=3)
+        assert not worker.is_alive(), "query encoder did not finish test cleanup"
+    assert not _encoder_threads(), "query encoder leaked across test boundaries"
+
+
 @pytest.fixture(autouse=True)
 def _env(monkeypatch):
     for name in (recall_policy.HYBRID_ENV, recall_policy.MIN_COSINE_ENV, plaintext_recall.MODE_ENV,
@@ -144,7 +155,7 @@ def _env(monkeypatch):
                  query_service.OWNER_ENV):
         monkeypatch.delenv(name, raising=False)
     yield
-    query_service.stop()      # the service is a process singleton; tests must not leak it
+    _stop_service_and_join_encoders()  # singleton cleanup includes actual thread exit
 
 
 # --------------------------------------------------------------------------- #
@@ -418,14 +429,17 @@ def test_mode_shadow_keeps_the_enclave_result_and_compares(worker, monkeypatch):
     assert emitted[0][1]["verdict"] in {"incomparable", "comparable"}
 
 
-def test_mode_on_serves_plaintext_locally_and_falls_back_to_the_enclave(worker, monkeypatch):
+def test_exact_off_local_and_exact_on_compatibility(worker, monkeypatch):
+    from memory import recall_candidates, recall_contract
     serve_worker, calls = worker
     monkeypatch.setenv(plaintext_recall.MODE_ENV, "on")
+    monkeypatch.setattr(serve_worker.accounts_registry, "effective_content_encryption", lambda uid: "off")
     monkeypatch.setattr(serve_worker, "_plaintext_recall_deps", lambda: _deps(_rows(WINDOWS["cn"])))
+    monkeypatch.setattr(recall_candidates, "read_owned", lambda uid, deadline:
+                        recall_contract.candidate_batch(_moments(), uid))
     out = serve_worker._read_context_memories(UID, through_seq=1)
     assert calls == [] and "cat_cn" in [c["id"] for c in out["context_memories"]]
-    monkeypatch.setattr(serve_worker, "_plaintext_recall_deps",
-                        lambda: _deps(_rows(WINDOWS["cn"]), mode="on"))
+    monkeypatch.setattr(serve_worker.accounts_registry, "effective_content_encryption", lambda uid: "on")
     out = serve_worker._read_context_memories(UID, through_seq=1)
     assert len(calls) == 1 and out["context_memories"] == [{"id": "e"}]
 
@@ -938,6 +952,50 @@ def parent(monkeypatch):
     return serve_worker
 
 
+def test_service_cleanup_waits_for_retiring_encoder_thread(monkeypatch):
+    exiting, release, joining = threading.Event(), threading.Event(), threading.Event()
+    original_next = query_service.Scheduler._next
+    errors = []
+
+    def delayed_exit(scheduler):
+        job = original_next(scheduler)
+        if job is None:
+            exiting.set()
+            assert release.wait(3)
+        return job
+
+    monkeypatch.setattr(query_service.Scheduler, "_next", delayed_exit)
+    query_service.reserve(port=0)
+    query_service.start(_embedder())
+    worker = query_service.active_scheduler()._thread
+    original_join = worker.join
+
+    def observed_join(timeout=None):
+        joining.set()
+        original_join(timeout)
+
+    monkeypatch.setattr(worker, "join", observed_join)
+
+    def cleanup():
+        try:
+            _stop_service_and_join_encoders()
+        except BaseException as exc:
+            errors.append(exc)
+
+    cleaner = threading.Thread(target=cleanup)
+    cleaner.start()
+    try:
+        assert exiting.wait(2) and joining.wait(2)
+        assert query_service.active_scheduler() is None
+        assert worker.is_alive() and cleaner.is_alive()
+    finally:
+        release.set()
+        cleaner.join(3)
+        original_join(3)
+    assert not cleaner.is_alive() and not worker.is_alive()
+    assert not errors and not _encoder_threads()
+
+
 def test_a_serve_restart_keeps_one_service_and_its_token(parent, monkeypatch):
     embedder = _embedder()
     monkeypatch.setattr(parent.memory_embedding_sweep, "get_embedder", lambda: embedder)
@@ -994,3 +1052,21 @@ def test_a_slow_load_across_a_restart_starts_one_loader_and_one_service(parent, 
     assert loads == [1] and len(_encoder_threads()) == before + 1
     reply = query_client.from_env().encode(["x"], time.monotonic() + 5)
     assert len(reply.vectors) == 1
+
+
+@pytest.mark.parametrize('strict', [False, True], ids=['encrypted_compatibility', 'effective_off'])
+def test_query_encoder_http_auth_failure_is_hard_only_for_strict_off(service, monkeypatch, strict):
+    from memory import recall_contract
+    _, port, _ = service
+    monkeypatch.setenv(recall_policy.MIN_COSINE_ENV, '0.2')
+    monkeypatch.setenv(recall_select.RECALL_RANKER_ENV, '1')
+    deps = _deps(_rows(WINDOWS['cn']), encoder=query_client.Client(port, 'wrong-token'))
+    def run():
+        return plaintext_recall._hybrid_state(_moments(), UID, 'query', 'query', deps,
+            time.monotonic()+2, time.monotonic(), strict=strict)
+    if strict:
+        with pytest.raises(recall_contract.RecallFailure, match='vector_authorization_failed'):
+            run()
+    else:
+        state, encoder = run()
+        assert state['fallback_reason'] == 'encode_failed' and encoder is None

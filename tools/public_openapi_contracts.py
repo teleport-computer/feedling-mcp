@@ -127,8 +127,15 @@ CONSUMER_HEADERS = [
     _header(
         "X-Feedling-Consumer-Commit",
         _schema("string", maxLength=80),
-        "Resident consumer source revision.",
+        "Consumer-declared startup distribution/checkout revision; not loaded-source attestation.",
         example="a1b2c3d",
+    ),
+    _header(
+        "X-Feedling-Consumer-Commit-Source",
+        _schema("string", enum=["consumer_env", "image_env", "git_checkout", "unknown"]),
+        "Source of the consumer's frozen startup revision declaration. Optional for older clients; "
+        "missing provenance is not inferred from the backend release. None of these values proves loaded code.",
+        example="image_env",
     ),
     _header(
         "X-Feedling-Consumer-Capabilities",
@@ -370,6 +377,33 @@ OPERATION_PARAMETERS[("put", "/v1/genesis/imports/{job_id}/chunks/{seq}")] = [
 
 
 COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
+    "GenesisManagedUnavailable": {
+        "type": "object", "additionalProperties": False,
+        "required": ["reason", "dependency", "checked_at"],
+        "properties": {
+            "reason": {"type": "string", "description": "Content-free reason, such as enclave_required, dependency_unavailable, dependency_invalid, or dependency_changed."},
+            "dependency": {"type": "string", "description": "The unavailable dependency category; never the dependency content or credential."},
+            "checked_at": {"type": "string", "format": "date-time", "description": "Time of the represented eligibility check, not a worker heartbeat."},
+        },
+    },
+    "GenesisPublicJob": {
+        "type": "object", "additionalProperties": True,
+        "properties": {
+            "job_id": {"type": "string"}, "status": {"type": "string"},
+            "metadata": {"type": "object", "description": "Operational metadata. Private worker execution capabilities and witnesses are omitted."},
+            "output": {"type": "object", "additionalProperties": True, "properties": {
+                "managed_unavailable": {"$ref": "#/components/schemas/GenesisManagedUnavailable"},
+            }},
+        },
+    },
+    "GenesisJobResponse": {
+        "type": "object", "additionalProperties": True,
+        "properties": {"job": {"$ref": "#/components/schemas/GenesisPublicJob"}},
+    },
+    "GenesisJobListResponse": {
+        "type": "object", "additionalProperties": True,
+        "properties": {"jobs": {"type": "array", "items": {"$ref": "#/components/schemas/GenesisPublicJob"}}},
+    },
     "ProviderTestFailedResponse": {
         "type": "object",
         "required": ["error", "detail", "status_code", "failure_class"],
@@ -1794,6 +1828,7 @@ COMPONENT_SCHEMAS: dict[str, dict[str, Any]] = {
         "type": "object",
         "required": ["message_id", "seq"],
         "properties": {
+            "include_references": {"type": "boolean", "default": True, "description": "Read explicit references attached to this message. Set false for a historical wake anchor whose references are not used in the prompt."},
             "message_id": {"type": "string", "minLength": 1, "maxLength": 128},
             "seq": {"type": "integer", "minimum": 1, "maximum": 9223372036854775806},
         },
@@ -2574,6 +2609,21 @@ OPTIONAL_PRECISE_BODIES: set[Operation] = {
 
 
 SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
+    ("post", "/v1/proactive/jobs/{job_id}/status"): {
+        "required": False,
+        "content": {"application/json": {"schema": {
+            "type": "object", "additionalProperties": True,
+            "properties": {
+                "status": {"description": "Existing status update; diagnostic-only requests remain invalid."},
+                "reason": {"description": "Existing status reason; diagnostic categories do not replace it."},
+                "consumer_id": {"description": "Existing consumer identity. Diagnostic binding additionally requires the original value to be a nonempty, untrimmed string of at most 160 characters matching the stored consumer."},
+                "failure_diagnostic": {
+                    "description": "Optional consumer claim, accepted only as exactly {v: 1, reported_error_class: <allowed class>}. Missing, malformed, extra-key, unknown-version or unknown-class claims degrade to unknown without rejecting the original status update. This permissive schema describes that compatibility behavior, not a new strict request validator.",
+                    "examples": [{"v": 1, "reported_error_class": "quota_insufficient"}],
+                },
+            },
+        }}},
+    },
     ("post", "/v1/onboarding/archive"): {
         "required": True,
         "content": {
@@ -2625,6 +2675,25 @@ SPECIAL_REQUEST_BODIES: dict[Operation, dict[str, Any]] = {
 
 
 OPERATION_DESCRIPTIONS: dict[Operation, str] = {
+    ("get", "/v1/identity/get"): (
+        "Read the authenticated user's raw identity envelope with server-computed days_with_user. "
+        "A missing row returns identity:null. Storage read or explicit enrichment failure returns "
+        "503 identity_read_unavailable; a stored non-object, including JSON null, returns "
+        "500 identity_storage_invalid. Errors contain fixed codes, not database exception details. "
+        "Successful encrypted and plaintext envelopes retain their storage shape; this endpoint does not decrypt."
+    ),
+    ("post", "/v1/proactive/jobs/{job_id}/status"): (
+        "Update the authenticated user's job with the existing status semantics. "
+        "Resident proactive failed jobs may expose an optional failure_diagnostic object in the returned job: "
+        "v=1, reported_error_class, source (consumer_reported or none), and state "
+        "(reported, missing, invalid, binding_unavailable, conflicting_reports). Other states clear it to null. "
+        "Allowed reported classes: auth_invalid, quota_insufficient, model_not_found, provider_account_expired, "
+        "rate_limited, upstream_unavailable, provider_incompatible, cli_config_invalid, resident_agent_cli_logged_out, "
+        "turn_timeout, content_filtered, context_overflow, reply_parse_failed, provider_error_unclassified, "
+        "provider_empty_reply, unknown. Every non-reported state has class unknown and source none. "
+        "These are consumer statements, not verified provider causes or attempt identities. Old clients remain compatible; "
+        "no reason text is reclassified and outcome statistics, notifications, retry and cooldown behavior are unchanged."
+    ),
     ("post", "/v1/voice/cancel"): (
         "Idempotently end a voice call that will not be archived. The durable "
         "tombstone suppresses late resident and Hosted Runtime V2 replies "
@@ -2671,7 +2740,7 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
     ("get", "/v1/bootstrap/status"): "Return server-observed onboarding progress. Resident routes include decrypt_source_ready, decrypt_health, and decrypt_health_policy; a fresh resident poll report is required for new-account completion.",
     ("get", "/v1/onboarding/validate"): "Return ordered onboarding checks. Resident routes include a decrypt_source step between resident_consumer and live_loop, with status, checked_at_epoch, reason, policy, and remediation fields.",
     ("get", "/v1/chat/poll"): "Long-poll and optionally claim resident chat work. Official residents report their running commit and may report an intentionally skipped compatible backend target with X-Feedling-Consumer-Compat-Commit. They also report read-source status (including backend readiness for effective-off accounts) and its confirmation time on every poll heartbeat with X-Feedling-Decrypt-Status and X-Feedling-Decrypt-Checked-At.",
-    ("post", "/v1/memory/turn-selection"): "Per-turn memory selection for a plaintext resident account: the cards picked for this message, selected by the backend with the lexical ranker on the same history page the enclave read used (before_seq = seq + 1, limit 4). Returns 409 not_served when the account is not plaintext or the feature is off (the enclave was not called; the resident keeps its enclave path), 503 recall_unavailable on exhausted budget, capacity, or selection failure (at most one backend enclave fallback when budget remains; the consumer must not retry), and 422 message_not_in_window when the message is not in that page.",
+    ("post", "/v1/memory/turn-selection"): "Fixed-frontier plaintext recall. Exact off never calls enclave content. Full candidate owner validation precedes exclusions. Invalid same-owner optional payloads yield typed recall_unavailable with uid/message/seq binding; required content, owner/auth and unknown-stage failures are hard. Rollout off/shadow is unavailable for off accounts. Successful encrypted/legacy modes return 409 for compatibility; a plaintext consumer must never follow that response to enclave. 422 preserves the fixed message binding failure.",
     ("post", "/v1/chat/message"): "Store a user chat message as a v1 ciphertext envelope; the server never decrypts it. If the envelope carries a content_pk_fpr label that does not match the user's currently registered content key, the write is rejected with 409 content_pk_fpr_mismatch (re-fetch whoami and re-seal); unlabeled envelopes are accepted for compatibility.",
     ("post", "/v1/chat/response"): "Store an agent reply as a v1 ciphertext envelope plus optional thinking and encrypted file/image followups. A text primary and its attachment rows commit as one ordered transaction; generated images are returned as native content_type=image Chat messages. Replies carrying reply_to_message_id are finalized atomically across backend workers: exactly one request inserts the reply and marks the parent answered, while a losing contender returns 409 already_answered without storing its reply. A hidden source=verify_ping reply is accepted only when reply_to_message_id identifies an outstanding verify ping exactly. role=system notices bypass reply exclusivity. A bootstrap_incomplete 409 always includes retryable: needs_resident_consumer is true so an official identity that previously polled may retry the same reply with bounded backoff; other stages are false, and a missing field from an old server must be treated as false. Labeled envelopes sealed to a key that is no longer the user's registered content key are rejected with 409 content_pk_fpr_mismatch — the writer should re-fetch whoami, re-seal, and retry once.",
     ("post", "/v1/chat/verify_loop"): (
@@ -2869,6 +2938,16 @@ OPERATION_DESCRIPTIONS: dict[Operation, str] = {
 
 
 RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
+    ("get", "/v1/identity/get"): {
+        "500": {
+            "description": "identity_storage_invalid: stored identity is not a JSON object (including JSON null).",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+        "503": {
+            "description": "identity_read_unavailable: storage read or explicit enrichment failed; not an absent identity.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
+    },
     ("get", "/v1/worldbook/list"): {
         "200": {
             "description": (
@@ -2890,15 +2969,37 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
             }},
         },
     },
+    ("get", "/v1/genesis/imports"): {
+        "200": {"description": "Import jobs, including optional managed eligibility diagnostics.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenesisJobListResponse"}}}},
+    },
+    ("get", "/v1/genesis/imports/{job_id}"): {
+        "200": {"description": "Import state. A managed job with unavailable dependencies remains uploaded; execution after provider start is not automatically replayed.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenesisJobResponse"}}}},
+    },
+    ("post", "/v1/genesis/imports/{job_id}/outputs"): {
+        "409": {"description": "Managed jobs require the worker's private current execution capability. Missing, stale or invalid authority, a duplicate in-flight apply, or changed dependencies are rejected without legacy fallback.",
+                "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}},
+    },
+
     ("post", "/v1/memory/turn-selection"): {
         "200": {
             "description": "Selection and content-free page identity, with the complete selection trace.",
             "content": {"application/json": {"schema": {
                 "type": "object",
-                "required": ["source", "messages", "context_memories", "context_memory_trace",
+                "required": ["source", "user_id", "message_id", "seq", "messages", "context_memories", "context_memory_trace",
                              "context_memory_log"],
                 "properties": {
-                    "source": {"type": "string", "enum": ["local", "enclave_fallback", "enclave_shadow"]},
+                    "source": {"type": "string", "enum": ["local"]},
+                    "user_id": {"type": "string"},
+                    "message_id": {"type": "string"},
+                    "seq": {"type": "integer", "minimum": 1},
+                    "required_references": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+                    "required_attachments": {"type": "array", "items": {
+                         "type": "object", "required": ["id", "seq", "sha256"],
+                         "properties": {"id": {"type": "string"}, "seq": {"type": "integer", "minimum": 1},
+                                        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+                         "additionalProperties": False}},
                     "messages": {"type": "array", "items": {
                         "type": "object", "required": ["id", "role", "seq"],
                         "properties": {"id": {"type": "string"}, "role": {"type": "string"},
@@ -2915,11 +3016,41 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
                   "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}}}
            for code, description in {
                "400": "request_invalid: invalid message_id, seq, or body.",
-               "409": "not_served: feature off or account not plaintext; enclave was not contacted.",
+               "409": "not_served: successful encrypted/legacy account mode. Off consumers must not fall back.",
                "413": "request_too_large: body exceeds 1024 bytes.",
                "422": "message_not_in_window: message does not belong to the fixed user-bound page.",
-               "503": "recall_unavailable: deadline, capacity, or selection failure; do not retry the enclave.",
+               "503": "Optional unavailability only when category=recall_unavailable carries matching user_id/message_id/seq. Missing category or a content/binding error is a hard failure; never retry enclave.",
            }.items()},
+        "503": {
+            "description": "Typed optional unavailability requires matching operation binding; all content/binding errors remain hard failures.",
+            "content": {"application/json": {"schema": {"anyOf": [
+                {"$ref": "#/components/schemas/ErrorResponse"},
+                {"type": "object",
+                 "required": ["error", "category", "detail", "user_id", "message_id", "seq", "context_memories", "context_memory_log"],
+                 "properties": {
+                     "error": {"const": "recall_unavailable"},
+                     "category": {"const": "recall_unavailable"},
+                     "detail": {"type": "string", "enum": ["candidate_read_unavailable", "candidate_payload_invalid", "selection_unavailable", "local_disabled", "shadow_not_supported_for_off"]},
+                     "user_id": {"type": "string", "minLength": 1},
+                     "message_id": {"type": "string", "minLength": 1},
+                     "seq": {"type": "integer", "minimum": 1},
+                     "required_references": {"type": "array", "items": {"type": "object", "required": ["id"], "properties": {"id": {"type": "string"}}}},
+                    "required_attachments": {"type": "array", "items": {
+                         "type": "object", "required": ["id", "seq", "sha256"],
+                         "properties": {"id": {"type": "string"}, "seq": {"type": "integer", "minimum": 1},
+                                        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+                         "additionalProperties": False}},
+                    "context_memories": {"type": "array", "maxItems": 0, "items": {"type": "object"}},
+                     "context_memory_log": {"type": "object", "properties": {
+                         "mode": {"const": "unavailable"},
+                         "reason": {"type": "string"},
+                         "counts": {"type": "object", "properties": {
+                             "selected": {"type": "null"},
+                             "candidate_pool": {"type": "null"},
+                             "injected": {"const": 0}}}}},
+                 }},
+            ]}}},
+        },
     },
     ("get", "/v1/chat/poll"): {
         "200": {
@@ -3400,9 +3531,13 @@ RESPONSE_OVERRIDES: dict[Operation, dict[str, Any]] = {
     },
     ("post", "/v1/genesis/imports/{job_id}/finalize"): {
         "202": {
-            "description": "Upload finalized and awaiting reducer output.",
+            "description": "Upload finalized and awaiting reducer output. A previously managed job rejects finalize with 409; deliberate retry requires a new import job and may incur provider cost again.",
             "content": {"application/json": {"schema": {"$ref": "#/components/schemas/GenericJsonResponse"}}},
-        }
+        },
+        "409": {
+            "description": "Missing chunks or managed_claim_requires_outputs: a managed job cannot be finalized or applied inline.",
+            "content": {"application/json": {"schema": {"$ref": "#/components/schemas/ErrorResponse"}}},
+        },
     },
     ("post", "/v1/genesis/persona_backfill"): {
         "202": {

@@ -12,6 +12,135 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Capture and Dream retain `output_truncated` and token-budget diagnostics when
+  an output-limited final reply contains partial text, cannot be parsed, and
+  the component has no re-ask remaining. Previously this could be reported as
+  a JSON format failure.
+- Capture and Dream count a consumed format or semantic re-ask against the
+  shared component retry budget before handling truncation. If that budget is
+  exhausted, a subsequently truncated reply does not trigger an extra request.
+
+- Test enclave attestation metadata now explicitly declares the test AppAuth
+  contract and compose path. Unavailable image digests and deployment
+  transactions are null instead of development placeholders or historical
+  transaction data. These declarations do not prove effective KMS policy.
+
+- Hosted Resident startup now revalidates configuration under the same per-user
+  lock as Model API deletion. Stale discovery results cannot start a consumer
+  after deletion; already admitted consumers retain ownership until their owner
+  confirms exit. Runtime V2 drain observations distinguish unknown process state
+  from idle, including parent and slot generations.
+
+- Plaintext automatic recall no longer falls back to enclave content reads.
+  Required conversation and owner/binding failures stop the turn; a malformed
+  same-owner optional memory makes the whole recall result unavailable without
+  blocking valid conversation. Unavailable counts remain unknown, distinct
+  from a healthy zero-match result. Candidate ordering and the fixed message
+  frontier are retained; old sealed content is excluded without migration.
+  Required attachment bytes are bound to the same message version before media
+  processing. Explicit references are required content and keep their own
+  message when stale backlog is collapsed. Turn selection returns attachment
+  fingerprints and required reference cards; historical wake anchors may omit
+  unused old references with `include_references: false`.
+
+
+- Genesis identity initialization preserves existing cards when storage or
+  decryption reads fail, and refuses stale writes that lose a concurrent
+  creation or update. Successful first initialization remains supported.
+
+- Resident consumers now reject unrecognized HTTP success responses without a
+  valid JSON reply ID receipt. Recognized terminal voice dispositions settle
+  without counting a posted reply or success. Unconfirmed foreground writes
+  retain the existing retry
+  path instead of being counted as accepted delivery. Server idempotency and
+  terminal conflict behavior are unchanged; this does not prove client display.
+
+- Capture and Dream preserve bounded provider exception and explicit-cause
+  categories in their existing restricted failure trajectories. The diagnostic
+  does not change error codes, requests, retries, budgets, or memory writes,
+  and does not attribute historical failures to an upstream provider.
+
+- Model route activation, route tests, and active credential key changes record
+  bounded HTTP/1.1 header/body phase evidence in existing probe diagnostics.
+  HTTP/2 and unavailable observations remain unknown. Validation, buffered reads,
+  90-second operation timeouts, and existing request counts are unchanged.
+
+- `io_cli doctor` now uses authenticated account mode for readiness. Plaintext
+  accounts skip the enclave content probe; legacy modes retain it. The
+  `io_cli.doctor.v2` output keeps five boolean check keys and adds required/skip
+  metadata, so a skipped `false` does not fail readiness. Mode-fetch errors stop
+  later probes. Whoami attestation compatibility and public API shapes are
+  unchanged; this does not promise zero enclave network requests.
+
+- `io_cli identity-read` reads effective plaintext identities locally with owner
+  checks and no content-decrypt fallback. It uses backend relationship days,
+  including anchor repair, which can differ from legacy enclave counts. The
+  existing identity GET now distinguishes absent rows from unavailable reads
+  (503) and non-object storage (500), while preserving successful raw envelopes.
+  Legacy identity writers retain their existing behavior.
+
+- Resident proactive failure status updates accept an optional bounded diagnostic
+  claim. Job responses preserve its consumer-reported provenance, unknown and
+  conflict states; an offline reader summarizes authorized snapshots without
+  changing failure statistics or background behavior.
+
+- `io_cli voice-transcript-read` reads effective plaintext accounts' own archives
+  locally, preserving full text and pagination without an enclave URL. Sealed or
+  malformed archives fail without decrypt fallback. Failed or malformed mode
+  responses stop the command; encrypted and valid legacy unknown modes retain
+  their existing decrypt path.
+
+- Documentation type checking now completes MDX source generation after Next
+  route type generation, preventing interrupted background writes from reaching
+  the TypeScript check. Public API behavior is unchanged.
+
+- Runtime V2 Dream now shares its post-claim model deadline across retries and
+  re-asks, retaining the Heavy slot limit and a nominal cleanup reserve. Budget
+  exhaustion is distinguished from provider failure; later recovery attempts
+  may be skipped when the remaining time is exhausted.
+
+- Authenticated memory index requests expose content-free operator timing for
+  worker queue, core execution, and overlapping enclave calls. Missing or
+  unfinished segments remain unknown; request behavior is unchanged.
+
+- V2 model-call start and completion traces retain their job association. An
+  offline failure-attribution tool counts distinct failed heartbeat jobs from
+  bounded snapshots while preserving missing and conflicting observations.
+
+- `io_cli chat-image` reads plaintext accounts' image bodies from the authenticated
+  backend without requiring an enclave URL. Sealed or unavailable bodies fail
+  without decrypt fallback; encrypted and unknown modes keep their existing path.
+
+- Resident version observations now retain each polling identity's declared
+  revision and its source. Unknown and stale reports stay explicit; unpacked
+  consumers no longer borrow an ancestor repository's SHA. Runner image labels
+  and consumer revision declarations do not attest loaded source.
+
+- Managed deployment detection retains pending code after failed or partial
+  releases, compares against complete deployment evidence, and includes Resident
+  consumer changes in test, pre, and production. Unknown history cannot silently
+  skip deployment; existing deployment and authorization gates remain in force.
+
+- Wake direct-text correction failures retain the configured model route,
+  current-call duration, and transport retry evidence in operator error traces.
+  Unknown retry evidence stays unknown; calls and failure behavior are unchanged.
+
+- Test runner compose recovery accepts strictly validated frozen-limit diagnostics
+  alongside the original intent and failure archive, while retaining the same
+  transaction, authorization checks, and one-attempt claim.
+
+- Test runner compose authorization has an explicit, operator-approved recovery
+  path for an archived pre-send stop. It preserves the frozen transaction,
+  records persistent target claims, and refuses automatic retries or repricing.
+
+- Runtime V2 worker exception traces preserve content-free exception families,
+  valid provider HTTP status codes, and an explicit cause when available. These
+  best-effort observations do not count terminal failures or change retries.
+
+- Managed test workers expose restricted process flag diagnostics to authenticated
+  operators. Missing evidence remains unknown; sampling does not change runtime
+  behavior or grant execution permission.
+
 - Model route activation/test diagnostics now correlate the route and server
   request with probe timing and safe exception categories. Unknown HTTP phases
   remain explicit; this does not change timeouts, validation, or rollback behavior.
@@ -44,6 +173,12 @@ change must not be interpreted as an API guarantee.
   truncation markers still apply, and unavailable or partial reads are marked
   explicitly. This restores automatic World Book injection; it
   does not guarantee model adherence or fix every long-conversation failure.
+
+- Enabled managed Genesis workers can process eligible plaintext uploaded/backfill
+  jobs without an enclave URL. Status/list output adds optional
+  `managed_unavailable` diagnostics. Claim-bound output application prevents
+  replay and stale writes; recovery after execution preserves partial effects
+  and fails without automatic retry. No deployment is implied by this entry.
 
 - Resident startup and idle health checks now read authenticated backend history
   for effective-off accounts, including with no enclave URL. The existing health

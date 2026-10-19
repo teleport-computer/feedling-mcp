@@ -95,3 +95,20 @@ def test_inject_does_not_mutate_the_input_tail():
         tail, user_id="u",
         read_files=_fake_reader({"m1": {"file_name": "doc.pdf", "text": "body", "truncated": False}}))
     assert tail[0] == original
+
+
+def test_off_required_file_cannot_continue_without_reader_or_text():
+    import pytest
+    from memory import recall_contract, recall_attachments
+    row = _file_row('file')
+    row['_recall_row_proof'] = recall_contract.TurnRowProof('u', 'file', 1, row['content'])
+    with pytest.raises(recall_contract.RecallFailure):
+        worker._inject_tail_files([row], user_id='u', read_files=None)
+    proof = recall_attachments.AttachmentProof('u', 'file', 1, '{}', b'validated source')
+    row['_recall_attachment_proof'] = proof
+    for response in ({}, {'file': {'error':'parser_unavailable'}}, {'file': {'text':''}}):
+        def read(uid, ids, *, proofs):
+            assert uid == 'u' and ids == ['file'] and proofs['file'] is proof
+            return response
+        with pytest.raises(recall_contract.RecallFailure):
+            worker._inject_tail_files([row], user_id='u', read_files=read)

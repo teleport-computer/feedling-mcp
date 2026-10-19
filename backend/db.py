@@ -582,6 +582,12 @@ def _list_supervisor_instance_heartbeats_from_pool(
             "owner": r[0], "host": r[1], "shard_index": r[2], "shard_count": r[3],
             "max_children": r[4], "active_children": r[5],
             "host_all": bool(r[6]), "gateway": bool(r[7]), "version": r[8],
+            # Legacy rows without provenance remain unknown. The label is a
+            # runner image declaration, not a measurement of consumer code.
+            "version_source": (
+                "image_env" if r[8] and payload.get("version_source") == "image_env"
+                else "unknown"
+            ),
             "ts": float(r[9]),
             "pi": bool(payload.get("pi")),
         })
@@ -10730,6 +10736,15 @@ def audit_resident_active_model_routes(*, apply: bool = False) -> list[dict]:
 
 
 def list_agent_runtime_enabled_users() -> list[dict]:
+    """Best-effort compatibility reader; supervisor discovery is strict."""
+    try:
+        return list_agent_runtime_enabled_users_strict()
+    except Exception as e:
+        log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
+        return []
+
+
+def list_agent_runtime_enabled_users_strict() -> list[dict]:
     """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
     fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
     不再有 per-user ``agent_runtime_driver`` 开关；kill switch 改用删/换 active
@@ -10753,55 +10768,50 @@ def list_agent_runtime_enabled_users() -> list[dict]:
     """
     providers = ["anthropic", "claude", "deepseek", "openai",
                  "gemini", "openrouter", "openai_compatible"]
-    try:
-        with get_pool().connection() as conn:
-            rows = conn.execute(
-                """
-                SELECT r.user_id,
-                  CASE LOWER(c.provider)
-                    WHEN 'anthropic' THEN 'claude'
-                    WHEN 'claude'    THEN 'claude'
-                    WHEN 'deepseek'  THEN 'claude'
-                    WHEN 'openai'    THEN 'codex'
-                    ELSE 'pi'
-                  END AS driver,
-                  LOWER(c.provider) AS provider,
-                  r.model AS model,
-                  c.base_url AS base_url,
-                  c.supports_responses AS supports_responses,
-                  COALESCE(r.reasoning_effort, '') AS reasoning_effort,
-                  r.vision_test_status AS vision_test_status
-                FROM model_api_routes r
-                JOIN model_api_credentials c ON c.id = r.credential_id
-                WHERE r.is_active
-                  AND r.test_status = 'ok'
-                  AND LOWER(c.provider) = ANY(%s)
-                  AND EXISTS (
-                    SELECT 1 FROM user_blobs route_blob
-                    WHERE route_blob.user_id = r.user_id
-                      AND route_blob.kind = 'onboarding_route'
-                      AND LOWER(COALESCE(route_blob.doc->>'route', '')) = 'model_api'
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM v2_runtime_state vrs
-                    WHERE vrs.user_id = r.user_id
-                      AND vrs.hosted_runtime_state IN ('v2', 'draining')
-                  )
-                ORDER BY r.user_id
-                """,
-                (providers,),
-            ).fetchall()
-        return [{"user_id": uid, "driver": driver, "provider": provider,
-                 "model": model, "base_url": base_url,
-                 "supports_responses": bool(supports_responses),
-                 "reasoning_effort": reasoning_effort,
-                 "vision_test_status": str(vision_test_status or "untested")}
-                for uid, driver, provider, model, base_url, supports_responses,
-                reasoning_effort, vision_test_status in rows]
-    except Exception as e:
-        log.error("[db] list_agent_runtime_enabled_users failed: %s", e)
-        return []
-
+    with get_pool().connection() as conn:
+        rows = conn.execute(
+            """
+            SELECT r.user_id,
+              CASE LOWER(c.provider)
+                WHEN 'anthropic' THEN 'claude'
+                WHEN 'claude'    THEN 'claude'
+                WHEN 'deepseek'  THEN 'claude'
+                WHEN 'openai'    THEN 'codex'
+                ELSE 'pi'
+              END AS driver,
+              LOWER(c.provider) AS provider,
+              r.model AS model,
+              c.base_url AS base_url,
+              c.supports_responses AS supports_responses,
+              COALESCE(r.reasoning_effort, '') AS reasoning_effort,
+              r.vision_test_status AS vision_test_status
+            FROM model_api_routes r
+            JOIN model_api_credentials c ON c.id = r.credential_id
+            WHERE r.is_active
+              AND r.test_status = 'ok'
+              AND LOWER(c.provider) = ANY(%s)
+              AND EXISTS (
+                SELECT 1 FROM user_blobs route_blob
+                WHERE route_blob.user_id = r.user_id
+                  AND route_blob.kind = 'onboarding_route'
+                  AND LOWER(COALESCE(route_blob.doc->>'route', '')) = 'model_api'
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM v2_runtime_state vrs
+                WHERE vrs.user_id = r.user_id
+                  AND vrs.hosted_runtime_state IN ('v2', 'draining')
+              )
+            ORDER BY r.user_id
+            """,
+            (providers,),
+        ).fetchall()
+    return [{"user_id": uid, "driver": driver, "provider": provider,
+             "model": model, "base_url": base_url,
+             "supports_responses": bool(supports_responses),
+             "reasoning_effort": reasoning_effort,
+             "vision_test_status": str(vision_test_status or "untested")}
+            for uid, driver, provider, model, base_url, supports_responses,
+            reasoning_effort, vision_test_status in rows]
 
 def claim_and_enqueue_introduction(
     user_id: str,
@@ -11326,6 +11336,7 @@ def genesis_claim_uploaded_jobs(*, worker_id: str = "", limit: int = 1) -> list[
                 UPDATE genesis_import_jobs AS j SET
                     status = 'processing',
                     error = '',
+                    metadata = COALESCE(j.metadata, '{}'::jsonb) - 'managed_worker_execution',
                     output = jsonb_build_object('stage', 'worker_claimed'),
                     worker_claimed_by = %s,
                     worker_claimed_at = now(),
@@ -11353,6 +11364,7 @@ def genesis_claim_uploaded_jobs(*, worker_id: str = "", limit: int = 1) -> list[
         placeholders = ", ".join(["(%s, %s)"] * len(out))
         mirror_sql = (
             "UPDATE genesis_import_jobs SET status = 'processing', error = '', "
+            "metadata = COALESCE(metadata, '{}'::jsonb) - 'managed_worker_execution', "
             "output = jsonb_build_object('stage', 'worker_claimed'), "
             "worker_claimed_by = %s, worker_claimed_at = now(), updated_at = now() "
             f"WHERE (user_id, job_id) IN ({placeholders})"
@@ -11405,6 +11417,7 @@ def genesis_reclaim_orphaned_processing_jobs(
             WITH picked AS (
                 SELECT user_id, job_id FROM genesis_import_jobs
                 WHERE status = 'processing'
+                  AND NOT (COALESCE(metadata, '{{}}'::jsonb) ? 'managed_worker_execution')
                   AND COALESCE(worker_claimed_by, '') <> ''
                   AND NOT (worker_claimed_by = ANY(%s))
                   AND worker_claimed_at < now() - make_interval(secs => %s)
@@ -11524,6 +11537,7 @@ def genesis_reap_stale_processing_jobs(older_than_sec: int, *, error: str, limit
                 SELECT user_id, job_id
                 FROM genesis_import_jobs
                 WHERE status = 'processing'
+                  AND NOT (COALESCE(metadata, '{}'::jsonb) ? 'managed_worker_execution')
                   AND COALESCE(resident_consumer_id, '') = ''
                   AND updated_at < now() - make_interval(secs => %s)
                 ORDER BY updated_at ASC
@@ -11940,6 +11954,7 @@ def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
             updated_at = now()
         WHERE user_id = %s AND job_id = %s
           AND status IN ('created', 'uploading', 'uploaded', 'failed')
+          AND NOT (COALESCE(metadata,'{}'::jsonb) ? 'managed_worker_execution')
         RETURNING *
         """
     )
@@ -11947,6 +11962,8 @@ def genesis_mark_finalized(user_id: str, job_id: str) -> dict | None:
     with get_pool().connection() as conn:
         cur = conn.execute(sql, params)
         result = _genesis_row(cur, cur.fetchone())
+    if result is None:
+        return None
     from tee_shadow import mirror
     mirror.execute(sql, params)
     return result
@@ -11960,6 +11977,7 @@ def genesis_set_job_status(
     error: str = "",
     output: dict | None = None,
     processed_chunks: int | None = None,
+    reject_managed: bool = False,
 ) -> dict | None:
     sql = (
         """
@@ -11975,6 +11993,7 @@ def genesis_set_job_status(
             processed_chunks = COALESCE(%s, processed_chunks),
             updated_at = now()
         WHERE user_id = %s AND job_id = %s
+          AND (NOT %s OR NOT (COALESCE(metadata,'{}'::jsonb) ? 'managed_worker_execution'))
         RETURNING *
         """
     )
@@ -11986,6 +12005,7 @@ def genesis_set_job_status(
         processed_chunks,
         user_id,
         job_id,
+        reject_managed,
     )
     with get_pool().connection() as conn:
         try:
@@ -12001,6 +12021,8 @@ def genesis_set_job_status(
                 raise GenesisRedistillJobActive(redistill["job_id"]) from None
             raise
         result = _genesis_row(cur, cur.fetchone())
+    if result is None:
+        return None
     from tee_shadow import mirror
     mirror.execute(sql, (
         status,
@@ -12010,6 +12032,7 @@ def genesis_set_job_status(
         processed_chunks,
         user_id,
         job_id,
+        reject_managed,
     ))
     return result
 
@@ -18092,59 +18115,69 @@ def model_api_route_get_with_envelope(user_id: str, route_id: str) -> dict | Non
 
 
 def model_api_active_route(user_id: str) -> dict | None:
-    """带 api_key_envelope —— 供 config_store 走 enclave 解密。"""
+    """Best-effort compatibility reader; admission uses the strict variant."""
     try:
-        with get_pool().connection() as conn:
-            row = conn.execute(
-                f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
-                "FROM model_api_routes r "
-                "JOIN model_api_credentials c ON c.id = r.credential_id "
-                "WHERE r.user_id = %s AND r.is_active",
-                (user_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        out = _route_row_to_dict(row)
-        # envelope is appended AFTER _ROUTE_COLUMNS, so read it by tail index — this
-        # stays correct if _ROUTE_COLUMNS ever grows again (it just did: created_at/
-        # updated_at), unlike a hardcoded positional index.
-        out["api_key_envelope"] = row[-1]
-        return out
+        return model_api_active_route_strict(user_id)
     except Exception as e:
         log.error("[db] model_api_active_route(%s) failed: %s", user_id, e)
         return None
 
 
+def model_api_active_route_strict(user_id: str) -> dict | None:
+    """Read the active route/envelope; missing row is None, errors propagate."""
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            f"SELECT {_ROUTE_COLUMNS}, c.api_key_envelope "
+            "FROM model_api_routes r "
+            "JOIN model_api_credentials c ON c.id = r.credential_id "
+            "WHERE r.user_id = %s AND r.is_active",
+            (user_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    out = _route_row_to_dict(row)
+    # envelope is appended AFTER _ROUTE_COLUMNS, so read it by tail index — this
+    # stays correct if _ROUTE_COLUMNS ever grows again (it just did: created_at/
+    # updated_at), unlike a hardcoded positional index.
+    out["api_key_envelope"] = row[-1]
+    return out
+
+
 def model_api_active_route_version(user_id: str) -> dict | None:
+    """Best-effort compatibility reader; admission uses the strict variant."""
+    try:
+        return model_api_active_route_version_strict(user_id)
+    except Exception as e:
+        log.error("[db] model_api_active_route_version(%s) failed: %s", user_id, e)
+        return None
+
+
+def model_api_active_route_version_strict(user_id: str) -> dict | None:
     """Return the active route's exact visual-capability fence.
 
     The microsecond timestamp is an internal compare-and-swap token, not a public
     route field. Setup probes and Hosted V1 failure learning use it so delayed
     provider results cannot mark a route the user changed in the meantime.
     """
-    try:
-        with get_pool().connection() as conn:
-            row = conn.execute(
-                "SELECT r.id::text,c.provider,r.model,c.base_url,"
-                "to_char(r.updated_at AT TIME ZONE 'UTC',"
-                "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
-                "FROM model_api_routes r "
-                "JOIN model_api_credentials c ON c.id=r.credential_id "
-                "WHERE r.user_id=%s AND r.is_active",
-                (user_id,),
-            ).fetchone()
-        if row is None:
-            return None
-        return {
-            "route_id": str(row[0]),
-            "provider": str(row[1] or ""),
-            "model": str(row[2] or ""),
-            "base_url": str(row[3] or ""),
-            "updated_at_token": str(row[4] or ""),
-        }
-    except Exception as e:
-        log.error("[db] model_api_active_route_version(%s) failed: %s", user_id, e)
+    with get_pool().connection() as conn:
+        row = conn.execute(
+            "SELECT r.id::text,c.provider,r.model,c.base_url,"
+            "to_char(r.updated_at AT TIME ZONE 'UTC',"
+            "  'YYYY-MM-DD\"T\"HH24:MI:SS.US\"Z\"') "
+            "FROM model_api_routes r "
+            "JOIN model_api_credentials c ON c.id=r.credential_id "
+            "WHERE r.user_id=%s AND r.is_active",
+            (user_id,),
+        ).fetchone()
+    if row is None:
         return None
+    return {
+        "route_id": str(row[0]),
+        "provider": str(row[1] or ""),
+        "model": str(row[2] or ""),
+        "base_url": str(row[3] or ""),
+        "updated_at_token": str(row[4] or ""),
+    }
 
 
 def model_api_active_route_vision_verdict(user_id: str) -> dict | None:
@@ -19310,6 +19343,39 @@ def log_patch_item(user_id: str, stream: str, item_key: str, patch: dict,
         # scheduled_wake claim_due). A missed real update is caught by the
         # reconciler; mirroring a rejection would forge a transition that
         # never happened on the primary.
+        from tee_shadow import mirror
+        mirror.execute(sql, tuple(params))
+    return row[0] if row is not None else None
+
+
+
+def log_patch_proactive_job(user_id: str, item_key: str, patch: dict,
+                            only_if_status: str | None = None, *,
+                            failure_report_context=None) -> dict | None:
+    """Merge the original job patch and a bounded claim in one row UPDATE.
+
+    Diagnostic binding is checked on each database's actual old row. Shadow
+    drift can therefore yield unknown instead of copying a primary claim.
+    """
+    from proactive.failure_diagnostics import ERROR_CLASSES, UPDATE_SQL, sql_inputs
+
+    candidate, consumer, present = sql_inputs(failure_report_context)
+    ordinary_patch = {k: v for k, v in patch.items() if k != "failure_diagnostic"}
+    params = [Jsonb(ordinary_patch), Jsonb(candidate), consumer, present,
+              Jsonb(sorted(ERROR_CLASSES)), user_id, "proactive_jobs",
+              user_id, "proactive_jobs", item_key]
+    sql = UPDATE_SQL
+    if only_if_status is not None:
+        sql += " AND target.doc->>'status' = %s"
+        params.append(only_if_status)
+    sql += " RETURNING target.doc"
+    try:
+        with get_pool().connection() as conn:
+            row = conn.execute(sql, tuple(params)).fetchone()
+    except Exception as e:
+        log.error("[db] log_patch_proactive_job(%s,%s) failed: %s", user_id, item_key, e)
+        return None
+    if row is not None:
         from tee_shadow import mirror
         mirror.execute(sql, tuple(params))
     return row[0] if row is not None else None

@@ -1227,3 +1227,15 @@ def test_auto_memory_context_shows_whole_summaries_up_to_the_limit():
     picked = _picked(("w", whole, "query", [], 0.9))
     text, ids = resident._auto_memory_context(picked, [])
     assert ids == ["w"] and whole in text and "…" not in text
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(resident, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

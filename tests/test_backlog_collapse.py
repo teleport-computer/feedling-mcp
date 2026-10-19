@@ -297,3 +297,15 @@ def test_mixed_batch_earlier_media_failure_defers_carrier(monkeypatch):
     assert any("3 条消息" in call for call in agent_calls[1:])
     assert len(posts) == 2
     assert second_latest == pytest.approx(STALE + 120)
+
+
+@pytest.fixture(autouse=True)
+def _confirmed_encrypted_recall_account(monkeypatch):
+    """Decoded legacy-lane fixtures still require an operation identity read.
+
+    Keep the real recall/driver pipeline; only the external account lookup is
+    fixed to the encrypted lane these fixtures model. Off-mode safety tests
+    supply their own authenticated identity and raw source envelopes.
+    """
+    monkeypatch.setattr(c, "_recall_account",
+                        lambda: ("legacy-test-user", "on"))

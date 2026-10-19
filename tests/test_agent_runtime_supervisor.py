@@ -22,7 +22,17 @@ T0 = 2_000_000.0
 
 
 @pytest.fixture(autouse=True)
-def _clean_table():
+def _clean_table(monkeypatch):
+    # This suite isolates lease/process orchestration. Real admission locking,
+    # route deletion and generation interleavings have their own offline suite.
+    from contextlib import nullcontext, contextmanager
+    monkeypatch.setattr(db, 'hosted_runtime_config_mutation_lock', lambda uid: nullcontext())
+    monkeypatch.setattr(supervisor_mod.admission, 'witness', lambda uid, entry: (1,'route','credential','version'))
+    monkeypatch.setattr(supervisor_mod.admission, 'envelope_matches', lambda binding,env: True)
+    @contextmanager
+    def orchestration_guard(uid, entry, *, expected=None):
+        yield (1,'route','credential','version')
+    monkeypatch.setattr(supervisor_mod.admission, 'guard', orchestration_guard)
     with db.get_pool().connection() as conn:
         conn.execute("TRUNCATE agent_runtime_instances")
     yield
@@ -1063,7 +1073,7 @@ def test_resolve_discovered_isolates_per_user_failure(monkeypatch):
                                              api_url="a", enclave_url="e", cache={})
     uids = {e["user_id"] for e in out}
     assert "good" in uids        # 好用户照常解析
-    assert "bad" not in uids     # 坏用户被隔离跳过：不抛、不拖累其余
+    assert next(e for e in out if e["user_id"] == "bad")["_admission_unresolved"]     # 坏用户被隔离跳过：不抛、不拖累其余
 
 
 def test_effective_roster_host_all_uses_discovered_entries():
@@ -1104,7 +1114,7 @@ def test_discover_enabled_calls_db_with_no_args(monkeypatch):
         captured["called"] = True
         return []
 
-    monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users", fake_list)
+    monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users_strict", fake_list)
     supervisor_mod._discover_enabled()
     assert captured["called"] is True
 
@@ -1304,7 +1314,7 @@ def test_supervisor_instance_payload_shape():
     assert p == {
         "ts": 123.5, "owner": "host:7", "host": "host", "host_all": True,
         "pi": False, "active_children": 3, "max_children": 4,
-        "shard_index": 1, "shard_count": 2, "version": "abc",
+        "shard_index": 1, "shard_count": 2, "version": "abc", "version_source": "unknown",
     }
 
 
@@ -1338,11 +1348,14 @@ def test_heartbeat_loop_writes_per_owner_instance_row(monkeypatch):
 
 def test_heartbeat_loop_instance_write_error_does_not_kill_loop(monkeypatch):
     import threading
-    import time
 
     legacy = {"n": 0}
-    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat",
-                        lambda payload: legacy.__setitem__("n", legacy["n"] + 1))
+    twice = threading.Event()
+    def record_legacy(payload):
+        legacy["n"] += 1
+        if legacy["n"] >= 2:
+            twice.set()
+    monkeypatch.setattr(supervisor_mod.db, "set_supervisor_heartbeat", record_legacy)
 
     def boom(owner, payload):
         raise RuntimeError("db blip")
@@ -1353,9 +1366,11 @@ def test_heartbeat_loop_instance_write_error_does_not_kill_loop(monkeypatch):
         owner="o", host_all=True, pi=True, interval=0.01, stop_event=stop,
         instance_payload_fn=lambda ts: {"owner": "o", "ts": ts}))
     t.start()
-    time.sleep(0.05)
-    stop.set()
-    t.join(timeout=2)
+    try:
+        assert twice.wait(timeout=2), "heartbeat failed to recover after instance-write errors"
+    finally:
+        stop.set()
+        t.join(timeout=2)
 
     assert not t.is_alive()
     assert legacy["n"] >= 2  # legacy write keeps going despite instance-write errors

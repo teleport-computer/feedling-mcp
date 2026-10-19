@@ -38,6 +38,7 @@ def transport(monkeypatch):
         "user_id": "usr_test", "content_encryption_effective": "off",
     })
     monkeypatch.setattr(crc, "ENCLAVE_FETCH_MAX_ATTEMPTS", 1)
+    monkeypatch.setattr(crc, "_recall_account", lambda: ("usr_test", crc._whoami_cache["content_encryption_effective"]))
     requests = []
     clients = []
 
@@ -74,12 +75,13 @@ def enclave_requests(requests):
 @pytest.mark.parametrize("include_body", [True, False])
 @pytest.mark.parametrize("storage", ["disabled", "missing"])
 @pytest.mark.parametrize("kind", ["image", "file"])
-def test_real_missing_sealed_pointer_projection_cannot_be_context_or_recall(
-    transport, monkeypatch, mode, include_body, storage, kind,
+@pytest.mark.parametrize("caption", ["independent plaintext caption", ""])
+def test_missing_sealed_pointer_exposes_only_independently_readable_caption(
+    transport, monkeypatch, mode, include_body, storage, kind, caption,
 ):
     saved = row(content_type=kind, body_key="usr_test/old-object", body_ct_len=100,
                 nonce="sealed-nonce", K_user="wrapped", K_enclave="wrapped",
-                vision_route_id="must-not-run", caption_body="must-not-enter-context")
+                vision_route_id="must-not-run", caption_body=caption)
     reads = []
     monkeypatch.setattr(chat_service.db.object_storage, "chat_files_enabled", lambda: storage != "disabled")
     monkeypatch.setattr(chat_service.db.object_storage, "get_chat_body",
@@ -92,19 +94,30 @@ def test_real_missing_sealed_pointer_projection_cannot_be_context_or_recall(
     requests = transport({"messages": [projected]})
     monkeypatch.setitem(crc._whoami_cache, "content_encryption_effective", mode)
     recall_calls = []
+    monkeypatch.setattr(crc, "call_agent", lambda *a, **kw: pytest.fail("provider called"))
+    monkeypatch.setattr(crc, "post_reply", lambda *a, **kw: pytest.fail("reply posted"))
     monkeypatch.setattr(crc, "_turn_selection_from_backend", lambda *args: recall_calls.append(args))
     result = crc._hydrate_omitted_bodies(crc.get_decrypted_history(1.0, include_image_body=include_body))
     if mode == "off":
-        assert result[0]["body_unavailable"] is True
-        assert {k: result[0][k] for k in ("id", "seq", "ts", "role")} == {
-            k: saved[k] for k in ("id", "seq", "ts", "role")}
-        assert result[0].get("content") == ""
+        # An independently readable caption is usable text even when its sealed
+        # attachment is unavailable; the original encrypted bytes stay excluded.
+        assert result[0]["body_unavailable"] is (not bool(caption))
+        assert result[0]["content"] == caption
+        assert result[0]["content_type"] == "text"
         assert "vision_route_id" not in result[0]
-        assert "caption_body" not in result[0]
-        assert crc._clean_messages_for_proactive_context(result) == []
-        assert crc._capture_live_history(result) == []
-        assert crc._auto_memory_fetch_for_turn(result[0]) is None
-        assert recall_calls == []
+        assert not ({"body", "body_b64", "image_b64", "file_b64"} & result[0].keys())
+        if not caption:
+            assert crc._clean_messages_for_proactive_context(result) == []
+            with pytest.raises(crc._RecallInputError):
+                crc._auto_memory_fetch_for_turn(result[0])
+            assert recall_calls == []
+            monkeypatch.setattr(crc, "_seen_ids", set())
+            monkeypatch.setattr(crc, "_seen_ids_order", [])
+            monkeypatch.setattr(crc, "_reset_proactive_idle_guard", lambda: None)
+            monkeypatch.setattr(crc, "_clear_proactive_failure", lambda: None)
+            monkeypatch.setattr(crc, "_emit_debug_trace", lambda *a, **kw: None)
+            assert crc._process_messages(result) == 0.0
+            assert result[0]["id"] not in crc._seen_ids
         assert not enclave_requests(requests)
     else:
         assert result[0]["content"] == "legacy decrypted"
@@ -198,7 +211,8 @@ def test_all_sealed_off_rows_stay_unreadable_with_cursor_metadata(transport, sea
     assert result[0].get("content") == ""
     assert crc._capture_live_history(result) == []
     assert crc._clean_messages_for_proactive_context(result) == []
-    assert crc._auto_memory_fetch_for_turn(result[0]) is None
+    with pytest.raises(crc._RecallInputError):
+        crc._auto_memory_fetch_for_turn(result[0])
     assert not enclave_requests(requests)
 
 

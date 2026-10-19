@@ -14,6 +14,51 @@ managed confidential-compute environment.
 Read [architecture and trust boundaries](/docs/architecture) first for the
 logical component, data-flow, and encryption model used by this guide.
 
+## Optional managed Genesis plaintext worker
+
+`FEEDLING_GENESIS_WORKER_ENABLED` remains opt-in and requires the runtime-token
+secret. An absent enclave URL selects strict per-job plaintext eligibility for
+managed uploaded/backfill jobs; it does not enable decrypting sealed records.
+The worker needs authenticated backend access to the user's configured provider
+credential and PostgreSQL. Configure these within your chosen host trust boundary:
+local plaintext processing exposes authorized import material to that host and
+the selected provider. See [managed import recovery](/docs/workflows/memory#managed-import-eligibility-and-recovery)
+for partial effects and retry costs. This does not change the Resident consumer
+queue or the direct plaintext import thread.
+
+## Resident version observations
+
+Consumers freeze a revision declaration at startup and send it with polls and
+responses in `X-Feedling-Consumer-Commit`. The optional
+`X-Feedling-Consumer-Commit-Source` identifies `consumer_env`
+(`FEEDLING_CONSUMER_COMMIT`), `image_env` (`FEEDLING_GIT_COMMIT`), or
+`git_checkout` (the consumer's own repository at startup), in that precedence
+order. Explicit empty, `dev`, or `unknown` environment values remain unknown;
+an unpacked distribution does not borrow an ancestor repository's revision.
+Changing the checkout or environment after import does not update this report.
+
+These are self-reported distribution/checkout labels, **not proof of loaded
+source bytes**. A dirty checkout or incorrect image label can disagree with the
+running code. The backend's expected update target and compatibility claim are
+separate and never fill a missing consumer revision. The process spawner
+inherits its runner environment; an isolated container instead uses its own
+image environment, without copying the supervisor's revision label.
+
+Each bounded `consumer_state.poll_consumers` entry stores the protocol version,
+commit, and source with that identity's poll timestamp. Operator diagnostics
+return those observations with age and `recent`; later polls from another
+identity or response activity do not refresh them. Missing version data in an
+old-client poll clears that identity's prior report. Old persisted observations
+without these fields remain unknown, even when a newer global writer has a
+version. A commit reported without provenance is labeled `legacy`.
+
+Supervisor heartbeats separately store their runner image declaration in
+`version`, with `version_source=image_env` in the heartbeat payload and readback.
+Absent or old provenance is `unknown`. A fresh heartbeat proves neither the
+consumer's revision nor that a child loaded that image's source. Deployment and
+coverage acceptance still require evidence for the intended environment and
+running children; these fields do not authorize a restart or deployment.
+
 ## Resident startup during enclave outages
 
 Hosted and self-hosted resident consumers retry the startup decrypt-source probe
@@ -51,6 +96,83 @@ are not decrypted: their identifiers and sequence metadata remain for cursor
 progress, but they cannot supply conversation context, Capture text, or a
 per-turn memory-selection anchor. Encrypted and unknown accounts keep their
 existing decrypt-service paths.
+
+`io_cli chat-image` also checks effective mode through the authenticated backend.
+For explicit `off`, it reads backend history and any omitted message body,
+decodes single images or multi-image bundles locally, and writes private image
+files. It requires no enclave URL in that mode. Sealed, malformed, or unavailable
+bodies fail without decrypt fallback; encrypted or unknown mode keeps the enclave
+history path. The backend's existing whoami public-attestation lookup is unchanged,
+so this CLI routing change does not establish zero backend-to-enclave traffic.
+
+`io_cli voice-transcript-read --call-id <id>` reads an effective `off` account's
+own plaintext voice archive through the authenticated backend and decodes it
+locally, with no content-decrypt fallback or enclave URL requirement. It preserves
+full Unicode text, metadata, and 6000-character pages. Sealed legacy archives,
+mixed sealed/plaintext rows, foreign owners, malformed bodies, and failed reads
+remain unreadable; a preview is never substituted for the full transcript.
+
+This voice command stops if the mode request fails or its response has no valid
+user identity. A present null or non-string effective mode is also an error.
+Only an authenticated successful response with `on`, or a missing, empty, or
+unrecognized **string** effective mode, retains the legacy enclave path. Unknown
+strings are not normalized into `off`. This stricter error handling applies to
+this voice command and the identity command described below. The existing whoami
+attestation lookup remains separate, so this is not a claim of zero backend
+attestation traffic. Plaintext archives are visible to the backend and resident
+host under their existing trust boundaries.
+
+`io_cli identity-read` uses the same strict authenticated mode check when a
+backend URL is configured. Effective `off` reads the existing backend identity
+endpoint and projects the caller's plaintext card locally, without an enclave
+URL or content-decrypt fallback. It validates the owner and rejects sealed,
+mixed, or malformed bodies. A `local_only` card returns metadata only. Valid
+empty or sparse JSON objects keep the canonical card defaults; a truly absent
+card returns `identity: null`. Profile fields and replacement metadata are
+preserved. Encrypted and valid unknown modes keep the enclave-first path;
+legacy enclave-only configuration also remains supported.
+
+The CLI uses the backend's `days_with_user`, including its existing memory-anchor
+repair, rather than the client machine's clock or a stale value embedded in the
+card. Ordinary anchored cards retain their day count. Legacy cards with no or
+invalid anchor, or a repaired earlier memory date, can differ from the old
+enclave projection. Auxiliary memory lookup remains best effort.
+
+`GET /v1/identity/get` still returns raw envelopes for authenticated clients in
+all modes. A missing row returns HTTP 200 with `identity: null`; a stored
+non-object (including JSON null) returns HTTP 500 `identity_storage_invalid`.
+A database read or explicit enrichment failure returns HTTP 503
+`identity_read_unavailable`, with no database exception details. Clients must
+not treat these failures as permission to initialize or replace a card.
+
+These failure guarantees apply to this endpoint and the new CLI read path.
+Existing Resident reads still have their own error handling. Legacy unmanaged
+Genesis reinitialization can continue after a failed read of a Genesis-owned
+card; this change does not fix or authorize that existing write behavior.
+`doctor` first requires an authenticated, well-formed whoami response. Exact
+`off` requires backend API, identity, memory and chat probes, and does not run
+the enclave identity content probe. Exact `on`, a missing mode field, or any
+other string (including empty, whitespace and `OFF`) preserves the five-probe
+compatibility contract. Explicit null/non-string modes, malformed identities,
+and failed mode requests fail before later probes; they never imply plaintext.
+
+Doctor output uses schema `io_cli.doctor.v2`. The five boolean `checks` keys
+(`api`, `enclave`, `identity`, `memory`, `chat`) remain present. New
+`required_checks` and `skipped_checks` explain readiness: for plaintext,
+`checks.enclave` is `false` and its skip reason is
+`not_required_for_plaintext`; it is not counted in `failed`. `ok` and exit status
+use only required checks. Consumers that previously required all check values
+to be true must use `ok` or the exit status instead. On mode-read failure,
+`account_mode` is `unavailable`, `api` fails, other probes are marked skipped
+with `account_mode_unavailable`, and the command exits nonzero. Probe failures
+are never marked skipped. Empty identity/history responses can pass these
+reachability checks; success does not prove raw content is readable.
+
+The whoami public-attestation lookup is unchanged: configured cache misses may
+still request enclave metadata. Skipping the content probe does not guarantee
+zero enclave network traffic. Plaintext identity
+content is visible to the backend and resident host within their existing trust
+boundaries; no new decryption service or plaintext API is added.
 
 This history policy is independent of the memory-selection switch below.
 Startup and health probes follow the account mode described above; other
@@ -179,6 +301,21 @@ is an encryption recipient, not an API credential. Plain-text-only chat messages
 (carried inside an envelope) may omit `reply_to_message_id`; file/image
 **followups** require it. Authentication, bootstrap, and envelope validation
 still apply. A 400 response alone does not identify which validation failed.
+
+The server may also return HTTP 200 with `status: ignored` and one of
+`voice_call_finalized`, `voice_call_cancelled`, or `voice_call_finalizing` as
+`reason`. These closed voice dispositions settle the turn without counting a
+posted reply or delivery success; they do not block later messages.
+
+The official resident consumer requires a JSON success receipt containing a
+nonempty string reply `id` before counting a response write as accepted. An
+unreadable or missing receipt outside the terminal dispositions above leaves
+delivery unconfirmed. For a foreground
+turn with no accepted reply or terminal rejection, the consumer retains the
+checkpoint and releases the turn for normal redelivery. A lost receipt can
+follow a real commit; existing server idempotency and terminal conflict handling
+still apply. Receipt acceptance proves server acknowledgment, not client display.
+
 
 Unrelated untracked files do not block self-update, but tracked edits still do.
 Checkout refuses to overwrite conflicting untracked or ignored files and logs
@@ -383,7 +520,7 @@ these settings:
 | `FEEDLING_V2_UNAUDITED_DEFAULT_CONTEXT_WINDOW_TOKENS` | Lowest-precedence prompt window for a custom or unknown route (code default `65536`; managed Compose default `131072`). Set to `0` for fail-closed resolution. |
 | `FEEDLING_V2_PROVIDER_METADATA_CONTEXT_WINDOW_FLOOR_TOKENS` | Minimum route-metadata window Runtime V2 trusts automatically (default `32768`). Smaller values fall through to audited-family or unaudited-route knowledge and emit a content-free warning. Saved routes do not distinguish automatically supplied and explicitly entered values, so the floor applies to both. Re-evaluate it if your route population includes a legitimate smaller-context model. |
 | `FEEDLING_V2_CAPTURE_ENABLED` / `FEEDLING_V2_DREAM_ENABLED` | Deployment gates for the pooled Runtime V2 worker's Memory Garden extraction lanes. Production and pre-production default both worker gates to `1`; test temporarily defaults V2 dream to `0` as an incident-recovery kill switch. User-level capture and dream settings remain separate and independent. Set either worker gate to `0` for an operational kill switch. When Dream is off, an explicit chat `memory_organize` request returns an explainable disabled state and does not enqueue work. |
-| `FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS` | Output-token budget of one hosted Dream provider call (default `12000`, clamped to the shared 32,768-token provider ceiling). If the provider stops at that limit, Dream retries once with a more concise prompt and double the budget (still clamped) before recording `output_truncated`. The value is a cap, not a spend: replies that fit are billed as before. |
+| `FEEDLING_V2_DREAM_MAX_OUTPUT_TOKENS` | Output-token budget of one hosted Dream provider call (default `12000`, clamped to the shared 32,768-token provider ceiling). If the provider stops at that limit and the shared component retry budget has a slot remaining, Dream retries with a more concise prompt and double the token budget (still clamped). A consumed format re-ask uses that same retry budget; truncation after it is exhausted records `output_truncated` without another request. The value is a cap, not a spend: replies that fit are billed as before. |
 | `FEEDLING_DREAM_FUSE_RATIO` / `FEEDLING_DREAM_FUSE_MIN_CARDS` | Dream blast-radius fuse, shared by resident V1 and Runtime V2. A single Dream run that would retire more than `RATIO` (default `0.8`) of the cards shown to the model **and** at least `MIN_CARDS` (default `10`) cards fails as a whole without applying anything, instead of partially rewriting the garden. With the default 10-card floor, gardens with fewer than 10 retiring cards cannot trip the fuse; lowering `MIN_CARDS` removes that exemption accordingly. Invalid values fall back to the defaults. |
 | `FEEDLING_DREAM_STAGGER` | Defaults to `1`. Spreads automatic Dream runs across the night window (`FEEDLING_DREAM_NIGHT_START_HOUR`–`FEEDLING_DREAM_NIGHT_END_HOUR`, default 02:00–05:00 in the user's timezone) with a per-user offset derived from the user id and the night's local date (fixed within a night, rotating between nights), leaving the last 90 minutes (at most half the window) free for failure-backoff retries. Shared by resident V1 and Runtime V2. Set to `0` only as a kill switch: every eligible user then becomes due at the same moment the window opens, which is the burst this setting exists to prevent. Has no effect when `FEEDLING_DREAM_NIGHT_ONLY=0`. |
 | `FEEDLING_DREAM_MAX_CONCURRENT` | Fleet-wide ceiling on automatic Dream jobs queued or running — resident V1 jobs queued or running plus Runtime V2 jobs claimed or running, or waiting in the queue for less than an hour (a waiting job is claimed as soon as a worker is free, so it counts; one waiting longer means a stalled queue and stops counting) (default `4`, matching the enclave's default four decrypt worker processes: each Dream decrypts its whole garden in one burst). While the ceiling is reached, the scheduler skips enqueueing with reason `dream_concurrency_cap` and retries on its next tick. Resident jobs still active an hour after creation are treated as orphaned and do not hold a slot. The count and the enqueue run under one deployment-wide database lock; a tick that finds another admission in progress skips with reason `dream_admission_busy` and retries on its next tick. User-forced Dream runs are never blocked by it, though they still occupy a slot while active. `0` disables the ceiling. |
@@ -624,6 +761,183 @@ operator will respond to a leaked client credential.
   across an incompatible database migration without an explicit plan.
 - Re-run every enabled readiness check after upgrade and restore drills.
 
+The managed `test`, `pre`, and `main` push workflow compares deployment paths
+against the last proven complete main-CVM and runner release, including required
+compose authorization. A later documentation fix therefore retains code that a
+failed or partial release never deployed. Resident consumer changes count in all
+three environments. The generated image-pin commit is validated before it is used
+as a comparison baseline; an arbitrary image edit is still a deployment change.
+
+Only a known baseline with unchanged deployment content may skip deployment.
+Missing or incomplete release history requires the normal deployment gates;
+unreadable GitHub metadata or a superseded event stops the detection job with
+`UNMEASURED`. History lookup is bounded to 20 earlier push runs from the latest
+50 entries; reruns conservatively require reconciliation. This CI evidence is not
+an independent measurement of live health or out-of-band changes. Existing HOLD,
+image/topology checks, release compare-and-swap, authorization, and single-attempt
+publisher claims still apply. No failed transaction is automatically re-signed
+or resent by the change detector.
+
+## Recovering a stopped test compose authorization
+
+A failed compose authorization does not prove that a transaction was never sent.
+The normal publisher refuses automatic retries after a prior intent or an
+ambiguous broadcast. Operators must reconcile the original run, archived intent,
+final journal, transaction and receipt, nonce, live compose hash, and on-chain
+authorization before approving a recovery.
+
+Before merging recovery tooling, an operator must set the repository variable
+`TEST_COMPOSE_RECOVERY_HOLD=true`. The normal test API and runner deployment jobs
+then fail explicitly at their first step, before any mutation; their results
+must not be reported as successful deployment. This avoids a tooling merge
+automatically replacing the frozen recovery target. Only the coordinating
+operator may clear the hold after the recovery decision and deployment review.
+The operator must read back the variable and drain existing running or queued
+deployments before merging: older workflow revisions do not contain this guard.
+HOLD is necessary for this recovery entrypoint but never substitutes for the
+separate explicit authorization.
+
+The CI manual operation `reconcile-test-compose` is restricted to the test runner
+on Sepolia. It accepts an exact, reviewed authorization document and its SHA-256,
+binding the original artifacts and transaction, the execution commit, a unique
+recovery ID, and an expiry no more than one hour after issuance. It only accepts
+the original pre-send `frozen_limits_insufficient` stop with no attempt markers.
+Both the original two-file intent/failure archive and an archive containing its
+optional `frozen-limits-check.json` diagnostic are supported. The diagnostic must
+match the publisher's exact schema, integer and boolean types, pre-send phase,
+zero-send result, frozen gas/fee values, and failed comparison arithmetic. It is
+supporting evidence only: original intent bytes, source authorization, current
+preflight checks, and the persistent claim remain required. Unknown extra files,
+malformed or inconsistent diagnostics, and attempt markers are rejected.
+An already-authorized compose returns without signing or sending. Otherwise,
+recovery keeps the original transaction hash, nonce, gas limit, and fee; drift or
+unknown evidence stops execution. Recovery does not deploy or restart a CVM.
+
+The operation shares the normal test runner deployment lock, which does not
+cover all users of the signing account. Recovery therefore refuses any other
+active or queued repository workflow, incomplete workflow history, or a changed
+test branch head, and repeats these checks before signing and broadcasting.
+The coordinating operator must prevent new deployment admissions throughout the
+recovery window, including other branches and external uses of the signing key.
+The read checks are not an atomic lock against an administrator starting a new
+workflow. If exclusive use cannot be assured, stop recovery.
+Before loading the signer, it archives non-secret evidence in GitHub annotated tags and atomically
+creates a claim for the original chain/contract/compose target. This claim is
+shared across directories and recovery IDs and is never automatically removed.
+A claimed or ambiguously sent transaction cannot be retried by this entrypoint.
+Repository administrators must preserve the `compose-recovery-*` evidence and
+claim tags; deleting or rewriting them invalidates the recovery safety evidence.
+The execution token therefore needs repository contents-write and Actions-read
+permissions. Dispatch permission and operator approval remain trust boundaries:
+the document digest verifies exact approved bytes, not the identity of a human
+approver. Private keys and raw signed transactions are never archived.
+
+After authorization, independently verify the actual API and worker release and
+health before declaring the deployment complete. An absent naturally occurring
+diagnostic event remains unmeasured; do not generate paid or user-facing work to
+fill that gap.
+
+## Memory index request timing
+
+Authenticated ASGI `POST /v1/memory/index` requests emit the best-effort operator
+trace `memory.index.timing` under existing trace controls. Its `trace_id` uses the
+existing access-log request ID when available. `detail.lane` is `index` or
+`search`; top-level `status` is `ok`, `error`, or `cancelled`, and
+`detail.http_status` is null when no route response status was obtained.
+
+Top-level `dur_ms` measures dispatch through response construction, after
+authentication and body parsing, and before telemetry emission. The bounded
+`detail.segments` object contains:
+
+- `queue_ms`: dispatch until the worker callable starts.
+- `core_ms`: elapsed execution of the existing index core, including enclave
+  calls. `core_state` is `not_started`, `running`, `completed`, or `failed`.
+- `upstream_ms`: summed elapsed synchronous enclave calls within that core;
+  `upstream_calls` counts calls started. `upstream_state` is `not_called`,
+  `running`, `completed`, or `failed`.
+
+Upstream time overlaps core time; do not add them. Return scheduling and response
+construction can make `dur_ms` exceed queue plus core. Missing, uncalled, or
+unfinished durations are null, not zero. Cancellation records the snapshot at
+route exit; a worker may still finish later. A completed core can return a handled
+error, so use the route status as well as segment states.
+
+These events contain no request content, credentials, URLs, or exception text.
+They do not change results, authentication, retries, timeouts, or worker limits.
+Trace delivery can be disabled or dropped; missing events do not imply no traffic
+or zero latency. The event does not establish the cause or frequency of historical
+slow requests and does not backfill them.
+
+## Runtime V2 provider call errors
+
+V2 model-call `start`, `done`, and `error` events include the owning `job_id`
+when available. Correlate using user, job, runtime actor, and lane; a shared
+`trace_id` alone can mix separate jobs. This applies to newly emitted events,
+including retained tail events, and does not backfill older records.
+
+For an already approved, bounded local snapshot, run
+`python tools/wake_failure_attribution.py snapshot.json`. Its JSON input has
+`jobs` (`user_id`, `job_id`, `status`, `lane`) and flat `events`
+(`user_id`, `job_id`, `actor`, `lane`, `type`, `provider`, `model`).
+It counts distinct failed heartbeat jobs, accepts only matching `hosted_v2`
+observations, and returns aggregate observation and route-coverage counts.
+Duplicate events do not add jobs. Conflicting candidate job snapshots are counted
+separately and excluded from confirmed failures; candidate counts equal confirmed
+failures plus conflicts. Multiple observed routes remain explicit. It performs no database or provider calls and prints no
+identifiers or model names. Snapshot completeness and acquisition remain the
+operator's responsibility.
+
+A start records a logical attempt, not proof of an HTTP request. A done or error
+event describes one call, not the job's terminal cause or outcome. Missing or
+sampled-out events remain unknown; this tool cannot establish a no-call count,
+reconstruct historical failures, or change the legacy open-rate denominator.
+
+The operator event `agent.model.call.error` retains the configured provider and
+model, including failures during a wake direct-text correction. Its duration is
+elapsed time for the current logical provider call, not the whole wake. Transport
+retry counts are included only when the private attempt envelope records HTTP
+attempts; absent evidence remains unknown, even when the correction allows only
+one attempt. Error categories remain closed and exclude response bodies,
+credentials, endpoints, and unpublished drafts.
+
+These best-effort events preserve available job and trace linkage. An earlier
+`agent.model.call.done` can precede a correction failure; it does not mean the
+job completed. Analyses that join only completed model calls cannot attribute
+all failures. This metadata change does not add calls, retries, or fallbacks,
+and does not backfill historical traces.
+
+## Runtime V2 exception observations
+
+The operator trace event `v2.failure.observed` records exceptions caught by chat,
+wake, turn setup, compaction, and trajectory-review workers. It links the job
+and available trace ID to closed exception-family and error-code categories.
+Only a valid HTTP status from a provider exception and its immediate explicit
+cause are retained; unknown categories stay unknown. Messages, class names,
+tracebacks, URLs, credentials, and provider response bodies are excluded from
+this event. Capture-specific failure handling is outside this event’s scope.
+
+These events follow existing trace controls and best-effort delivery. An event
+can precede a retry or a lost-lease transition, so it is an exception observation,
+not a terminal job outcome. Missing events do not prove success. Use durable
+job outcomes for completion rates; this event neither backfills historical
+failures nor changes public errors, retry policy, or model calls.
+
+Capture and Dream attach a separate `provider_failure` object to their existing
+restricted `turn_exception` trajectory when a provider exception becomes the
+returned extraction failure. The object retains only the same closed exception
+families, immediate explicit cause, and valid provider HTTP status. It is bound
+to the exact exception raised for that returned failure; a later health or usage
+error with the same error code does not inherit it. Provider messages, payloads,
+and implicit exception context are excluded.
+
+This adds no trace event or storage lookup. Existing trajectory access controls,
+encryption, enablement, and best-effort delivery still apply. Refusal, output
+truncation, recoverable output-budget fallback, and Dream's shared deadline keep
+their existing diagnostics. `observation_only` does not prove a durable failure
+transition or an upstream root cause, and a missing object is not proof that no
+local exception occurred. This does not backfill old failures or change requests,
+retries, budgets, public errors, or memory-write behavior.
+
 ## Minimum security checklist
 
 - Run containers as non-root and keep the Docker socket out of application
@@ -651,3 +965,68 @@ operator will respond to a leaked client credential.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.
+
+## Resident proactive failure claims
+
+The resident consumer can attach an optional `failure_diagnostic` to an existing
+`POST /v1/proactive/jobs/{job_id}/status` failure report. The request contains
+`v: 1` and one `reported_error_class` from the documented closed vocabulary.
+The backend records `source: consumer_reported` only after checking the original
+consumer identity against the current job row. This checks association, not the
+truth of a provider diagnosis: a client can report a valid category incorrectly,
+and a consumer identifier is not an execution-attempt token.
+
+Old clients need no changes. Missing diagnostics stay unknown; malformed claims,
+unknown versions/classes, extra keys and unavailable bindings degrade without
+changing the original status operation. Persisted objects contain only `v`,
+`reported_error_class`, `source` and `state`. States are `reported`, `missing`,
+`invalid`, `binding_unavailable` and `conflicting_reports`; all states other than
+`reported` have class `unknown` and source `none`. A later non-failure state clears
+the field to null. Repeated conflicting claims are retained as a conflict rather
+than choosing a cause. No exception bodies or credentials enter this new field.
+Existing job responses can expose it under the same tenant authorization.
+
+Operators can summarize an already authorized, bounded snapshot with
+`python tools/resident_failure_diagnostics.py snapshot.json`. Input has
+`schema_version: 1` and a `jobs` array whose entries contain `user_id`, `job_id`
+and the stored job `doc`. The tool never queries a service or database, and does
+not authenticate snapshot provenance. It limits input to 16 MiB and 100,000 rows,
+deduplicates by user/job, excludes conflicting job states from confirmed failures,
+and emits only fixed aggregate counts. These are reported categories, not verified
+causes or opening/delivery rates. Missing historical evidence is not reconstructed.
+The projection follows the existing proactive-job retention and deletion lifecycle.
+
+
+### Plaintext automatic recall boundaries
+
+For an authenticated effective-off account, automatic recall has no enclave
+content fallback, including rollout `off`/`shadow`, old sealed input and local
+failure. Required turn content and subject ownership are validated separately
+from optional candidate payloads. An invalid same-owner candidate makes the
+whole recall result unavailable; an ownership, authorization, required-content
+or unknown shared-read failure stops the turn. See the [memory workflow](./workflows/memory)
+for fixed-frontier, unavailable-count and deadline behavior. Whoami public
+attestation metadata remains compatible and may still make network requests.
+
+### Attestation release and policy metadata
+
+`/attestation` includes declared `enclave_release` and `app_auth` metadata.
+These fields are configuration claims, not independent proof of the loaded
+image digest or the effective platform KMS/AppAuth binding. The quote's
+REPORT_DATA binds the content public key, TLS fingerprint and version; it does
+not directly bind these metadata fields. Verify platform policy separately.
+
+The test compose explicitly declares the test AppAuth contract on Sepolia
+(chain 11155111) for both enclave listeners. Its compose URL names the mutable
+`test` branch for navigation; it is not an immutable release proof. Use the
+measured compose hash and recorded release/pin evidence for that purpose.
+Missing or malformed `enclave_release.image_digest` and `app_auth.deploy_tx`
+are JSON `null`, including empty values and development placeholders. Consumers
+must handle null and must not create a transaction link without a transaction.
+A configured digest or transaction remains a declaration, not verification.
+
+The existing deployment attestation gate compares the content public key with
+its baseline. The canary compares that key with the backend advertisement and
+checks an encrypt/decrypt round trip. Neither verifies AppAuth contract/chain,
+image digest, compose URL, or DCAP quote validity. A successful gate or canary
+must not be presented as complete policy verification.
