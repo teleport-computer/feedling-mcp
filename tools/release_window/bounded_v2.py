@@ -202,7 +202,7 @@ def runtime_drain(owner, reads, h, *, deadline=None, connector=receipts.connect,
             if not any(current[k] for k in ('pending','claimed','running','resident_lease_active','job_leases')):
                 owner.save('resident-guard-after', receipts.resident_guard(owner.manifest, connector=connector, read_budget=reads))
                 remaining()
-                owner.save('runtime-drained', {'observation':current, 'parents':observed})
+                owner.save('runtime-drained', {'observation':current, 'causal_proof':proof.evidence})
                 return current
         sleep(min(owner.manifest['limits']['poll_seconds'], remaining()))
     raise RuntimeError('owned runtime drain unconfirmed; retain fixture')

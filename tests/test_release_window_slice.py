@@ -877,3 +877,39 @@ def test_or_success_with_null_error_can_advance_phase(tmp_path):
         assert len(calls) == 2
     finally:
         run.close()
+
+
+@pytest.mark.parametrize('changes,reason', [
+    ({'unexpected_secret_field': 'private-prompt-canary'}, 'or_shape'),
+    ({'messages': [{'role': 'user', 'content': [{'type':'text','text':'private-prompt-canary'}]}]}, 'or_text_only'),
+    ({'stream': True}, 'or_stream'),
+    ({'max_tokens': None}, 'or_output_limit'),
+])
+def test_or_payload_refusal_records_only_fixed_reason(tmp_path, changes, reason):
+    run, calls = or_run(tmp_path)
+    with pytest.raises(proxy.Refused):
+        run.forward(or_body(**changes))
+    with pytest.raises(proxy.Refused):
+        run.forward(or_body())
+    run.close()
+    rows = [json.loads(x) for x in (tmp_path/'ledger').read_text().splitlines()]
+    refusal = [r for r in rows if r['event'] == 'payload_rejected']
+    assert refusal == [{'event': 'payload_rejected', 'reason': reason, 'phase': 'setup'}]
+    assert calls == [] and run.attempts == 0 and run.stopped
+    assert 'private-prompt-canary' not in (tmp_path/'ledger').read_text()
+    assert 'unexpected_secret_field' not in (tmp_path/'ledger').read_text()
+
+
+def test_payload_refusal_unknown_exception_text_is_never_logged(tmp_path, monkeypatch):
+    run, calls = or_run(tmp_path)
+    def reject(*args):
+        raise proxy.Refused('private-key-canary')
+    monkeypatch.setattr(proxy, 'payload', reject)
+    with pytest.raises(proxy.Refused):
+        run.forward(or_body())
+    run.close()
+    text = (tmp_path/'ledger').read_text()
+    assert 'private-key-canary' not in text
+    assert any(r.get('event') == 'payload_rejected' and r['reason'] == 'unclassified'
+               for r in map(json.loads, text.splitlines()))
+    assert calls == [] and run.attempts == 0

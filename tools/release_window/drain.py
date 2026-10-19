@@ -63,12 +63,29 @@ def identity(row):
     return (report['parent_generation'], sorted((s['slot_id'],s['slot_generation'],s['pid']) for s in report['slots']))
 
 
+def checked_projection(row):
+    """Copy only causal fields from a row already accepted by rows()."""
+    report = row['runtime_state']['drain']
+    return {
+        'worker_id': row['worker_id'], 'pool': row['pool'],
+        'beat_at_epoch': row['beat_at_epoch'], 'age_sec': row['age_sec'],
+        'parent_generation': report['parent_generation'],
+        'slots': [{k: slot[k] for k in (
+            'slot_id', 'slot_generation', 'pid', 'sample_monotonic',
+            'progress_monotonic', 'state')} for slot in report['slots']],
+    }
+
+
 class Proof:
     def __init__(self, initial, scope, fence_epoch):
         self.scope, self.fence_epoch = scope, fence_epoch
         self.initial = rows(initial, scope)
         self.after_beat = {}
         self.barriers = {}
+        # Constant stage count: never retain every poll or arbitrary metrics.
+        self.evidence = {'fence_epoch': fence_epoch, 'pools': {
+            pool: {'initial': checked_projection(row)}
+            for pool, row in self.initial.items()}}
 
     def observe(self, metrics):
         current = rows(metrics, self.scope)
@@ -81,6 +98,7 @@ class Proof:
             if pool not in self.after_beat:
                 if beat > self.fence_epoch:
                     self.after_beat[pool] = beat
+                    self.evidence['pools'][pool]['after_beat'] = checked_projection(row)
                 ready = False
             elif pool not in self.barriers:
                 # This sample belongs to a later iteration of the SAME awaited
@@ -89,8 +107,12 @@ class Proof:
                 # between DB, parent, and child is required.
                 if beat > self.after_beat[pool]:
                     self.barriers[pool] = {s['slot_id']:s['sample_monotonic'] for s in slots}
+                    self.evidence['pools'][pool]['barrier'] = checked_projection(row)
                 ready = False
             elif any(s['state'] != 'idle' or s['progress_monotonic'] <= self.barriers[pool][s['slot_id']]
                      for s in slots):
                 ready = False
+        if ready:
+            for pool, row in current.items():
+                self.evidence['pools'][pool]['final'] = checked_projection(row)
         return current if ready else None
