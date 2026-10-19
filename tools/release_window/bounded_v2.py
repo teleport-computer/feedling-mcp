@@ -72,13 +72,27 @@ def exercise(owner, run, reads, *, connector=receipts.connect, sleep=time.sleep)
     owner.verify()
     if c.content_encryption_effective != 'off':
         raise RuntimeError('plaintext fixture required')
-    r = c.post('/v1/model_api/setup', json={'provider': 'openai_compatible' if run.manifest['lane'] == 'openrouter-v2-text' else 'openai', 'model': run.manifest['model'],
-        'api_key': run.token, 'base_url': run.manifest['relay_origin'] + '/v1'}, _retries=1, timeout=30)
+    text_route = run.manifest['lane'] == 'openrouter-v2-text'
+    endpoint = '/v1/model_api/routes' if text_route else '/v1/model_api/setup'
+    r = c.post(endpoint, json={'provider': 'openai_compatible' if text_route else 'openai', 'model': run.manifest['model'],
+        'api_key': run.token, 'base_url': run.manifest['relay_origin'] + '/v1',
+        **({'activate': True, 'purpose': 'conversation'} if text_route else {})}, _retries=1, timeout=30)
     r.raise_for_status()
     setup = r.json()
-    status = (setup.get('config') or {}).get('test_status') or setup.get('test_status')
-    owner.save('setup', {'phase': 'setup', 'http': r.status_code, 'assertions': {'selftest_ok': status == 'ok'}})
-    if status != 'ok':
+    if text_route:
+        # /setup also schedules an image probe, incompatible with this text-only
+        # relay. Route activation retains synchronous key testing and V2 fences.
+        route = setup.get('route') or {}
+        ok = (isinstance(route, dict) and isinstance(route.get('id'), str)
+              and bool(route['id']) and setup.get('active_route_id') == route['id']
+              and route.get('is_active') is True and route.get('test_status') == 'ok'
+              and route.get('provider') == 'openai_compatible'
+              and route.get('model') == run.manifest['model']
+              and route.get('base_url') == run.manifest['relay_origin'] + '/v1')
+    else:
+        ok = ((setup.get('config') or {}).get('test_status') or setup.get('test_status')) == 'ok'
+    owner.save('setup', {'phase': 'setup', 'endpoint': endpoint, 'http': r.status_code, 'assertions': {'selftest_ok': ok}})
+    if not ok:
         raise RuntimeError('setup failed')
     while run.clock() < run.deadline:
         observation = snapshot(owner, reads, connector=connector)
