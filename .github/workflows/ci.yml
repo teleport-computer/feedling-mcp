@@ -505,6 +505,7 @@ jobs:
             tests/test_memory_lane_user_unavailable.py \
             tests/test_extraction_output_truncation.py \
             tests/test_extraction_exhausted_truncation.py \
+            tests/test_extraction_mixed_retry_budget.py \
             tests/test_memory_store_conformance.py \
             tests/test_memory_integrity.py \
             tests/test_dream_stagger_admission.py \
