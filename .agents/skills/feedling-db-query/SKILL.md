@@ -1,4 +1,6 @@
 ---
+document_lifecycle: current
+canonical_owner: self
 name: feedling-db-query
 description: >-
   Query Feedling IO TEE PostgreSQL in test, pre, or prod with read-only SQL. Use for
