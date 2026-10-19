@@ -113,6 +113,6 @@ def test_recall_trace_does_not_stringify_unknown_exception_arguments():
     class Private:
         def __str__(self):
             pytest.fail('private exception argument was stringified')
-    assert crc._recall_input_trace_reason(crc._RecallInputError(Private())) == 'unknown'
-    assert crc._recall_input_trace_reason(crc._RecallInputError('account_unconfirmed', 'secret')) == 'unknown'
-    assert crc._recall_input_trace_reason(crc._RecallInputError()) == 'unknown'
+    assert crc._classify_recall_input_error(crc._RecallInputError(Private())).input_reason == 'unknown'
+    assert crc._classify_recall_input_error(crc._RecallInputError('account_unconfirmed', 'secret')).input_reason == 'unknown'
+    assert crc._classify_recall_input_error(crc._RecallInputError()).input_reason == 'unknown'

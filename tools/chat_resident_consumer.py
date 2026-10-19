@@ -3012,9 +3012,14 @@ _RECALL_INPUT_TRACE_REASONS = frozenset({
 })
 
 
-def _recall_input_trace_reason(error: _RecallInputError) -> str:
+@dataclass(frozen=True)
+class _RecallInputTrace:
+    input_reason: str
+
+
+def _classify_recall_input_error(error: _RecallInputError) -> _RecallInputTrace:
     reason = error.args[0] if len(error.args) == 1 else None
-    return reason if type(reason) is str and reason in _RECALL_INPUT_TRACE_REASONS else "unknown"
+    return _RecallInputTrace(reason if type(reason) is str and reason in _RECALL_INPUT_TRACE_REASONS else "unknown")
 
 
 def _recall_account():
@@ -21688,11 +21693,12 @@ def _process_messages(messages: list) -> float:
                     transcript = _recent_chat_context_for_foreground(before_ts=ts, before_seq=msg.get("seq"))
                 _RECALL_FOREGROUND_TRANSCRIPT.set(transcript)
         except _RecallInputError as exc:
+            failure = _classify_recall_input_error(exc)
             _unmark_seen([key, *(msg.get("_backlog_absorbed_keys") or [])])
             _emit_debug_trace("context", "context.recall_failed", status="error", trace_id=str(msg.get("trace_id") or msg.get("id") or key),
                               summary="Required turn content unavailable",
                               detail={"reason": "required_content_unavailable",
-                                      "input_reason": _recall_input_trace_reason(exc)})
+                                      "input_reason": failure.input_reason})
             break
 
         content = str(msg.get("content") or "").strip()
