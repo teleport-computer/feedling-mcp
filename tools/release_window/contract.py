@@ -67,6 +67,7 @@ def validate_manifest(value):
     is_or = value.get('lane') == OR_LANE
     policy = admission_policy(value)
     shared = policy == SHARED_ADMISSION
+    need(shared or 'execution_window' not in value, 'absolute_window_lane')
     need(value.get('lane') in ('openai-official-v2-text', OR_LANE), 'lane')
     need(value.get('model') == (OR_MODEL if is_or else 'gpt-5.4-mini'), 'fixed_model')
     need(isinstance(value.get('run_id'), str) and re.fullmatch(r'[a-zA-Z0-9_-]{8,80}', value['run_id']), 'run_id')
@@ -139,6 +140,9 @@ def validate_manifest(value):
         need(limits['starts'] <= 6 and limits['wall_seconds'] <= 600, 'or_batch_cap')
         need(cost_ceiling(billing) <= 120000000, 'or_money_cap')
     if shared:
+        from .deadlines import validate_window
+        window = validate_window(value.get('execution_window'))
+        need(window['cleanup_end_epoch'] - window['execution_end_epoch'] >= limits['cleanup_seconds'], 'absolute_cleanup_reserve')
         need('allocations' not in limits and 'phase_starts' not in limits, 'shared_no_phase_quotas')
         need(limits['starts'] == 6 and limits['input_tokens_per_start'] == 128000
              and limits['total_input_tokens'] == 768000

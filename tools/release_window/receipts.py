@@ -11,6 +11,7 @@ from pathlib import Path
 import shlex
 import time
 import math
+from contextlib import contextmanager
 
 from tools.e2e.client import _write_private_json
 from .contract import digest
@@ -55,8 +56,10 @@ def verify_environment(manifest, *, now=None):
     return data
 
 
-def connect():
+def connect(*, deadline=None):
     import psycopg
+    if deadline is not None:
+        deadline.remaining()
     cfg = {}
     for line in CONFIG.read_text().splitlines():
         parts = shlex.split(line, comments=True)
@@ -70,28 +73,106 @@ def connect():
     if (cfg.get('TEST_TEE_PGHOST') != DB_HOST or not CERT.is_file() or CERT.is_symlink()
             or cfg.get('TEST_TEE_SSLROOTCERT') not in {str(CERT), '$HOME/fleet/secrets/test-tee-ca.crt', '${HOME}/fleet/secrets/test-tee-ca.crt'}):
         raise RuntimeError('test DB identity/certificate mismatch')
-    return psycopg.connect(host=DB_HOST, port=443, dbname='feedling', user='feedling_owner',
+    connect_seconds, statement_ms = 5, 3000
+    if deadline is not None:
+        remaining = deadline.remaining()
+        # libpq rounds a positive connect_timeout below two seconds up to two.
+        # Refuse instead of issuing a connection which cannot fit this budget.
+        if remaining < 2:
+            raise RuntimeError('DB connection cannot fit remaining phase')
+        connect_seconds = min(5, int(remaining))
+        statement_ms = max(1, min(3000, int(remaining*1000)))
+    connection = psycopg.connect(host=DB_HOST, port=443, dbname='feedling', user='feedling_owner',
         password=cfg['TEST_TEE_PGPASSWORD'], sslrootcert=str(CERT), sslmode='verify-full',
-        sslnegotiation='direct', connect_timeout=5,
-        options='-c default_transaction_read_only=on -c statement_timeout=3000 -c lock_timeout=1000 -c idle_in_transaction_session_timeout=5000',
+        sslnegotiation='direct', connect_timeout=connect_seconds,
+        options=f'-c default_transaction_read_only=on -c statement_timeout={statement_ms} -c lock_timeout={min(1000,statement_ms)} -c idle_in_transaction_session_timeout=5000',
         autocommit=True)
+    if deadline is not None:
+        deadline.on_expire(connection.close)
+        deadline.remaining()
+    return connection
+
+
+@contextmanager
+def _connection(connector, budget):
+    deadline = getattr(budget, 'deadline', None)
+    if deadline is not None:
+        deadline.remaining()  # Before connector invocation, not merely SELECT.
+    resource = connector(deadline=deadline) if connector is connect else connector()
+    if deadline is not None:
+        if hasattr(resource, 'close'):
+            deadline.on_expire(resource.close)
+        deadline.remaining()
+    with resource as connection:
+        if deadline is not None:
+            # Cancellation/close are attempts, never completion evidence.
+            if hasattr(connection, 'cancel_safe'):
+                deadline.on_expire(lambda: connection.cancel_safe(timeout=1))
+            if hasattr(connection, "close"):
+                deadline.on_expire(connection.close)
+            deadline.remaining()
+        yield _ReadConnection(connection, budget)
+        if deadline is not None:
+            deadline.remaining()
 
 
 class _ReadConnection:
     def __init__(self, connection, budget):
         self.connection, self.budget = connection, budget
+        self.deadline = getattr(budget, 'deadline', None)
     def __getattr__(self, name):
         return getattr(self.connection, name)
+    def check(self):
+        return self.deadline.remaining() if self.deadline is not None else None
+    @contextmanager
+    def transaction(self):
+        self._timeouts(local=False)
+        self.check()
+        transaction = self.connection.transaction()
+        self.check()
+        with transaction:
+            self.check()
+            yield
+            self.check()
+        self.check()
+    def _timeouts(self, *, local=True):
+        left = self.check()
+        if left is None:
+            return
+        scope = 'LOCAL ' if local else ''
+        for name, cap in (('statement_timeout', 3000), ('lock_timeout', 1000)):
+            ms = max(1, min(cap, int(self.check()*1000)))
+            self.connection.execute(f"SET {scope}{name} = '{ms}ms'")
+            self.check()
     def execute(self, statement, *args, **kwargs):
+        self.check()
         if str(statement).lstrip().upper().startswith('SELECT') and self.budget is not None:
             self.budget.use()
-        return self.connection.execute(statement, *args, **kwargs)
+        self._timeouts()
+        self.check()
+        value = self.connection.execute(statement, *args, **kwargs)
+        self.check()
+        return _ReadCursor(value, self.check) if self.deadline is not None else value
+
+
+class _ReadCursor:
+    def __init__(self, cursor, check):
+        self.cursor, self.check = cursor, check
+    def fetchone(self):
+        self.check()
+        value = self.cursor.fetchone()
+        self.check()
+        return value
+    def fetchall(self):
+        self.check()
+        value = self.cursor.fetchall()
+        self.check()
+        return value
 
 
 def preflight(*, connector=connect, read_budget=None):
     """Existing test read-only connection identity/schema check; zero model calls."""
-    with connector() as conn:
-        conn = _ReadConnection(conn, read_budget)
+    with _connection(connector, read_budget) as conn:
         with conn.transaction():
             conn.execute('SET TRANSACTION READ ONLY')
             identity = conn.execute("SELECT current_database(),current_user,current_setting('transaction_read_only'),ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()").fetchone()
@@ -118,8 +199,7 @@ SQL = '''SELECT EXISTS(SELECT 1 FROM users WHERE user_id=%s),
 
 def observe(owner, *, connector=connect, read_budget=None):
     owner.verify()
-    with connector() as conn:
-        conn = _ReadConnection(conn, read_budget)
+    with _connection(connector, read_budget) as conn:
         with conn.transaction():
             conn.execute('SET TRANSACTION READ ONLY')
             identity = conn.execute("SELECT current_database(),current_user,current_setting('transaction_read_only'),ssl FROM pg_stat_ssl WHERE pid=pg_backend_pid()").fetchone()
@@ -201,8 +281,7 @@ def resident_guard(manifest, *, connector=connect, read_budget=None):
     Only process metadata is selected, never user or credential content.
     """
     expected = set(manifest['drain_scope']['resident_owners'])
-    with connector() as conn:
-        conn = _ReadConnection(conn, read_budget)
+    with _connection(connector, read_budget) as conn:
         with conn.transaction():
             conn.execute('SET TRANSACTION READ ONLY')
             rows = conn.execute(
@@ -211,7 +290,6 @@ def resident_guard(manifest, *, connector=connect, read_budget=None):
                 "FROM agent_runtime_supervisor_heartbeats "
                 "WHERE updated_at >= clock_timestamp()-interval '90 seconds' "
                 "OR owner=ANY(%s)", (sorted(expected),)).fetchall()
-    import math
     if (len(rows) != len(expected) or {r[0] for r in rows} != expected
             or any(r[1] != manifest['expected_release'] or not math.isfinite(float(r[2]))
                    or not 0 <= float(r[2]) <= 30 for r in rows)):

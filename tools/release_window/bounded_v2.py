@@ -40,9 +40,12 @@ def check_candidate(health, metrics, expected):
 
 
 class Reads:
-    def __init__(self, maximum):
+    def __init__(self, maximum, deadline=None):
         self.remaining = maximum
+        self.deadline = deadline
     def use(self):
+        if self.deadline is not None:
+            self.deadline.remaining()
         if self.remaining <= 0:
             raise RuntimeError('read budget exhausted')
         self.remaining -= 1
@@ -225,12 +228,15 @@ def runtime_drain(owner, reads, h, *, deadline=None, connector=receipts.connect,
 def cleanup(owner, run, reads, *, admin=None, connector=receipts.connect, clock=time.monotonic, sleep=time.sleep):
     """No model admission can reopen; preserve evidence before reset/revoke."""
     deadline = clock() + owner.manifest['limits']['cleanup_seconds']
+    if 'execution_window' in owner.manifest:
+        deadline = min(deadline, clock() + max(0, owner.manifest['execution_window']['cleanup_end_epoch']-time.time()))
     drain_deadline = min(deadline, clock() + owner.manifest['limits']['drain_seconds'])
     def remaining():
         left = deadline - clock()
         if left <= 0:
             raise RuntimeError('cleanup deadline; retain fixture')
         return left
+    remaining()
     owner.verify()
     # Require the executor's already-written safe scenario receipt, not a caller boolean.
     scenario = owner.out / 'scenario-result.json'
@@ -271,6 +277,8 @@ def cleanup(owner, run, reads, *, admin=None, connector=receipts.connect, clock=
 
 def execute(manifest, out, *, connector=receipts.connect):
     manifest = validate_manifest(manifest)
+    if 'execution_window' in manifest and time.time() >= manifest['execution_window']['latest_start_epoch']:
+        raise RuntimeError('absolute latest start; no claim')
     receipts.verify_input_count(manifest)  # before claim, network or fixture creation
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     _write_private_json(out/'manifest.json', manifest)
@@ -291,6 +299,8 @@ def execute(manifest, out, *, connector=receipts.connect):
             'model_availability_sha256':manifest['receipt_sha256']['model_availability_receipt']}:
         raise RuntimeError('billing contract/funding binding changed')
     receipts.verify_environment(manifest)
+    if 'execution_window' in manifest and time.time() >= manifest['execution_window']['latest_start_epoch']:
+        raise RuntimeError('absolute latest start after validation; no claim')
     _write_private_json(Path(manifest['claim_path']), {'run_id':manifest['run_id'], 'manifest_digest':digest(manifest), 'state':'CONSUMED_NO_REUSE'})
     result = {'status':'INCOMPLETE', 'cleanup':'NOT_ATTEMPTED',
               'run_id':manifest['run_id'], 'manifest_digest':digest(manifest)}
@@ -309,12 +319,31 @@ def execute(manifest, out, *, connector=receipts.connect):
 
 
 def _execute_claimed(manifest, out, connector, result, progress):
-    reads = Reads(manifest['limits']['read_requests'])
+    if 'execution_window' not in manifest:
+        return _execute_claimed_guarded(manifest, out, connector, result, progress, None)
+    from .deadlines import Deadline
+    from .coordinator import coordinate
+    def work(worker_result, worker_progress, publish_recovery):
+        execution = Deadline(manifest['execution_window']['execution_end_epoch'])
+        execution.recovery_callback = publish_recovery
+        try:
+            _execute_claimed_guarded(manifest, out, connector, worker_result, worker_progress, execution)
+        finally:
+            execution.cancel()
+    final = coordinate(work, manifest['execution_window'], out, result, progress)
+    result.clear()
+    result.update(final)
+
+
+def _execute_claimed_guarded(manifest, out, connector, result, progress, execution):
+    reads = Reads(manifest['limits']['read_requests'], execution)
     progress['stage'] = 'credentials'
     admin_key = os.environ['FEEDLING_ADMIN_KEY']
     owner = run = server = thread = None
     with httpx.Client(base_url=manifest['api_url'], headers={'X-Admin-Token':admin_key},
                       trust_env=False, follow_redirects=False, timeout=10) as h:
+        if execution is not None:
+            execution.bind(h)
         progress['stage'] = 'candidate_preflight'
         before_worker = candidate(h, manifest, reads)
         progress['stage'] = 'db_preflight'
@@ -322,11 +351,15 @@ def _execute_claimed(manifest, out, connector, result, progress):
         _write_private_json(out/'resident-guard-preflight.json', receipts.resident_guard(manifest, connector=connector, read_budget=reads))
         try:
             progress['stage'] = 'relay_start'
+            if execution is not None:
+                execution.remaining()
             run = proxy.Run(token=secrets.token_urlsafe(32), upstream_key=os.environ['E2E_KEY_OPENROUTER' if manifest['lane'] == 'openrouter-v2-text' else 'E2E_KEY_OPENAI'],
                             journal=out/'proxy.jsonl', manifest=manifest)
             server = proxy.ThreadingHTTPServer(('127.0.0.1', manifest['relay_port']), proxy.handler(run))
             thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()
             with httpx.Client(trust_env=False, follow_redirects=False, timeout=10) as relay:
+                if execution is not None:
+                    execution.bind(relay)
                 reads.use()
                 probe = relay.post(manifest['relay_origin']+run.relay_path, content=b'{}',
                     headers={'Authorization':'Bearer '+run.token,'X-T779-Probe':run.probe_nonce})
@@ -338,9 +371,14 @@ def _execute_claimed(manifest, out, connector, result, progress):
             # provision performs one whoami GET internally. Reserve it before
             # registration; a failed registration does not refund the read.
             reads.use()
-            c = E2EClient.provision(route='model_api', api_url=manifest['api_url'], defer_failure_cleanup=True)
+            result['fixture_ownership'] = 'REGISTRATION_RESULT_UNCERTAIN_UNTIL_OWNED_RECEIPT'
+            c = E2EClient.provision(route='model_api', api_url=manifest['api_url'], defer_failure_cleanup=True,
+                **({'http_guard': execution} if execution is not None else {}))
             progress['stage'] = 'ownership'
             owner = receipts.Owner(c, manifest, out)
+            result['fixture_ownership'] = 'OWNED_RECOVERY_RECORD_AVAILABLE'
+            if execution is not None:
+                execution.bind(c._http)
             owner.verify()
             selection = h.post('/v1/admin/runtime-allowlist', json={'user_id':c.user_id,'desired':'v2','note':'T779 fresh bounded fixture'})
             selection.raise_for_status()
@@ -353,11 +391,26 @@ def _execute_claimed(manifest, out, connector, result, progress):
             result['error_type'] = type(exc).__name__
             result['error_stage'] = progress['stage']
         finally:
+            cleanup_guard = cleanup_admin = None
+            if owner is None and result.get('fixture_ownership') == 'REGISTRATION_RESULT_UNCERTAIN_UNTIL_OWNED_RECEIPT':
+                result['cleanup'] = 'INCOMPLETE_REGISTRATION_OUTCOME'
+                result['recovery_required'] = True
             # Fixed safe projection, even when a scenario failed before a step receipt.
             try:
                 if owner is not None:
                     progress['stage'] = 'safe_diagnostics'
                     owner.save('scenario-result', result)
+                    if execution is not None:
+                        from .deadlines import Deadline
+                        execution.expire()  # No new execution I/O; independent of relay lock.
+                        run.closing.set()
+                        cleanup_guard = Deadline(manifest['execution_window']['cleanup_end_epoch'])
+                        reads.deadline = cleanup_guard
+                        cleanup_guard.remaining()
+                        cleanup_admin = cleanup_guard.bind(httpx.Client(base_url=manifest['api_url'],
+                            headers={'X-Admin-Token':admin_key}, trust_env=False, follow_redirects=False, timeout=10))
+                        h = cleanup_admin
+                        owner.client._http = cleanup_guard.bind(httpx.Client(timeout=10, verify=True))
                     if candidate(h, manifest, reads) != before_worker:
                         raise RuntimeError('cleanup environment changed')
                     progress['stage'] = 'cleanup'
@@ -367,6 +420,8 @@ def _execute_claimed(manifest, out, connector, result, progress):
             except Exception as exc:
                 result['cleanup'] = 'FAILED'
                 result['cleanup_error_type'] = type(exc).__name__
+                result['status'] = 'INCOMPLETE'
+                result['recovery_required'] = owner is not None or result.get('fixture_ownership') == 'REGISTRATION_RESULT_UNCERTAIN_UNTIL_OWNED_RECEIPT'
             finally:
                 if run is not None:
                     try:
@@ -386,6 +441,10 @@ def _execute_claimed(manifest, out, connector, result, progress):
                     thread.join(timeout=2)
                 if owner is not None:
                     owner.client._http.close()
+                if cleanup_admin is not None:
+                    cleanup_admin.close()
+                if cleanup_guard is not None:
+                    cleanup_guard.cancel()
 
 
 

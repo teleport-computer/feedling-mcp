@@ -953,6 +953,8 @@ def test_text_fixture_rejects_unbound_activation_before_selection(tmp_path,monke
 def shared_manifest(tmp_path):
     m = or_manifest(tmp_path)
     m['admission_policy'] = dict(contract.SHARED_ADMISSION)
+    import time
+    m['execution_window'] = dict(latest_start_epoch=time.time()+600, execution_end_epoch=time.time()+900, cleanup_end_epoch=time.time()+1200)
     m['limits'].pop('allocations')
     m['limits'].pop('phase_starts')
     m['limits'].update(starts=6, input_tokens_per_start=128000,
@@ -966,7 +968,7 @@ def rebind_shared_receipt(m):
     import hashlib
     p = Path(m['input_bound_receipt'])
     d = json.loads(p.read_text())
-    for k in ('admission_policy', 'limits', 'billing'):
+    for k in ('admission_policy', 'limits', 'billing', 'execution_window'):
         d[k] = m[k]
     p.write_text(json.dumps(d))
     m['receipt_sha256']['input_bound_receipt'] = hashlib.sha256(p.read_bytes()).hexdigest()
@@ -1067,4 +1069,34 @@ def test_explicit_legacy_policy_never_inherits_shared_allowance(tmp_path):
     run.close()
     m = shared_manifest(tmp_path)
     m['admission_policy'] = dict(contract.LEGACY_ADMISSION)
+    with pytest.raises(ValueError, match='absolute_window_lane'): contract.validate_manifest(m)
+    m.pop('execution_window')
     with pytest.raises(ValueError, match='allocations'): contract.validate_manifest(m)
+
+
+def test_shared_absolute_window_receipt_tamper(tmp_path):
+    m=shared_manifest(tmp_path)
+    m['execution_window']['execution_end_epoch']+=1
+    with pytest.raises(RuntimeError,match='binding'):
+        receipts.verify_input_count(m)
+
+
+def test_shared_absolute_cleanup_time_must_be_reserved(tmp_path):
+    m=shared_manifest(tmp_path)
+    m['execution_window']['cleanup_end_epoch']=m['execution_window']['execution_end_epoch']+1
+    with pytest.raises(ValueError,match='absolute_cleanup_reserve'):
+        contract.validate_manifest(m)
+
+
+def test_shared_absolute_cutoff_after_reservation_never_sends(tmp_path):
+    import time
+    run,calls=shared_run(tmp_path)
+    record=run.record
+    def delay(row):
+        record(row)
+        if row['event']=='send_reserved':
+            run.absolute.epoch=time.time()-1
+    run.record=delay
+    with pytest.raises(proxy.Refused):run.forward(or_body())
+    assert calls==[] and run.attempts==1 and run.reserved_nanodollars==19814400
+    run.close()

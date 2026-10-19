@@ -84,6 +84,8 @@ def verify(manifest, *, now=None):
               'no_extra_fees_or_byok':True,'errors_do_not_exceed_reserved_cost':True,
               'authorized':True,
               'receipt_sha256':{k:v for k,v in hashes.items() if k!='input_bound_receipt'}}
+    if 'execution_window' in manifest:
+        expected['execution_window'] = manifest['execution_window']
     if any(value.get(k)!=v for k,v in expected.items()) or admission_policy(
             {'lane': manifest['lane'], 'admission_policy': value.get('admission_policy')}) != policy:
         raise RuntimeError('or_evidence_binding')

@@ -1180,6 +1180,8 @@ jobs:
             tests/test_distillation_ledger.py \
             tests/test_e2e_tools.py \
             tests/test_release_window_slice.py \
+            tests/test_release_phase_deadlines.py \
+            tests/test_release_coordinator.py \
             tests/test_runtime_drain_witness.py \
             tests/test_e2e_p0_fallback_gate.py \
             tests/test_e2e_relay_model_preflight.py \

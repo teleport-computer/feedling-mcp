@@ -124,6 +124,7 @@ class Run:
         self.failure_reason = None
         self.billing_bound_breached = False
         self.closing = threading.Event()
+        self.absolute = None
         self.probe_nonce = secrets.token_hex(32)
         self.probe_ack = secrets.token_hex(32)
         self.probe_received = False
@@ -131,6 +132,12 @@ class Run:
         self.journal = os.fdopen(fd, "w")
         self.client = httpx.Client(transport=transport or httpx.HTTPTransport(retries=0),
                                    follow_redirects=False, trust_env=False)
+        if 'execution_window' in self.manifest:
+            from .deadlines import Deadline
+            self.absolute = Deadline(self.manifest['execution_window']['execution_end_epoch'])
+            self.deadline = min(self.deadline, self.clock() + self.absolute.remaining())
+            self.absolute.on_expire(self.closing.set)
+            self.absolute.bind(self.client)
         self.record({"event": "limits", "manifest_digest": self.manifest_digest,
                      "run_id": self.manifest["run_id"], "limits": self.limits,
                      "admission_policy": self.manifest.get("admission_policy"),
@@ -350,10 +357,15 @@ class Run:
 
     def close(self):
         self.closing.set()  # Close admission before waiting for active forwarding.
-        if not self.lock.acquire(timeout=self.limits["drain_seconds"]):
+        wait = self.limits["drain_seconds"]
+        if 'execution_window' in self.manifest:
+            wait = max(0, min(wait, self.manifest['execution_window']['cleanup_end_epoch']-time.time()))
+        if not self.lock.acquire(timeout=wait):
             raise Refused("drain_unconfirmed")
         try:
             self.stopped = True
+            if self.absolute is not None:
+                self.absolute.cancel()
             self.client.close()
             if self.journal.closed:
                 return  # failed journal cannot supply a cleanup receipt
