@@ -2998,6 +2998,25 @@ class _RecallInputError(RuntimeError):
     """Required content or recall provenance failed; never a no-card success."""
 
 
+# Only these source-defined categories may cross the trace boundary. Never
+# stringify exceptions: transport/decoder errors can contain private content.
+_RECALL_INPUT_TRACE_REASONS = frozenset({
+    "account_mode_changed", "account_unconfirmed", "account_mode_invalid",
+    "turn_binding_invalid", "unreadable_current_message",
+    "required_reference_unavailable", "attachment_storage_invalid",
+    "caption_owner_invalid", "content_storage_invalid", "history_unconfirmed",
+    "history_binding_unconfirmed", "caption_unconfirmed", "recall_response_invalid",
+    "recall_binding_invalid", "recall_input_unconfirmed",
+    "required_reference_unconfirmed", "attachment_unconfirmed",
+    "attachment_binding_invalid", "history_owner_unconfirmed", "caption_storage_invalid",
+})
+
+
+def _recall_input_trace_reason(error: _RecallInputError) -> str:
+    reason = error.args[0] if len(error.args) == 1 else None
+    return reason if type(reason) is str and reason in _RECALL_INPUT_TRACE_REASONS else "unknown"
+
+
 def _recall_account():
     # Fresh operation identity; never the best-effort encryption-key cache.
     try:
@@ -21668,10 +21687,12 @@ def _process_messages(messages: list) -> float:
                 if _foreground_history_injection_enabled():
                     transcript = _recent_chat_context_for_foreground(before_ts=ts, before_seq=msg.get("seq"))
                 _RECALL_FOREGROUND_TRANSCRIPT.set(transcript)
-        except _RecallInputError:
+        except _RecallInputError as exc:
             _unmark_seen([key, *(msg.get("_backlog_absorbed_keys") or [])])
             _emit_debug_trace("context", "context.recall_failed", status="error", trace_id=str(msg.get("trace_id") or msg.get("id") or key),
-                              summary="Required turn content unavailable", detail={"reason": "required_content_unavailable"})
+                              summary="Required turn content unavailable",
+                              detail={"reason": "required_content_unavailable",
+                                      "input_reason": _recall_input_trace_reason(exc)})
             break
 
         content = str(msg.get("content") or "").strip()
