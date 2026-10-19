@@ -1,4 +1,4 @@
-"""One-run, text-only V2 probe relay. No retries, no user credentials, no billing inference.
+"""One-run, text-only V2 probe relay. No transport retries, no user credentials, no billing inference.
 
 All starts (including setup and compaction) share one immutable budget. The
 append-only journal is opened exclusively: restarting cannot reset an old run.
@@ -19,7 +19,7 @@ import time
 
 import httpx
 
-from tools.release_window.contract import validate_manifest, digest, cost_reservation, cost_ceiling, count_cost_reservation
+from tools.release_window.contract import validate_manifest, digest, cost_reservation, cost_ceiling, count_cost_reservation, PHASES, SHARED_ADMISSION
 from tools.release_window.receipts import verify_input_count
 
 UPSTREAM = "https://api.openai.com/v1/responses"
@@ -106,7 +106,8 @@ class Run:
         self.limits = self.manifest["limits"] | {"model": self.manifest["model"]}
         self.manifest_digest = digest(self.manifest)
         self.phase = "setup"
-        self.phase_starts = {name: 0 for name in self.limits["phase_starts"]}
+        self.phase_starts = {name: 0 for name in PHASES}
+        self.shared_cap = self.manifest.get("admission_policy") == SHARED_ADMISSION
         self.token = token
         self.key = upstream_key
         self.clock = clock
@@ -132,6 +133,7 @@ class Run:
                                    follow_redirects=False, trust_env=False)
         self.record({"event": "limits", "manifest_digest": self.manifest_digest,
                      "run_id": self.manifest["run_id"], "limits": self.limits,
+                     "admission_policy": self.manifest.get("admission_policy"),
                      "usage": "UNKNOWN"})
 
     def set_phase(self, phase):
@@ -193,7 +195,7 @@ class Run:
                 self._fail('token_or_monetary_budget')
                 raise Refused('token_or_monetary_budget')
             if (self.attempts >= self.limits["starts"] or self.input_bytes + len(body) > self.limits["total_bytes"]
-                    or self.phase_starts[self.phase] >= self.limits["phase_starts"][self.phase]
+                    or (not self.shared_cap and self.phase_starts[self.phase] >= self.limits["phase_starts"][self.phase])
                     or (self.attempts + 1) * self.limits["output_tokens_per_start"] > self.limits["total_output_tokens"]):
                 self._fail('total_budget')
                 raise Refused("total_budget")

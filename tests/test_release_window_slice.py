@@ -683,7 +683,7 @@ def or_manifest(tmp_path):
     import hashlib, time
     from tools.release_window import openrouter_bound as ob
     m=manifest()
-    m.update(lane=contract.OR_LANE,model=contract.OR_MODEL,
+    m.update(lane=contract.OR_LANE,model=contract.OR_MODEL,admission_policy=dict(contract.LEGACY_ADMISSION),
              input_count=dict(enabled=False,max_requests=0,timeout_seconds=0,usd_per_request_cap='0'))
     m.pop('input_count_receipt')
     m['billing'].update(model=contract.OR_MODEL,input_bound_kind='fixed_provider_context',
@@ -698,7 +698,7 @@ def or_manifest(tmp_path):
     source={'path':str(e),'sha256':hashlib.sha256(e.read_bytes()).hexdigest()}
     data=dict(run_id=m['run_id'],model=m['model'],endpoint=ob.ENDPOINT,
         account_scope=m['billing']['account_scope'],billing=m['billing'],limits=m['limits'],
-        provider_policy=ob.POLICY,context_tokens=128000,context_is_full_billable_input_upper_bound=True,
+        provider_policy=ob.POLICY,admission_policy=m['admission_policy'],context_tokens=128000,context_is_full_billable_input_upper_bound=True,
         output_limit_includes_all_billable_tokens=True,no_extra_fees_or_byok=True,
         errors_do_not_exceed_reserved_cost=True,authorized=True,
         receipt_sha256={k:v for k,v in m['receipt_sha256'].items() if k!='input_bound_receipt'},
@@ -948,3 +948,123 @@ def test_text_fixture_rejects_unbound_activation_before_selection(tmp_path,monke
         assert saved['setup']['assertions']['selftest_ok'] is False
         assert calls==[]
     finally:run.close()
+
+
+def shared_manifest(tmp_path):
+    m = or_manifest(tmp_path)
+    m['admission_policy'] = dict(contract.SHARED_ADMISSION)
+    m['limits'].pop('allocations')
+    m['limits'].pop('phase_starts')
+    m['limits'].update(starts=6, input_tokens_per_start=128000,
+        total_input_tokens=768000, output_tokens_per_start=1024, total_output_tokens=6144)
+    m['billing']['max_cost_usd'] = '0.1188864'
+    rebind_shared_receipt(m)
+    return m
+
+
+def rebind_shared_receipt(m):
+    import hashlib
+    p = Path(m['input_bound_receipt'])
+    d = json.loads(p.read_text())
+    for k in ('admission_policy', 'limits', 'billing'):
+        d[k] = m[k]
+    p.write_text(json.dumps(d))
+    m['receipt_sha256']['input_bound_receipt'] = hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def shared_run(tmp_path, handler=None):
+    calls = []
+    def dispatch(req):
+        calls.append(req)
+        return handler(req) if handler else httpx.Response(200, json={
+            'usage': {'prompt_tokens': 7, 'completion_tokens': 2, 'total_tokens': 9}})
+    run = proxy.Run(token='synthetic'*8, upstream_key='fake', journal=tmp_path/'shared-ledger',
+        manifest=shared_manifest(tmp_path), transport=httpx.MockTransport(dispatch))
+    return run, calls
+
+
+def test_shared_concurrent_six_total_then_no_send(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    run, calls = shared_run(tmp_path)
+    def send(_):
+        try:
+            return run.forward(or_body())[0]
+        except proxy.Refused:
+            return 0
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        results = list(pool.map(send, range(10)))
+    assert results.count(200) == 6 and len(calls) == 6
+    assert run.phase_starts['setup'] == 6 and run.attempts == 6
+    assert run.reserved_nanodollars == 118886400
+    with pytest.raises(proxy.Refused):
+        run.forward(or_body())
+    assert len(calls) == 6
+    run.close()
+
+
+def test_shared_phase_observation_and_reissues_share_allowance(tmp_path):
+    run, calls = shared_run(tmp_path)
+    for phase, n in [('setup', 3), ('dialogue_1', 2), ('dialogue_2', 1)]:
+        if phase != 'setup':
+            run.set_phase(phase)
+        for _ in range(n):
+            run.forward(or_body())  # Identical reissues are still actual starts.
+    assert run.phase_starts == dict(setup=3, dialogue_1=2, dialogue_2=1, background=0)
+    assert len(calls) == 6
+    run.close()
+
+
+@pytest.mark.parametrize('kind', ['http', 'error', 'usage', 'transport'])
+def test_shared_observed_failure_stops_and_keeps_full_reserve(tmp_path, kind):
+    def respond(req):
+        if kind == 'transport':
+            raise httpx.ReadTimeout('synthetic')
+        return httpx.Response(503 if kind == 'http' else 200, json=(
+            {'error': 'synthetic'} if kind == 'error' else {}))
+    run, calls = shared_run(tmp_path, respond)
+    try:
+        run.forward(or_body())
+    except proxy.Refused:
+        pass
+    with pytest.raises(proxy.Refused):
+        run.forward(or_body())
+    assert len(calls) == 1 and run.reserved_nanodollars == 19814400
+    run.close()
+
+
+@pytest.mark.parametrize('change', ['missing', 'unknown', 'retry', 'bool', 'phase', 'quota', 'cap'])
+def test_shared_contract_rejects_ambiguous_or_contradictory_policy(tmp_path, change):
+    m = shared_manifest(tmp_path)
+    if change == 'missing': m.pop('admission_policy')
+    elif change == 'unknown': m['admission_policy']['version'] = 'unknown'
+    elif change == 'retry': m['admission_policy']['product_reissues'] = 'zero_logical_retries'
+    elif change == 'bool': m['admission_policy']['relay_transport_retries'] = False
+    elif change == 'phase': m['admission_policy']['phase'] = 'enforced'
+    elif change == 'quota': m['limits']['phase_starts'] = dict.fromkeys(contract.PHASES, 6)
+    elif change == 'cap': m['limits']['starts'] = 7
+    with pytest.raises(ValueError): contract.validate_manifest(m)
+
+
+@pytest.mark.parametrize('change', ['missing', 'legacy', 'retry', 'bool'])
+def test_shared_receipt_policy_tampering_even_with_rehashed_file(tmp_path, change):
+    import hashlib
+    m = shared_manifest(tmp_path)
+    p = Path(m['input_bound_receipt']); d = json.loads(p.read_text())
+    if change == 'missing': d.pop('admission_policy')
+    elif change == 'legacy': d['admission_policy'] = dict(contract.LEGACY_ADMISSION)
+    elif change == 'retry': d['admission_policy']['relay_transport_retries'] = 1
+    elif change == 'bool': d['admission_policy']['relay_transport_retries'] = False
+    p.write_text(json.dumps(d)); m['receipt_sha256']['input_bound_receipt'] = hashlib.sha256(p.read_bytes()).hexdigest()
+    with pytest.raises((RuntimeError, ValueError)):
+        receipts.verify_input_count(m)
+
+
+def test_explicit_legacy_policy_never_inherits_shared_allowance(tmp_path):
+    run, calls = or_run(tmp_path)
+    run.forward(or_body())
+    with pytest.raises(proxy.Refused): run.forward(or_body())
+    assert len(calls) == 1
+    run.close()
+    m = shared_manifest(tmp_path)
+    m['admission_policy'] = dict(contract.LEGACY_ADMISSION)
+    with pytest.raises(ValueError, match='allocations'): contract.validate_manifest(m)
