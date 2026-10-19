@@ -16,6 +16,9 @@ change must not be interpreted as an API guarantee.
   an output-limited final reply contains partial text, cannot be parsed, and
   the component has no re-ask remaining. Previously this could be reported as
   a JSON format failure.
+- Capture and Dream count a consumed format or semantic re-ask against the
+  shared component retry budget before handling truncation. If that budget is
+  exhausted, a subsequently truncated reply does not trigger an extra request.
 
 - Test enclave attestation metadata now explicitly declares the test AppAuth
   contract and compose path. Unavailable image digests and deployment
