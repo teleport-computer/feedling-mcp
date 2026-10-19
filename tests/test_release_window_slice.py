@@ -192,15 +192,23 @@ def test_cleanup_evidence_failure_stops_before_reset(tmp_path,monkeypatch):
     with pytest.raises(OSError):v2.cleanup(owner,run,v2.Reads(10),admin=object())
 
 
-def test_synthetic_complete_exercise_and_cleanup(tmp_path,monkeypatch):
-    run,calls=make_run(tmp_path)
+@pytest.mark.parametrize('text_route', [False, True])
+def test_synthetic_complete_exercise_and_cleanup(tmp_path,monkeypatch,text_route):
+    run,calls=or_run(tmp_path, journal_name='proxy.jsonl') if text_route else make_run(tmp_path)
+    wire = or_body if text_route else body
     saved={}
     state={'mid':None,'marker':None,'number':0}
     class Client:
         content_encryption_effective='off'
         def post(self,path,*,json=None,**kw):
-            if path.endswith('/setup'):
-                run.forward(body())
+            if path in ('/v1/model_api/setup', '/v1/model_api/routes'):
+                assert path == ('/v1/model_api/routes' if text_route else '/v1/model_api/setup')
+                run.forward(wire())
+                if text_route:
+                    assert json['activate'] is True and json['purpose'] == 'conversation'
+                    return httpx.Response(200,json={'active_route_id':'synthetic-route','route':{
+                        'id':'synthetic-route','is_active':True,'test_status':'ok',
+                        'provider':json['provider'],'model':json['model'],'base_url':json['base_url']}})
                 return httpx.Response(200,json={'test_status':'ok'})
             if path.endswith('/reset'):
                 assert run.closing.is_set()
@@ -210,7 +218,7 @@ def test_synthetic_complete_exercise_and_cleanup(tmp_path,monkeypatch):
                 state['client_msg_id']=json['client_msg_id'];state['number']+=1
                 state['mid']='synthetic-message-'+str(state['number'])
                 if state['number']==1:state['marker']=json['message'].split('code ')[1].split('.')[0]
-                run.forward(body())
+                run.forward(wire())
             return httpx.Response(202,json={'user_message':{'id':state['mid'],'ts':100}})
         def get(self,path,**kw):
             if path.endswith('/whoami'):return httpx.Response(401)
@@ -706,12 +714,12 @@ def or_body(**changes):
     v.update(changes);return json.dumps(v).encode()
 
 
-def or_run(tmp_path, handler=None):
+def or_run(tmp_path, handler=None, *, journal_name='ledger'):
     m=or_manifest(tmp_path);calls=[]
     def dispatch(req):
         calls.append(req)
         return handler(req) if handler else httpx.Response(200,json={'usage':{'prompt_tokens':7,'completion_tokens':2,'total_tokens':9}})
-    return proxy.Run(token='synthetic'*8,upstream_key='fake-or-key',journal=tmp_path/'ledger',manifest=m,
+    return proxy.Run(token='synthetic'*8,upstream_key='fake-or-key',journal=tmp_path/journal_name,manifest=m,
         transport=httpx.MockTransport(dispatch)),calls
 
 
@@ -913,3 +921,30 @@ def test_payload_refusal_unknown_exception_text_is_never_logged(tmp_path, monkey
     assert any(r.get('event') == 'payload_rejected' and r['reason'] == 'unclassified'
                for r in map(json.loads, text.splitlines()))
     assert calls == [] and run.attempts == 0
+
+
+@pytest.mark.parametrize('field,value', [
+    ('id',''),('is_active',False),('is_active',1),('test_status','failed'),
+    ('provider','openrouter'),('model','other'),('base_url','https://other.invalid/v1'),
+    ('active_route_id','other'),
+])
+def test_text_fixture_rejects_unbound_activation_before_selection(tmp_path,monkeypatch,field,value):
+    run,calls=or_run(tmp_path)
+    route=dict(id='synthetic-route',is_active=True,test_status='ok',provider='openai_compatible',
+               model=run.manifest['model'],base_url=run.manifest['relay_origin']+'/v1')
+    reply={'route':route,'active_route_id':route['id']}
+    if field=='active_route_id':reply[field]=value
+    else:route[field]=value
+    saved={}
+    def post(path,**kwargs):
+        assert path=='/v1/model_api/routes'
+        return httpx.Response(200,json=reply,request=httpx.Request('POST','https://offline.invalid'))
+    client=SimpleNamespace(content_encryption_effective='off',post=post)
+    owner=SimpleNamespace(client=client,verify=lambda:None,save=lambda n,d:saved.update({n:d}))
+    monkeypatch.setattr(v2,'snapshot',lambda *a,**kw:pytest.fail('unbound route reached selection'))
+    try:
+        with pytest.raises(RuntimeError,match='setup failed'):
+            v2.exercise(owner,run,v2.Reads(10))
+        assert saved['setup']['assertions']['selftest_ok'] is False
+        assert calls==[]
+    finally:run.close()
