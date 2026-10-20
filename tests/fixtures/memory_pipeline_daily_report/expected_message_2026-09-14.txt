@@ -1,44 +1,11 @@
-[需要关注] 记忆管线日报 2026-09-14（北京时间）
-窗口：[2026-09-14 00:00, 2026-09-15 00:00) Asia/Shanghai；按终态时刻
-来源：V2 agent_jobs；V1 user_logs（终态时间缺失/无效回退记录时间）。不含非终态与未覆盖记录，不与可变 metric/trace 相加；V1非成功原列包含 skipped。
-原因范围：非成功码未关联具体终态；completed 内跳过的原因未提供，不推断为花园太小。
-- 落卡 · V2 model_api：我们这边的故障影响 8 人（阈值 5）
-- 落卡 · V2 model_api：运维失败率 30%，前一天 3%
-
-落卡 capture
-  V1 resident：观测用户 26 人
-    互斥结果：处理完成（不证明生成） 139｜跳过（未生成） 9｜失败终态 38｜过期 0｜被替代 0｜完成语义未知 0｜失败/跳过未分型 0｜合计 186
-    非成功原因码（完整；与结果同批，不另加总）：capture_agent_call_failed:quota_insufficient 24、capture_window_unavailable 9、capture_agent_call_failed:resident_agent_cli_logged_out 8、capture_memory_actions_failed 3、runtime_failed 3
-    运维分类（与上方结果重叠）：运维失败 14｜控制结果 9｜账号不可用 24；运维失败率 9%（分母 153，前一天 0%）
-    受影响 5 人（前一天 0）｜零成功 2 人（前一天 0）
-    运维原因分组：账号/配置类 8 次/2 人（capture_agent_call_failed:resident_agent_cli_logged_out 8）；我们这边 3 次/3 人（capture_memory_actions_failed 3）；未知 3 次/3 人（runtime_failed 3）
-    账号不可用排除码（完整）：capture_agent_call_failed:quota_insufficient 24
-    覆盖：起点 2026-08-01，完整起点 2026-08-01，冻结至 2026-09-14；跳过拆分水位 2026-08-20，V1分类水位 2026-08-25
-  V2 model_api：观测用户 35 人
-    互斥结果：处理完成（不证明生成） 172｜跳过（未生成） 0｜失败终态 100｜过期 6｜被替代 0｜完成语义未知 0｜失败/跳过未分型 0｜合计 278
-    非成功原因码（完整；与结果同批，不另加总）：extraction_failed:auth_invalid 24、extraction_failed:json_decode_error 24、lease_timeout 24、extraction_failed:upstream_unavailable 12、capture_disabled 10、extraction_failed:rate_limited 6、no_code 6
-    运维分类（与上方结果重叠）：运维失败 72｜控制结果 10｜账号不可用 24；运维失败率 30%（分母 244，前一天 3%）
-    受影响 14 人（前一天 8）｜零成功 8 人（前一天 0）
-    运维原因分组：模型服务 18 次/6 人（extraction_failed:upstream_unavailable 12、extraction_failed:rate_limited 6）；我们这边 48 次/8 人（extraction_failed:json_decode_error 24、lease_timeout 24）；未知 6 次/6 人（no_code 6）
-    账号不可用排除码（完整）：extraction_failed:auth_invalid 24
-    覆盖：起点 2026-07-10，完整起点 2026-07-10，冻结至 2026-09-14；跳过拆分水位 2026-08-20，V1分类水位 未知
-
-做梦 dream
-  V1 resident：观测用户 8 人
-    互斥结果：处理完成（不证明生成） 6｜跳过（未生成） 0｜失败终态 2｜过期 0｜被替代 0｜完成语义未知 0｜失败/跳过未分型 0｜合计 8
-    非成功原因码（完整；与结果同批，不另加总）：dream_agent_call_failed:auth_invalid 2
-    运维分类（与上方结果重叠）：运维失败 0｜控制结果 0｜账号不可用 2；运维失败率 0%（分母 6，前一天 0%）
-    受影响 0 人（前一天 0）｜零成功 0 人（前一天 0）
-    账号不可用排除码（完整）：dream_agent_call_failed:auth_invalid 2
-    覆盖：起点 2026-08-01，完整起点 2026-08-01，冻结至 2026-09-14；跳过拆分水位 2026-08-20，V1分类水位 2026-08-25
-  V2 model_api：观测用户 14 人
-    互斥结果：处理完成（不证明生成） 3｜跳过（未生成） 8｜失败终态 3｜过期 0｜被替代 0｜完成语义未知 0｜失败/跳过未分型 0｜合计 14
-    非成功原因码（完整；与结果同批，不另加总）：provider_setup:model_api_not_tested 3
-    运维分类（与上方结果重叠）：运维失败 0｜控制结果 0｜账号不可用 3；运维失败率 0%（分母 3，前一天 0%）
-    受影响 0 人（前一天 0）｜零成功 0 人（前一天 0）
-    账号不可用排除码（完整）：provider_setup:model_api_not_tested 3
-    覆盖：起点 2026-07-10，完整起点 2026-07-10，冻结至 2026-09-14；跳过拆分水位 2026-08-20，V1分类水位 未知
-
-此刻卡着没结束的任务：落卡 5 · 做梦 0
-
-口径：按终态任务/记录计数，不是模型调用、metric 或生成卡片数；同一用户可有多次尝试。受影响/零成功为运维分类人数，零成功仅指当日无完成，不证明卡死。运维失败率=运维失败/(扣除声明跳过的完成+运维失败)，排除控制结果、账号不可用和 superseded；分类缺失时沿用保守告警口径，不代表已证实失败。
+[需要关注] 记忆报告｜2026-09-14（北京时间，00:00–24:00）
+任务｜处理完成｜正常跳过｜失败
+Capture｜311｜9｜138
+Capture另有：过期6。
+Dream｜9｜8｜5
+完成后的实际写入/无变化尚无细分记录；排队和运行数未统计。
+Capture失败相关原因：模型服务相关18次、账号/模型配置56次、解析/处理51次、原因待查9次。
+Dream失败相关原因：账号/模型配置5次。
+原因记录未逐项关联失败任务，不能相加还原失败数。
+需处理：排查解析与处理异常，核对输出格式和处理日志。
+需处理：检查失败增加的主要原因，优先核对模型服务和账号配置。

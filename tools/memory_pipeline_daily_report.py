@@ -29,7 +29,8 @@ Result semantics: the summary supplies conserved observed terminal buckets,
 including skips, expiry, replacement and unmeasured splits. Completed status
 is not proof that content was generated. A separate overlapping operational
 classification retains the existing alert thresholds and rate denominator.
-All sanitized non-success codes and account exclusions are displayed.
+Exact sanitized codes and account exclusions remain in the summary/offline detail;
+the compact message displays at most four investigation areas per lane.
 
 Day boundary: the rollup freezes **Beijing** (Asia/Shanghai) days, so the
 report covers the previous Beijing day, not a UTC day. Recomputing UTC days
@@ -39,11 +40,10 @@ the rollup exists to retire.
 Output never contains user ids, message ids or any free text: counts, lane /
 route labels and sanitized failure codes only.
 
-Each lane/route line carries two user counts next to the per-attempt failure
-rate: ``受影响`` (users with at least one operational failure) and ``零成功``
-(users with failures and no real completion). They come from the summary's
-``failed_users`` / ``stuck_users``; a backend that predates ``failed_users``
-renders ``-`` rather than 0, so an older prod never reads as "nobody affected".
+Each lane has separate processed, skipped and failed columns. Unmeasured
+outcomes remain explicit; missing coverage is unknown rather than zero. Actual
+writes/no-change and pending/running counts are not supplied by this summary.
+Rates and user counts remain in the unchanged alert policy and offline detail.
 
 Any unexpected error (a changed response shape, a bug here) still posts a
 content-free "没生成出来" notice naming only the exception type, and exits
@@ -255,77 +255,94 @@ def _cause_line(stats: dict) -> str:
     return "；".join(parts)
 
 
+def _lane_totals(report: dict, lane: str) -> dict | None:
+    # A missing/partial route cannot silently become a zero in the lane total.
+    if any(item["lane"] == lane for item in report.get("incomplete", [])):
+        return None
+    totals = dict.fromkeys(("processed", "skipped", "failed", "expired", "superseded",
+                            "unknown_completed", "unknown_non_success"), 0)
+    for route in ROUTES:
+        cur = report.get("cells", {}).get(f"{lane}/{route}", {}).get("day", {})
+        outcomes = cur.get("outcomes")
+        if outcomes is None or cur.get("partial") or cur.get("unclassified"):
+            return None
+        for key in totals:
+            value = outcomes.get(key)
+            if type(value) is not int or value < 0:
+                return None
+            totals[key] += value
+    return totals
+
+
+def _brief_causes(report: dict, lane: str) -> str:
+    # Use the existing disjoint diagnostic groups, plus their separately excluded
+    # account records. Never also add reason_codes or terminal outcome counts.
+    groups = dict.fromkeys(GROUP_ORDER, 0)
+    service_codes = set()
+    for route in ROUTES:
+        cur = report.get("cells", {}).get(f"{lane}/{route}", {}).get("day", {})
+        for group in GROUP_ORDER:
+            codes = cur.get("causes", {}).get(group, {}).get("codes", {})
+            groups[group] += sum(codes.values())
+            if group == GROUP_PROVIDER:
+                service_codes.update(code.rsplit(":", 1)[-1]
+                                     for code, count in codes.items() if count)
+        groups[GROUP_USER] += sum(cur.get("user_unavailable_codes", {}).values())
+    service_label = "模型服务相关"
+    if service_codes == {"upstream_unavailable"}:
+        service_label = "服务不可用"
+    elif service_codes and service_codes <= {"output_truncated", "upstream_unavailable"}:
+        service_label = "模型回复截断/服务不可用" if "upstream_unavailable" in service_codes else "模型回复截断"
+    labels = {GROUP_PROVIDER: service_label, GROUP_USER: "账号/模型配置",
+              GROUP_OURS: "解析/处理", GROUP_UNKNOWN: "原因待查"}
+    return "、".join(f"{labels[group]}{groups[group]}次" for group in
+                    (GROUP_PROVIDER, GROUP_USER, GROUP_OURS, GROUP_UNKNOWN) if groups[group])
+
+
 def render_message(report: dict) -> str:
     attention = evaluate_attention(report)
-    incomplete = incomplete_notes(report)
-    lines = []
     head = "[需要关注]" if attention else "[正常]"
-    lines.append(f"{head} 记忆管线日报 {report['day']}（北京时间）")
-    next_day = (date.fromisoformat(report['day']) + timedelta(days=1)).isoformat()
-    lines.append(f"窗口：[{report['day']} 00:00, {next_day} 00:00) Asia/Shanghai；按终态时刻")
-    lines.append("来源：V2 agent_jobs；V1 user_logs（终态时间缺失/无效回退记录时间）。"
-                 "不含非终态与未覆盖记录，不与可变 metric/trace 相加；V1非成功原列包含 skipped。")
-    lines.append("原因范围：非成功码未关联具体终态；completed 内跳过的原因未提供，不推断为花园太小。")
-    if attention:
-        lines.extend(f"- {reason}" for reason in attention)
+    lines = [f"{head} 记忆报告｜{report['day']}（北京时间，00:00–24:00）",
+             "任务｜处理完成｜正常跳过｜失败"]
+    totals = {lane: _lane_totals(report, lane) for lane in LANES}
+    names = {"capture": "Capture", "dream": "Dream"}
     for lane in LANES:
-        lines.append("")
-        lines.append(LANE_LABELS[lane])
-        for route in ROUTES:
-            cur = report['cells'][f'{lane}/{route}']['day']
-            prev = report['cells'][f'{lane}/{route}']['previous']
-            outcomes = cur.get("outcomes")
-            lines.append(f"  {ROUTE_LABELS[route]}：观测用户 {cur['active_users']} 人")
-            if outcomes is None:
-                lines.append("    结果明细未知：旧版汇总未提供互斥终态，不能还原失败/过期/跳过")
-                lines.append(f"    旧口径扣除声明跳过的完成 {cur['completed']}｜声明跳过 {cur['skipped']}｜"
-                             f"非成功合计 {cur['failed_raw']}")
-            else:
-                labels = (("processed", "处理完成（不证明生成）"), ("skipped", "跳过（未生成）"),
-                          ("failed", "失败终态"), ("expired", "过期"),
-                          ("superseded", "被替代"), ("unknown_completed", "完成语义未知"),
-                          ("unknown_non_success", "失败/跳过未分型"))
-                lines.append("    互斥结果：" + "｜".join(
-                    f"{label} {outcomes[key]}" for key, label in labels)
-                    + f"｜合计 {cur['observed_total']}")
-                codes = _all_codes(cur.get('reason_codes', {}))
-                lines.append("    非成功原因码（完整；与结果同批，不另加总）：" + (codes or "无记录"))
-                if cur.get('evidence_notes'):
-                    notes = {
-                        "v1_status_split_unmeasured": "V1终态分类未测量或不守恒",
-                        "resident_dream_silence_ambiguous": "Resident Dream声明沉默不能证明处理或跳过",
-                        "completion_skip_split_unmeasured": "完成/跳过拆分未测量或不一致",
-                        "reason_counts_exceed_non_success": "原因码次数超过非成功总数",
-                    }
-                    lines.append("    证据限制：" + "、".join(
-                        notes.get(note, "未知证据限制") for note in cur['evidence_notes']))
-            lines.append(f"    运维分类（与上方结果重叠）：运维失败 {cur['operational']}｜"
-                         f"控制结果 {cur['control']}｜账号不可用 {cur['user_unavailable']}；"
-                         f"运维失败率 {_pct(cur['failure_rate'])}（分母 {cur['attempts']}，"
-                         f"前一天 {_pct(prev['failure_rate'])}）")
-            lines.append(f"    受影响 {_users(cur, 'failed_users')} 人（前一天 {_users(prev, 'failed_users')}）｜"
-                         f"零成功 {cur['stuck_users']} 人（前一天 {prev['stuck_users']}）")
-            causes = _cause_line(cur)
-            if causes:
-                lines.append(f"    运维原因分组：{causes}")
-            if cur['user_unavailable']:
-                lines.append("    账号不可用排除码（完整）：" + _all_codes(cur['user_unavailable_codes']))
-            cov = (report.get('coverage', {}).get(lane, {}).get(route) or {})
-            lines.append(f"    覆盖：起点 {cov.get('backfill_from') or '未知'}，"
-                         f"完整起点 {cov.get('partial_before') or '未知'}，"
-                         f"冻结至 {cov.get('through_day') or '未知'}；"
-                         f"跳过拆分水位 {cov.get('voice_from') or '未知'}，"
-                         f"V1分类水位 {cov.get('outcomes_from') or '未知'}")
-    stuck = [f"{LANE_LABELS[lane].split()[0]} {report['live_stuck'][lane]}"
-             for lane in LANES if report['live_stuck'].get(lane) is not None]
-    if stuck:
-        lines.append("")
-        lines.append("此刻卡着没结束的任务：" + " · ".join(stuck))
-    lines.append("")
-    lines.append(RATE_CAVEAT)
-    if incomplete:
-        lines.append("")
-        lines.append("数据说明：" + "；".join(incomplete))
+        cur = totals[lane]
+        if cur is None:
+            lines.append(f"{names[lane]}｜不明｜不明｜不明")
+            continue
+        lines.append(f"{names[lane]}｜{cur['processed']}｜{cur['skipped']}｜{cur['failed']}")
+        extra = []
+        for key, label in (("expired", "过期"), ("superseded", "替代"),
+                           ("unknown_completed", "完成结果不明"),
+                           ("unknown_non_success", "失败/跳过未分型")):
+            if cur[key]:
+                extra.append(f"{label}{cur[key]}")
+        if extra:
+            lines.append(f"{names[lane]}另有：" + "、".join(extra) + "。")
+    lines.append("完成后的实际写入/无变化尚无细分记录；排队和运行数未统计。")
+    for lane in LANES:
+        causes = _brief_causes(report, lane)
+        if causes:
+            lines.append(f"{names[lane]}失败相关原因：" + causes + "。")
+    if any(_brief_causes(report, lane) for lane in LANES):
+        lines.append("原因记录未逐项关联失败任务，不能相加还原失败数。")
+    actions = []
+    if any(value is None for value in totals.values()):
+        actions.append("核对缺失或不完整的数据，暂不判断整体结果")
+    for reason in attention:
+        if "我们这边" in reason:
+            action = "排查解析与处理异常，核对输出格式和处理日志"
+        elif "零完成" in reason or "卡着" in reason:
+            action = "检查未正常完成的任务，区分仍在执行、超时和账号阻塞"
+        elif "活跃" in reason:
+            action = "核对任务量下降是否符合实际使用情况"
+        else:
+            action = "检查失败增加的主要原因，优先核对模型服务和账号配置"
+        if action not in actions:
+            actions.append(action)
+    for action in actions[:2]:
+        lines.append("需处理：" + action + "。")
     return "\n".join(lines)
 
 
