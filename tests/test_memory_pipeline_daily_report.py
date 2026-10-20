@@ -117,40 +117,77 @@ def test_quiet_healthy_day_is_marked_normal():
     rows = [_row(f"usr_{i:016x}", completed=5) for i in range(3)]
     text = report_tool.render_message(_report(rows))
     assert text.splitlines()[0].startswith("[正常]")
-    assert "V1 resident：观测用户 0 人" in text
+    assert "Capture｜15｜0｜0" in text
+    assert "V1 resident" not in text
 
 
-def test_each_route_line_shows_affected_and_zero_success_users():
+def test_lane_totals_are_flat_and_do_not_claim_writes():
     rows = [_row("usr_a", failed=4, codes={"lease_timeout": 4}),
             _row("usr_b", failed=1, completed=2, codes={"lease_timeout": 1}),
             _row("usr_c", completed=3)]
     text = report_tool.render_message(_report(rows))
-    line = text
-    assert "失败终态 5｜过期 0" in line
-    assert "受影响 2 人（前一天 0）｜零成功 1 人（前一天 0）" in line
+    assert "Capture｜5｜0｜5" in text
+    assert "实际写入/无变化尚无细分记录" in text
+    assert text.count("排队和运行数未统计") == 1
+    assert "受影响" not in text and "失败率" not in text
+    assert "解析/处理5次" in text
 
 
-def test_rate_caveat_is_printed_once_on_every_message():
-    # Seven 2026-09-18: keep the per-attempt rate, but say on the message
-    # itself that retries inflate it (dream retries up to 4x since 09-16).
-    quiet = report_tool.render_message(_report([_row("usr_a", completed=5)]))
-    busy = report_tool.render_message(_report(_stuck_rows(3)))
-    for text in (quiet, busy):
-        assert text.count(report_tool.RATE_CAVEAT) == 1
-    assert "同一用户可有多次尝试" in report_tool.RATE_CAVEAT
-    assert "受影响" in report_tool.RATE_CAVEAT and "零成功" in report_tool.RATE_CAVEAT
+def test_report_is_one_screen_without_nested_axes_or_rates():
+    for report in (_report([_row("usr_a", completed=5)]), _report(_stuck_rows(20))):
+        text = report_tool.render_message(report)
+        assert len(text.splitlines()) <= 11
+        assert sum(line.startswith("需处理：") for line in text.splitlines()) <= 2
+        assert not any(line.startswith(" ") for line in text.splitlines())
+        assert "互斥" not in text and "覆盖：" not in text and "阈值" not in text
+        assert "%" not in text
 
 
-def test_backend_without_failed_users_renders_dash_not_zero():
-    # The tool reads whatever prod serves; an older backend must not read as
-    # "nobody affected". stuck_users predates this change and stays numeric.
+def test_missing_user_count_does_not_become_a_zero_user_claim():
     report = _report(_stuck_rows(2))
     for cell in report["cells"].values():
         for side in ("day", "previous"):
             cell[side].pop("failed_users")
     text = report_tool.render_message(report)
-    line = text
-    assert "受影响 - 人（前一天 -）｜零成功 2 人（前一天 0）" in line
+    assert "受影响" not in text
+    assert "Capture｜0｜0｜4" in text
+
+
+def test_unknown_skip_expiry_and_superseded_are_not_folded_into_failures():
+    report = _sources()
+    cur = report['cells']['dream/model_api']['day']
+    cur['outcomes'] = dict(processed=2, skipped=8, failed=3, expired=4,
+                           superseded=5, unknown_completed=6, unknown_non_success=7)
+    # Isolate the route to make conservation and displayed buckets obvious.
+    report['cells']['dream/resident']['day']['outcomes'] = dict.fromkeys(cur['outcomes'], 0)
+    text = report_tool.render_message(report)
+    assert "Dream｜2｜8｜3" in text
+    assert "Dream另有：过期4、替代5、完成结果不明6、失败/跳过未分型7。" in text
+
+
+@pytest.mark.parametrize('kind', ['missing_lane', 'partial', 'truncated', 'unclassified'])
+def test_incomplete_lane_is_unknown_not_zero(kind):
+    report = _sources()
+    report['incomplete'] = [{'kind': kind, 'lane': 'capture', 'route': 'resident'}]
+    text = report_tool.render_message(report)
+    assert "Capture｜不明｜不明｜不明" in text
+    assert "核对缺失或不完整的数据" in text
+
+
+def test_legacy_summary_does_not_reconstruct_outcomes():
+    report = _sources()
+    del report['cells']['capture/resident']['day']['outcomes']
+    assert "Capture｜不明｜不明｜不明" in report_tool.render_message(report)
+
+
+def test_causes_do_not_add_overlapping_reason_axis_or_users():
+    report = _report([_row('usr_a', failed=3, codes={'lease_timeout': 3})])
+    for cell in report['cells'].values():
+        cell['day']['reason_codes'] = {'lease_timeout': 999}
+    text = report_tool.render_message(report)
+    assert "解析/处理3次" in text and "999" not in text
+    assert "人" not in text
+
 
 
 # --------------------------------------------------------------------------- #
@@ -281,7 +318,7 @@ def test_dry_run_prints_and_never_posts():
         out=out,
     )
     assert code == 0
-    assert out.getvalue().startswith("[需要关注] 记忆管线日报 2026-09-14")
+    assert out.getvalue().startswith("[需要关注] 记忆报告｜2026-09-14")
 
 
 def test_dry_run_script_entrypoint():
@@ -293,7 +330,7 @@ def test_dry_run_script_entrypoint():
              if k not in {"LARK_BOT_WEBHOOK", "FEEDLING_ADMIN_TOKEN"}},
     )
     assert result.returncode == 0, result.stderr
-    assert "记忆管线日报 2026-09-14" in result.stdout
+    assert "记忆报告｜2026-09-14" in result.stdout
 
 
 class _FakeAdminAndLark:

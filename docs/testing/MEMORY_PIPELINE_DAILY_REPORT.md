@@ -52,15 +52,28 @@ are not status-linked in the rollup; they cannot be assigned to individual expir
 skip, or failure buckets. Completed Dream skip reasons are not stored here and must
 not be inferred as `not_enough_new_cards` from an unrelated trace sample.
 
-Operational / control / user-unavailable form a second, overlapping diagnostic
-axis over non-success records. Do not add this axis to terminal buckets or subtract
-its exclusions twice. The retained alert rate is operational / (legacy completed
-minus declared skips + operational). When classification is missing it remains a
-conservative alert fallback, not a proven failure result. All account-exclusion
-codes are rendered; there is no top-two truncation. Zero-success users are not
-labelled deadlocked. Coverage prints backfill/complete/through/voice/outcome
-watermarks; unknown values remain unknown. Older summaries without new fields
-render an explicit unknown detail, not reconstructed raw statuses.
+The compact message puts processed, explicitly skipped and failed terminal
+counts in separate columns for each lane, combining routes without adding user
+counts. Nonzero expired, superseded and unknown outcomes remain a short separate
+line. Missing/partial or older unmeasured lane data displays unknown, not zero.
+Processed does not prove a memory write; actual-write/no-change details and the
+pending/running population are not measured by this summary.
+
+Operational / control / user-unavailable remain an overlapping diagnostic axis
+in the unchanged summary. The renderer uses operational cause groups plus their
+separate account exclusions; it never also adds reason_codes or terminal counts.
+Each lane shows up to four nonzero, flat cause-group counts;
+exact codes, users, rates, coverage watermarks and all alert
+rules remain in the summary/offline detail rather than the compact message.
+Cause records are not status-linked and cannot reconstruct individual failed
+terminal buckets. Group labels describe investigation areas, not proven blame.
+At most two deduplicated action sentences summarize existing alerts.
+
+The actual schedule remains daily at 01:30 UTC (09:30 Beijing), through
+`.github/workflows/memory-pipeline-daily.yml`; no separate weekly entry has been
+identified. Historical sent message bodies are not retained by the workflow.
+Re-rendering a later read for the same day is a comparison sample, not a claim to
+recover the original sent text or the data available at send time.
 
 No schema migration, historical backfill, production write, public API or execution
 policy change is involved. This admin-only endpoint is excluded from public

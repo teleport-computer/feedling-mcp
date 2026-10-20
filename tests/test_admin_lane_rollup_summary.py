@@ -192,7 +192,7 @@ def test_unfrozen_day_is_flagged_not_reported_as_healthy():
     report = _report(through=PREV, today_partial=live)
     text = report_tool.render_message(report)
     assert text.startswith("[需要关注]")
-    assert "覆盖不足或尚未冻结" in text
+    assert "Capture｜不明｜不明｜不明" in text
     stats = report['cells']['capture/model_api']['day']
     assert stats['operational'] == 1 and stats['causes']['unknown']['codes'] == {"no_code": 1}
 
@@ -201,7 +201,7 @@ def test_lagging_freezer_is_flagged_even_without_live_rows():
     # A stalled freezer with no live tail must not read as "当天没有任务".
     report = _report(through=PREV)
     assert any("数据不完整" in r for r in report_tool.evaluate_attention(report))
-    assert "落卡 capture · V2 model_api 覆盖不足或尚未冻结" in report_tool.render_message(report)
+    assert "Capture｜不明｜不明｜不明" in report_tool.render_message(report)
 
 
 def test_missing_lane_payload_is_flagged():
@@ -209,7 +209,7 @@ def test_missing_lane_payload_is_flagged():
     sources["lane_rollup"].pop("dream")
     text = report_tool.render_message(summary.build_summary(sources, day=DAY))
     assert text.startswith("[需要关注]")
-    assert "做梦 dream 没取到数据" in text
+    assert "Dream｜不明｜不明｜不明" in text
 
 
 def test_dream_skips_come_from_silent_declared_and_are_not_successes():
@@ -249,8 +249,8 @@ def test_v1_control_and_user_unavailable_do_not_page():
     assert report_tool.evaluate_attention(report) == []
     text = report_tool.render_message(report)
     assert text.startswith("[正常]")
-    assert "跳过（未生成） 48｜失败终态 36" in text
-    assert "账号不可用排除码（完整）：capture_agent_call_failed:quota_insufficient 36" in text
+    assert "Capture｜12｜48｜36" in text
+    assert "账号/模型配置36次" in text
 
 
 def test_v1_codes_shared_with_skips_are_not_guessed_into_a_group():
@@ -344,7 +344,7 @@ def test_internal_pagination_and_truncation(monkeypatch):
     monkeypatch.setattr(summary, 'LANE_ROLLUP_MAX_PAGES', 1)
     actual = summary.read_summary(day=DAY)
     assert {'lane': 'capture', 'kind': 'truncated'} in actual['incomplete']
-    assert '行数超过翻页上限，只统计了一部分' in report_tool.render_message(actual)
+    assert 'Capture｜不明｜不明｜不明' in report_tool.render_message(actual)
 
 
 def test_pagination_deduplicates_full_cell_key(monkeypatch):
@@ -530,10 +530,12 @@ def test_t825_all_closed_codes_and_missing_codes_visible_without_double_subtract
     assert sum(cur['reason_codes'].values()) == 68
     assert cur['reason_codes']['no_code'] == 52
     text = report_tool.render_message(report)
-    exclusions = next(line for line in text.splitlines() if '账号不可用排除码' in line)
-    for code, n in row['failure_codes'].items():
-        assert f'{code} {n}' in exclusions
-    assert '失败终态 68' in text
+    # The compact view keeps grouped counts; all exact codes remain in
+    # the original summary and its unchanged conservation assertions above.
+    assert "账号/模型配置16次" in text
+    assert "原因待查52次" in text
+    assert 'Capture｜192｜0｜68' in text
+
 
 
 def test_t825_coverage_before_history_and_previous_only_are_explicit():
@@ -543,14 +545,14 @@ def test_t825_coverage_before_history_and_previous_only_are_explicit():
     cur = report['cells']['capture/model_api']['day']
     assert cur['partial'] and cur['observed_total'] == 0
     text = report_tool.render_message(report)
-    assert '缺失不代表零' in text and '当天没有任务' not in text
+    assert 'Capture｜不明｜不明｜不明' in text and '当天没有任务' not in text
     assert '完全卡死' not in text
 
 
 def test_t825_old_summary_is_explicitly_unmeasured():
     old = json.loads((FIXTURE.parent / 'summary_pre_t718.json').read_text())
     text = report_tool.render_message(old)
-    assert text.count('结果明细未知') == 4
+    assert text.count('｜不明｜不明｜不明') == 2
     assert '互斥结果：' not in text
     assert '完全卡死' not in text
 
@@ -577,4 +579,4 @@ def test_t825_resident_dream_completion_silence_never_invents_skip(
     assert cur['control'] == 4  # no double subtraction of failed-column skips
     if unknown:
         assert cur['evidence_notes']
-        assert '结果分型缺少证据' in report_tool.render_message(report)
+        assert f'完成结果不明{unknown}' in report_tool.render_message(report)
