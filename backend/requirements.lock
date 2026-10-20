@@ -595,9 +595,9 @@ mdurl==0.1.2 \
     --hash=sha256:84008a41e51615a49fc9966191ff91509e3c40b939176e643fd50a5c2196b8f8 \
     --hash=sha256:bb413d29f5eea38f31dd4754dd7377d4465116fb207585f97bf925588687c1ba
     # via markdown-it-py
-memgarden==0.23.0.post1 \
-    --hash=sha256:4b484096de96ddd97f6d093b04ebeefe8cb659d5f4d1dbe096ddf7f18d50f21b \
-    --hash=sha256:602efdd9d1f765addc21041c357fdff05062af670b9b970a04ba33d3c5f8e6aa
+memgarden==0.23.0.post2 \
+    --hash=sha256:3f0dcc3af996a585c1cfc8556e1155719fbd2cbd9420b945f756b827ff5ce7d7 \
+    --hash=sha256:59b6b90dd9b4befe14bec2f4c4520334a41b9899ebe6e1cbf5c6fc863d4a1025
     # via -r backend/requirements.txt
 packaging==26.1 \
     --hash=sha256:5d9c0669c6285e491e0ced2eee587eaf67b670d94a19e94e3984a481aba6802f \
