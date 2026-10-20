@@ -244,6 +244,41 @@ def test_mode_off_is_unavailable_and_never_calls_the_enclave(turn):
     assert turn.calls["enclave"] == 0
 
 
+@pytest.mark.parametrize("rollout", ["off", "on"])
+def test_required_history_callback_preserves_snapshot_and_allows_bound_unavailable(monkeypatch, rollout):
+    """Exercise the real history adapter, not the usual replaced _history_page."""
+    rows = _rows(WINDOWS["cn"])
+    original = json.loads(json.dumps(rows))
+    store = types.SimpleNamespace(user_id=UID)
+    monkeypatch.setattr(core, "_store", lambda uid: store)
+    monkeypatch.setattr(core.accounts_registry, "effective_content_encryption", lambda uid: "off")
+    monkeypatch.setattr(core, "_trace", lambda *args, **kwargs: None)
+    monkeypatch.setenv(core.MODE_ENV, rollout)
+    monkeypatch.setattr(recall_candidates, "read_owned", lambda uid, end:
+                        recall_contract.candidate_batch([], uid))
+
+    def history(actual_store, *, query, user_agent, remote_addr, raw_page_observer):
+        assert actual_store is store
+        assert query["before_seq"] == "2"
+        raw_page_observer(rows)
+        projected = json.loads(json.dumps(rows))
+        rows[0]["body"] = "later mutation"
+        return {"messages": projected}, 200
+
+    monkeypatch.setattr(core.chat_core, "history", history)
+    page = core._history_page(UID, 1)
+    assert json.loads(page.original_json) == original
+    rows[:] = json.loads(json.dumps(original))
+    body, status = core.select_for_turn(store, {"message_id": "m1", "seq": 1}, 3.0)
+    assert status == (503 if rollout == "off" else 200)
+    if rollout == "off":
+        assert body["category"] == "recall_unavailable"
+        assert body["detail"] == "local_disabled"
+    else:
+        assert body["context_memories"] == []
+    assert (body["user_id"], body["message_id"], body["seq"]) == (UID, "m1", 1)
+
+
 def test_an_encrypted_account_is_409_and_never_calls_the_enclave(turn, monkeypatch):
     monkeypatch.setenv(core.MODE_ENV, "on")
     monkeypatch.setattr(core.accounts_registry, "effective_content_encryption", lambda _u: "on")
