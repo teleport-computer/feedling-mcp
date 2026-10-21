@@ -14,6 +14,20 @@ managed confidential-compute environment.
 Read [architecture and trust boundaries](/docs/architecture) first for the
 logical component, data-flow, and encryption model used by this guide.
 
+## Cache diagnostic metadata
+
+Runtime V2's existing per-user attempt log may contain allowlisted numeric cache
+usage and a nullable system-prefix change observation. Treat this as plaintext
+operational metadata with the log's existing access controls. Prompt/reply bodies
+remain on their existing content-isolated paths; no plaintext content digest,
+credential, or endpoint is added to the log. The keyed comparison state is only
+in process memory, bounded to 256 user-route baselines with a 30-minute idle TTL;
+it is lost on worker restart/eviction and is not shared between workers.
+It does not identify a durable chat session or establish provider cache behavior.
+See [Runtime V2 prompt caching](/docs/architecture#runtime-v2-prompt-caching)
+for the exact observed wire ranges and unknown states. This does not enable new
+Resident/VPS diagnostics or require a database migration.
+
 ## Optional managed Genesis plaintext worker
 
 `FEEDLING_GENESIS_WORKER_ENABLED` remains opt-in and requires the runtime-token

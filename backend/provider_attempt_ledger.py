@@ -19,6 +19,7 @@ from typing import Any
 
 import db
 import provider_attempt_metadata
+import provider_cache_diagnostics
 
 
 STREAM = "provider_attempts"
@@ -246,6 +247,7 @@ def record_runtime_attempt(
     ts: float | None = None,
     attempt_trace: Any = None,
     probe_http: Any = None,
+    cache_diagnostic: Any = None,
 ) -> bool:
     """Append one server-side provider attempt. Never raises.
 
@@ -299,6 +301,12 @@ def record_runtime_attempt(
             ),
             "dur_ms": _duration_ms(dur_ms),
         }
+        try:
+            safe_cache = provider_cache_diagnostics.project(cache_diagnostic)
+            if safe_cache is not None:
+                doc["cache_diagnostic"] = safe_cache
+        except Exception:  # preserve the ordinary attempt row if projection fails
+            pass
         if runtime == "hosted_setup" and lane in _PROBE_LANES:
             safe_probe = project_probe_http(probe_http)
             if safe_probe is not None:

@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote, unquote, urlsplit
 
 import httpx
+import provider_cache_diagnostics
 
 import generated_image
 import provider_refusal
@@ -1373,6 +1374,21 @@ def _normalize_usage(provider: str, raw: dict | None) -> dict:
         "cache_write_tokens": cache_write,
         "cache_miss_tokens": cache_miss,
     }
+
+
+_CACHE_USAGE_OBSERVATION = contextvars.ContextVar("cache_usage_observation", default=None)
+
+
+def _observed_usage(provider: str, raw: dict | None) -> dict:
+    normalized = _normalize_usage(provider, raw)
+    observation = _CACHE_USAGE_OBSERVATION.get()
+    if observation is not None:
+        observation[0] = (normalized, None)
+        try:
+            observation[0] = (normalized, provider_cache_diagnostics.usage(provider, raw, normalized))
+        except Exception:  # diagnostics must never change provider behavior
+            pass
+    return normalized
 
 
 def _parse_tool_args(raw) -> tuple[dict, str, bool]:
@@ -3322,7 +3338,7 @@ def _parse_openai_responses_body(
         or body.get("status")
         or "",
     ).strip()
-    usage = _normalize_usage("openai", body.get("usage"))
+    usage = _observed_usage("openai", body.get("usage"))
     if require_reply and not reply and not tool_calls and not media:
         raise _mark_output_truncation(
             ProviderError("provider response had no usable reply text"),
@@ -3694,7 +3710,8 @@ def _with_request_diagnostics(
 ) -> dict[str, Any]:
     """Attach non-sensitive request-path evidence to normalized usage."""
     out = dict(result)
-    usage = dict(out.get("usage") or {})
+    original_usage = out.get("usage")
+    usage = dict(original_usage or {})
     usage.update(
         {
             "provider_retry_count": max(0, int(attempts) - 1),
@@ -3705,6 +3722,12 @@ def _with_request_diagnostics(
             "compatibility_fallbacks": list(fallback_codes),
         }
     )
+    try:
+        observation = _CACHE_USAGE_OBSERVATION.get()
+        if observation and observation[0] is not None and observation[0][0] is original_usage:
+            observation[0] = (usage, observation[0][1])
+    except Exception:
+        pass
     out["usage"] = usage
     return out
 
@@ -4248,7 +4271,7 @@ def _parse_openrouter_images_body(
     return {
         "reply": "",
         "reasoning": "",
-        "usage": _normalize_usage(provider, body.get("usage")),
+        "usage": _observed_usage(provider, body.get("usage")),
         "raw_id": body.get("id", ""),
         "stop_reason": "image_generated",
         "provider": provider,
@@ -4299,14 +4322,14 @@ def _parse_openai_compat_body(
         raise _mark_output_truncation(
             exc,
             stop_reason=stop_reason,
-            usage=_normalize_usage(provider, body.get("usage")),
+            usage=_observed_usage(provider, body.get("usage")),
         )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_openai_compatible_reasoning(body),
-        "usage": _normalize_usage(provider, body.get("usage")),
+        "usage": _observed_usage(provider, body.get("usage")),
         "raw_id": body.get("id", ""),
         "stop_reason": stop_reason,
         "openai_compat_diagnostics": _openai_compat_empty_diagnostics(body),
@@ -4529,7 +4552,7 @@ def _parse_anthropic_body(
         raise _mark_output_truncation(
             exc,
             stop_reason=stop_reason,
-            usage=_normalize_usage("anthropic", body.get("usage")),
+            usage=_observed_usage("anthropic", body.get("usage")),
         )
     return {
         **({"provider_refusal": refusal} if refusal is not None else {}),
@@ -4537,7 +4560,7 @@ def _parse_anthropic_body(
             reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_anthropic_reasoning(body),
-        "usage": _normalize_usage("anthropic", body.get("usage")),
+        "usage": _observed_usage("anthropic", body.get("usage")),
         "raw_id": body.get("id", ""),
         "stop_reason": stop_reason,
         "provider": "anthropic",
@@ -4822,7 +4845,7 @@ def _parse_bedrock_body(
     tool_calls = _decode_tool_calls_bedrock(body)
     content = _bedrock_output_content(body)
     stop_reason = str(body.get("stopReason") or "").strip()
-    usage = _normalize_usage("bedrock", body.get("usage"))
+    usage = _observed_usage("bedrock", body.get("usage"))
     try:
         reply = _extract_bedrock_reply(
             body, required=require_reply and not tool_calls
@@ -5021,14 +5044,14 @@ def _parse_gemini_body(
         raise _mark_output_truncation(
             exc,
             stop_reason=_normalize_gemini_finish_reason(stop_reason),
-            usage=_normalize_usage("gemini", body.get("usageMetadata")),
+            usage=_observed_usage("gemini", body.get("usageMetadata")),
         )
     return {
         "reply": _reconstruct_assistant_prefill(
             reply, assistant_prefill, stop_reason=stop_reason
         ),
         "reasoning": _extract_gemini_reasoning(body),
-        "usage": _normalize_usage("gemini", body.get("usageMetadata")),
+        "usage": _observed_usage("gemini", body.get("usageMetadata")),
         "raw_id": body.get("responseId", ""),
         "stop_reason": stop_reason,
         "provider": "gemini",
@@ -6309,6 +6332,19 @@ async def chat_completion_async(
     deadline_trace = provider_deadline.attempt_trace.get()
     if attempt_trace is not None and deadline_trace is not None:
         attempt_trace = deadline_trace
+    tracker = provider_cache_diagnostics.prefix_tracker
+    ticket = None
+    observation, observation_token = None, None
+    trace_start = len(attempt_trace) if attempt_trace is not None else 0
+    try:
+        if config.capture_attempt_trace and _cache_key(config.prompt_cache_key):
+            observation = [None]
+        # Even a disabled nested call masks the parent's mutable collector.
+        observation_token = _CACHE_USAGE_OBSERVATION.set(observation)
+        if observation is not None:
+            ticket = tracker.begin(config.prompt_cache_key)
+    except Exception:
+        pass
     try:
         result = await _chat_completion_async_impl(
             config,
@@ -6331,6 +6367,35 @@ async def chat_completion_async(
             _mark_attempt_postprocess_error(attempt_trace, exc)
             _attach_provider_attempt_trace(exc, attempt_trace)
         raise
+    finally:
+        # Scope stays occupied through request completion/cancellation. No wire
+        # content or keyed digest crosses the numeric metadata boundary.
+        try:
+            payload, wire_provider, wire_model = None, "", ""
+            if "result" in locals() and attempt_trace is not None:
+                for row in reversed(attempt_trace[trace_start:]):
+                    if row.get("kind") == "http_attempt" and type(row.get("status")) is int and 200 <= row["status"] < 300:
+                        payload = (row.get("wire") or {}).get("payload")
+                        wire_provider, wire_model = row.get("provider", ""), row.get("model", "")
+                        break
+            prefix = tracker.finish(ticket, payload, wire_provider, wire_model)
+            if ("result" in locals() and type(result) is dict
+                    and observation is not None and observation[0] is not None
+                    and observation[0][0] is result.get("usage")
+                    and type(observation[0][1]) is dict):
+                result = dict(result)
+                usage = dict(result.get("usage") or {})
+                usage["cache_diagnostic"] = {**observation[0][1], "prefix": prefix}
+                result["usage"] = usage
+        except Exception:
+            pass
+        finally:
+            try:
+                tracker.abandon(ticket)
+            except Exception:
+                pass
+            if observation_token is not None:
+                _CACHE_USAGE_OBSERVATION.reset(observation_token)
     if attempt_trace is None:
         return result
     return _with_provider_attempt_trace(result, attempt_trace)

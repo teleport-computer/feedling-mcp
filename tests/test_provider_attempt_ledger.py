@@ -337,3 +337,24 @@ def test_probe_projection_rejects_open_values_and_is_setup_only(monkeypatch):
         assert provider_attempt_ledger.record_runtime_attempt('synthetic', parent_key='probe',
             trigger='model_api_probe', outcome='ok', runtime=runtime, lane=lane, probe_http=good)
         assert ('probe_http' in stored[-1]) == (runtime == 'hosted_setup' and lane != 'setup')
+
+
+def test_cache_evidence_projects_closed_schema_and_survives_projection_failure(monkeypatch):
+    import json
+    import provider_cache_diagnostics as diag
+    import provider_client as pc
+    from model_api_runtime.v2 import worker
+    rows = []
+    monkeypatch.setattr(provider_attempt_ledger.db, "log_append_numbered", lambda *a, **kw: rows.append(a[2]) or a[2])
+    raw = {"prompt_tokens_details": {"cached_tokens": 0}, "password": "SECRET"}
+    evidence = diag.usage("openai", raw, pc._normalize_usage("openai", raw))
+    evidence.update(prompt="SECRET", endpoint="SECRET", digest="SECRET")
+    evidence["prefix"] = {"range": "openai_chat_leading_system", "status": "changed", "changed": False, "digest": "SECRET"}
+    worker._note_provider_attempt("synthetic", "provider_response", {"response": {"usage": {"cache_diagnostic": evidence}}}, job_id=1)
+    safe = rows[-1]["cache_diagnostic"]
+    assert safe["raw"]["prompt_tokens_details.cached_tokens"]["value"] == 0
+    assert safe["prefix"]["changed"] is True
+    assert "SECRET" not in json.dumps(rows[-1])
+    monkeypatch.setattr(diag, "project", lambda *a: (_ for _ in ()).throw(ValueError("private")))
+    assert provider_attempt_ledger.record_runtime_attempt("synthetic", parent_key="2", trigger="v2_turn", outcome="ok", cache_diagnostic=evidence)
+    assert "cache_diagnostic" not in rows[-1]  # ordinary attempt still persisted
