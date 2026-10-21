@@ -1070,6 +1070,27 @@ conversation prefix. Native Bedrock and the deployed trusted-skills boundary
 still require their own live post-deploy evidence; unit and wire tests
 are not presented as that proof.
 
+The existing per-user `provider_attempts` ledger can also retain a closed cache
+usage diagnostic: presence and validated integer values of allowlisted upstream
+cache fields, alongside normalized prompt/read/write/miss counts. Missing values
+remain unknown; a reported zero is retained as zero. These numeric fields are
+plaintext metadata. Arbitrary usage objects, prompts, replies, credentials and
+private endpoints are not copied into this ledger.
+
+For hosted async calls with an opaque user-route affinity, a local diagnostic
+compares only the final successful wire request's leading system/developer
+messages (Chat Completions), `instructions` (Responses), `system` (Anthropic or
+Bedrock), or `systemInstruction` (Gemini). It compares canonical JSON of that closed range (object keys sorted, array order
+preserved), excluding tools, schemas, history, and other messages. Only a range label, status and nullable change boolean are
+persisted. The comparison is **not** the provider's cache key or token prefix,
+and the scope is a host user-route within one process, not a durable chat session.
+A process-random HMAC protects the in-memory comparison state; its digest and
+key are never logged. Up to 256 baselines expire after 30 minutes of inactivity.
+First observations, eviction/restart, changed wire/model, unsupported/empty
+ranges, failures and overlapping requests do not establish equality; overlap
+invalidates the baseline. There is no cross-worker or historical comparison.
+Diagnostic errors do not change provider success, failure, retries or requests.
+
 ### Runtime V2 encrypted trajectories and offline review
 
 Runtime V2 keeps an append-only flight recorder for each job in addition to

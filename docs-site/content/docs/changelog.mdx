@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Runtime V2 attempt logs can retain allowlisted upstream/normalized cache counts
+  and a nullable, process-local system-prefix change observation. Missing fields
+  stay unknown; content, credentials, endpoints and comparison digests are not
+  logged. This diagnostic does not prove a cache miss cause or change requests.
+
 - Capture and Dream retain `output_truncated` and token-budget diagnostics when
   an output-limited final reply contains partial text, cannot be parsed, and
   the component has no re-ask remaining. Previously this could be reported as

@@ -1583,3 +1583,119 @@ def test_usage_normalization_keeps_unreported_cache_metrics_unknown(
     assert usage["cache_read_tokens"] is None
     assert usage["cache_write_tokens"] is None
     assert usage["cache_miss_tokens"] is None
+
+
+def test_host_prefix_baselines_ranges_and_no_content_output():
+    import provider_cache_diagnostics as diag
+    tracker = diag.PrefixTracker()
+    def compare(payload, provider="openai", model="fixture", scope="user-route-one"):
+        return tracker.finish(tracker.begin(scope), payload, provider, model)
+    payload = {"messages": [{"role": "system", "content": "PRIVATE-SYSTEM"}, {"role": "user", "content": "old-tail"}]}
+    assert compare(payload)["status"] == "baseline"
+    assert compare(payload)["changed"] is False
+    payload["messages"][1]["content"] = "new-tail"
+    assert compare(payload)["changed"] is False  # scope explicitly excludes history
+    payload["messages"][0]["content"] = "CHANGED-PRIVATE"
+    assert compare(payload)["changed"] is True
+    assert compare(payload, scope="other-user")["status"] == "baseline"
+    assert compare(payload, model="new-model")["status"] == "baseline"
+    assert compare({"messages": [{"role": "user", "content": "no-system"}]})["changed"] is None
+    assert compare(payload)["status"] == "baseline"  # unsupported clears baseline
+    for provider, body, expected in [
+        ("anthropic", {"system": [{"text": "secret"}]}, "anthropic_system"),
+        ("bedrock", {"system": [{"text": "secret"}]}, "bedrock_system"),
+        ("gemini", {"systemInstruction": {"parts": [{"text": "secret"}]}}, "gemini_system_instruction"),
+        ("openai", {"instructions": "secret"}, "openai_responses_instructions"),
+    ]:
+        result = compare(body, provider)
+        assert result["range"] == expected and result["status"] == "baseline"
+        assert compare(body, provider)["changed"] is False
+        assert "secret" not in json.dumps(result)
+    assert all(set(row) == {"active", "overlap", "baseline", "time"} for row in tracker._entries.values())
+
+
+def test_host_prefix_ttl_capacity_overlap_and_failed_comparison(monkeypatch):
+    import provider_cache_diagnostics as diag
+    now = [0.0]
+    tracker = diag.PrefixTracker(capacity=1, ttl=10, clock=lambda: now[0])
+    payload = {"messages": [{"role": "system", "content": "x"}]}
+    first = tracker.begin("a")
+    second = tracker.begin("a")
+    assert tracker.begin("b") is None  # active state never evicted
+    assert tracker.finish(first, payload)["status"] == "overlap"
+    assert tracker.finish(second, payload)["status"] == "overlap"
+    assert tracker.finish(tracker.begin("a"), payload)["status"] == "baseline"
+    assert tracker.finish(tracker.begin("a"), payload)["status"] == "same"
+    now[0] = 11
+    assert tracker.finish(tracker.begin("a"), payload)["status"] == "baseline"
+    tracker.finish(tracker.begin("b"), payload)
+    assert list(tracker._entries) == ["b"]
+    ticket = tracker.begin("b")
+    monkeypatch.setattr(diag, "system_prefix", lambda *a: (_ for _ in ()).throw(ValueError("secret")))
+    assert tracker.finish(ticket, payload)["status"] == "unmeasured"
+    assert ticket["entry"]["active"] == 0 and ticket["entry"]["baseline"] is None
+
+
+def test_async_cache_diagnostic_uses_actual_wire_not_host_messages(monkeypatch):
+    import provider_cache_diagnostics as diag
+    tracker = diag.PrefixTracker()
+    monkeypatch.setattr(diag, "prefix_tracker", tracker)
+    calls = []
+    async def post(url, *, json, **kwargs):
+        calls.append(copy.deepcopy(json))
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                                       "usage": {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 0}}})
+    class Client:
+        pass
+    client = Client()
+    client.post = post
+    monkeypatch.setattr(pc, "_async_http_client", lambda: client)
+    # Validate egress offline: no DNS/network needed in a synthetic protocol test.
+    monkeypatch.setattr(pc, "validate_config", lambda *a: ("openai_compatible", "fixture", "https://fixture.invalid/v1"))
+    config = pc.ProviderConfig("openai_compatible", "fixture", "SECRET-KEY", capture_attempt_trace=True, prompt_cache_key="opaque-user-route")
+    async def run():
+        messages = [{"role": "system", "content": "host-system"}, {"role": "user", "content": "PRIVATE-CHAT"}]
+        original = pc._build_openai_compat_payload
+        def builder(**kwargs):
+            payload = copy.deepcopy(original(**kwargs))
+            payload["messages"][0]["content"] = "wire-one" if len(calls) == 0 else "wire-two"
+            return payload
+        monkeypatch.setattr(pc, "_build_openai_compat_payload", builder)
+        first = await pc.chat_completion_async(config, messages)
+        second = await pc.chat_completion_async(config, messages)
+        assert first["usage"]["cache_diagnostic"]["prefix"]["status"] == "baseline"
+        evidence = diag.project(second["usage"]["cache_diagnostic"])
+        assert evidence["prefix"]["changed"] is True
+        assert evidence["normalized"]["cache_read_tokens"] == 0
+        assert not any(secret in json.dumps(evidence) for secret in ["PRIVATE-CHAT", "SECRET-KEY", "wire-two", "opaque-user-route", "fixture.invalid"])
+    asyncio.run(run())
+
+
+def test_async_prefix_cancellation_and_diagnostic_error_do_not_change_business(monkeypatch):
+    import provider_cache_diagnostics as diag
+    tracker = diag.PrefixTracker()
+    monkeypatch.setattr(diag, "prefix_tracker", tracker)
+    config = pc.ProviderConfig("openai", "fixture", "secret", capture_attempt_trace=True, prompt_cache_key="route")
+    async def cancelled(*a, **kw):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", cancelled)
+    async def run_cancel():
+        with pytest.raises(asyncio.CancelledError):
+            await pc.chat_completion_async(config, [])
+    asyncio.run(run_cancel())
+    assert tracker._entries["route"]["active"] == 0
+    error = pc.ProviderError("original")
+    async def failure(*a, **kw):
+        raise error
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", failure)
+    async def run_error():
+        with pytest.raises(pc.ProviderError) as got:
+            await pc.chat_completion_async(config, [])
+        assert got.value is error
+    asyncio.run(run_error())
+    async def ok(*a, **kw):
+        return {"reply": "ok", "usage": {"cache_diagnostic": {}}}
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", ok)
+    monkeypatch.setattr(tracker, "finish", lambda *a: (_ for _ in ()).throw(RuntimeError("diagnostic")))
+    assert asyncio.run(pc.chat_completion_async(config, []))["reply"] == "ok"
+    assert tracker._entries["route"]["active"] == 0
