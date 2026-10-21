@@ -346,7 +346,8 @@ def test_cache_evidence_projects_closed_schema_and_survives_projection_failure(m
     from model_api_runtime.v2 import worker
     rows = []
     monkeypatch.setattr(provider_attempt_ledger.db, "log_append_numbered", lambda *a, **kw: rows.append(a[2]) or a[2])
-    evidence = pc._observed_usage("openai", {"prompt_tokens_details": {"cached_tokens": 0}, "password": "SECRET"})["cache_diagnostic"]
+    raw = {"prompt_tokens_details": {"cached_tokens": 0}, "password": "SECRET"}
+    evidence = diag.usage("openai", raw, pc._normalize_usage("openai", raw))
     evidence.update(prompt="SECRET", endpoint="SECRET", digest="SECRET")
     evidence["prefix"] = {"range": "openai_chat_leading_system", "status": "changed", "changed": False, "digest": "SECRET"}
     worker._note_provider_attempt("synthetic", "provider_response", {"response": {"usage": {"cache_diagnostic": evidence}}}, job_id=1)

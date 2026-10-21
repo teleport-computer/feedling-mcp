@@ -75,6 +75,16 @@ def test_usage_derived_totals_never_overflow_postgres_bigint():
     assert usage["cache_miss_tokens"] is None
 
 
+def _diagnostic_usage(provider, raw):
+    observation = [None]
+    token = pc._CACHE_USAGE_OBSERVATION.set(observation)
+    try:
+        normalized = pc._observed_usage(provider, raw)
+        return {**normalized, "cache_diagnostic": observation[0][1]}
+    finally:
+        pc._CACHE_USAGE_OBSERVATION.reset(token)
+
+
 def test_cache_raw_numeric_diagnostic_maps_protocols_without_content():
     import json
     import provider_cache_diagnostics as diag
@@ -87,7 +97,7 @@ def test_cache_raw_numeric_diagnostic_maps_protocols_without_content():
     ]
     for provider, raw, prompt, read in cases:
         raw["private_prompt"] = "PRIVATE-CONTENT"
-        usage = pc._observed_usage(provider, raw)
+        usage = _diagnostic_usage(provider, raw)
         evidence = diag.project(usage["cache_diagnostic"])
         assert evidence["normalized"]["prompt_tokens"] == prompt
         assert evidence["normalized"]["cache_read_tokens"] == read
@@ -98,12 +108,12 @@ def test_cache_raw_numeric_diagnostic_maps_protocols_without_content():
 def test_cache_raw_missing_zero_invalid_and_normalized_are_distinct():
     import provider_cache_diagnostics as diag
     for value in [None, False, "0", 0.0, float("nan"), -1, 1 << 63]:
-        usage = pc._observed_usage("openai", {"prompt_tokens_details": {"cached_tokens": value}})
+        usage = _diagnostic_usage("openai", {"prompt_tokens_details": {"cached_tokens": value}})
         field = diag.project(usage["cache_diagnostic"])["raw"]["prompt_tokens_details.cached_tokens"]
         assert field == {"present": True, "valid": False, "value": None}
-    missing = diag.project(pc._observed_usage("openai", {})["cache_diagnostic"])
+    missing = diag.project(_diagnostic_usage("openai", {})["cache_diagnostic"])
     assert missing["raw"]["prompt_tokens_details.cached_tokens"] == {"present": False, "valid": None, "value": None}
-    zero = diag.project(pc._observed_usage("openai", {"prompt_tokens_details": {"cached_tokens": 0}})["cache_diagnostic"])
+    zero = diag.project(_diagnostic_usage("openai", {"prompt_tokens_details": {"cached_tokens": 0}})["cache_diagnostic"])
     assert zero["raw"]["prompt_tokens_details.cached_tokens"] == {"present": True, "valid": True, "value": 0}
     assert zero["normalized"]["cache_read_tokens"] == 0
 
@@ -113,4 +123,11 @@ def test_cache_diagnostic_failure_preserves_normalization(monkeypatch):
         raise RuntimeError("private-error")
     monkeypatch.setattr(pc.provider_cache_diagnostics, "usage", fail)
     raw = {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 0}}
-    assert pc._observed_usage("openai", raw) == pc._normalize_usage("openai", raw)
+    observation = [None]
+    token = pc._CACHE_USAGE_OBSERVATION.set(observation)
+    try:
+        assert pc._observed_usage("openai", raw) == pc._normalize_usage("openai", raw)
+        assert observation[0][1] is None
+    finally:
+        pc._CACHE_USAGE_OBSERVATION.reset(token)
+    assert pc._CACHE_USAGE_OBSERVATION.get() is None

@@ -1682,6 +1682,7 @@ def test_async_prefix_cancellation_and_diagnostic_error_do_not_change_business(m
     async def run_cancel():
         with pytest.raises(asyncio.CancelledError):
             await pc.chat_completion_async(config, [])
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
     asyncio.run(run_cancel())
     assert tracker._entries["route"]["active"] == 0
     error = pc.ProviderError("original")
@@ -1692,6 +1693,7 @@ def test_async_prefix_cancellation_and_diagnostic_error_do_not_change_business(m
         with pytest.raises(pc.ProviderError) as got:
             await pc.chat_completion_async(config, [])
         assert got.value is error
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
     asyncio.run(run_error())
     async def ok(*a, **kw):
         return {"reply": "ok", "usage": {"cache_diagnostic": {}}}
@@ -1699,3 +1701,68 @@ def test_async_prefix_cancellation_and_diagnostic_error_do_not_change_business(m
     monkeypatch.setattr(tracker, "finish", lambda *a: (_ for _ in ()).throw(RuntimeError("diagnostic")))
     assert asyncio.run(pc.chat_completion_async(config, []))["reply"] == "ok"
     assert tracker._entries["route"]["active"] == 0
+
+
+def test_cache_observation_is_opt_in_and_context_resets_between_calls(monkeypatch):
+    raw = {"prompt_tokens": 4, "prompt_tokens_details": {"cached_tokens": 0}}
+    async def impl(*args, **kwargs):
+        return {"reply": "ok", "usage": pc._observed_usage("openai", raw)}
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", impl)
+    async def run():
+        config = pc.ProviderConfig("openai", "fixture", "secret")
+        plain = await pc.chat_completion_async(config, [])
+        assert plain["usage"] == pc._normalize_usage("openai", raw)
+        from dataclasses import replace
+        observed = await pc.chat_completion_async(replace(config, capture_attempt_trace=True, prompt_cache_key="opaque"), [])
+        assert observed["usage"]["cache_diagnostic"]["normalized"]["cache_read_tokens"] == 0
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
+        again = await pc.chat_completion_async(config, [])
+        assert again["usage"] == plain["usage"]
+    asyncio.run(run())
+
+
+def test_cache_observation_nested_disabled_and_concurrent_isolation(monkeypatch):
+    from dataclasses import replace
+    base = pc.ProviderConfig("openai", "fixture", "secret")
+    observed = replace(base, capture_attempt_trace=True, prompt_cache_key="opaque")
+    async def impl(config, messages, **kwargs):
+        number = messages[0]["number"]
+        usage = pc._observed_usage("openai", {"prompt_tokens": number, "prompt_tokens_details": {"cached_tokens": number}})
+        await asyncio.sleep(0)
+        if number == 10:
+            child = await pc.chat_completion_async(base, [{"number": 999}])
+            assert "cache_diagnostic" not in child["usage"]
+        return {"reply": "ok", "usage": usage}
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", impl)
+    async def run():
+        nested, concurrent = await asyncio.gather(
+            pc.chat_completion_async(observed, [{"number": 10}]),
+            pc.chat_completion_async(replace(observed, prompt_cache_key="other-user"), [{"number": 20}]),
+        )
+        assert nested["usage"]["cache_diagnostic"]["normalized"]["cache_read_tokens"] == 10
+        assert concurrent["usage"]["cache_diagnostic"]["normalized"]["cache_read_tokens"] == 20
+        no_scope = await pc.chat_completion_async(replace(base, capture_attempt_trace=True), [{"number": 30}])
+        assert "cache_diagnostic" not in no_scope["usage"]
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
+    asyncio.run(run())
+
+
+def test_cache_observation_final_usage_identity_and_retry_no_stale(monkeypatch):
+    config = pc.ProviderConfig("openai", "fixture", "secret", capture_attempt_trace=True, prompt_cache_key="opaque")
+    async def impl(config, messages, **kwargs):
+        pc._observed_usage("openai", {"prompt_tokens": 111, "prompt_tokens_details": {"cached_tokens": 111}})
+        if messages:
+            return {"reply": "ok", "usage": pc._normalize_usage("openai", {"prompt_tokens": 9})}
+        final = pc._observed_usage("openai", {"prompt_tokens": 20, "prompt_tokens_details": {"cached_tokens": 0}})
+        return pc._with_request_diagnostics({"reply": "ok", "usage": final}, initial_payload={}, successful_payload={}, attempts=2, fallback_codes=[])
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", impl)
+    async def run():
+        unknown = await pc.chat_completion_async(config, [1])
+        assert "cache_diagnostic" not in unknown["usage"]  # parser/raw not bound to final usage
+        retried = await pc.chat_completion_async(config, [])
+        raw = retried["usage"]["cache_diagnostic"]["raw"]
+        assert raw["prompt_tokens"]["value"] == 20
+        assert raw["prompt_tokens_details.cached_tokens"]["value"] == 0
+        assert retried["usage"]["provider_retry_count"] == 1
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
+    asyncio.run(run())

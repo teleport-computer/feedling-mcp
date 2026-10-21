@@ -1376,14 +1376,18 @@ def _normalize_usage(provider: str, raw: dict | None) -> dict:
     }
 
 
+_CACHE_USAGE_OBSERVATION = contextvars.ContextVar("cache_usage_observation", default=None)
+
+
 def _observed_usage(provider: str, raw: dict | None) -> dict:
     normalized = _normalize_usage(provider, raw)
-    try:
-        normalized["cache_diagnostic"] = provider_cache_diagnostics.usage(
-            provider, raw, normalized
-        )
-    except Exception:  # diagnostics must never change provider behavior
-        pass
+    observation = _CACHE_USAGE_OBSERVATION.get()
+    if observation is not None:
+        observation[0] = (normalized, None)
+        try:
+            observation[0] = (normalized, provider_cache_diagnostics.usage(provider, raw, normalized))
+        except Exception:  # diagnostics must never change provider behavior
+            pass
     return normalized
 
 
@@ -3706,7 +3710,8 @@ def _with_request_diagnostics(
 ) -> dict[str, Any]:
     """Attach non-sensitive request-path evidence to normalized usage."""
     out = dict(result)
-    usage = dict(out.get("usage") or {})
+    original_usage = out.get("usage")
+    usage = dict(original_usage or {})
     usage.update(
         {
             "provider_retry_count": max(0, int(attempts) - 1),
@@ -3717,6 +3722,12 @@ def _with_request_diagnostics(
             "compatibility_fallbacks": list(fallback_codes),
         }
     )
+    try:
+        observation = _CACHE_USAGE_OBSERVATION.get()
+        if observation and observation[0] is not None and observation[0][0] is original_usage:
+            observation[0] = (usage, observation[0][1])
+    except Exception:
+        pass
     out["usage"] = usage
     return out
 
@@ -6323,9 +6334,14 @@ async def chat_completion_async(
         attempt_trace = deadline_trace
     tracker = provider_cache_diagnostics.prefix_tracker
     ticket = None
+    observation, observation_token = None, None
     trace_start = len(attempt_trace) if attempt_trace is not None else 0
     try:
-        if config.capture_attempt_trace:
+        if config.capture_attempt_trace and _cache_key(config.prompt_cache_key):
+            observation = [None]
+        # Even a disabled nested call masks the parent's mutable collector.
+        observation_token = _CACHE_USAGE_OBSERVATION.set(observation)
+        if observation is not None:
             ticket = tracker.begin(config.prompt_cache_key)
     except Exception:
         pass
@@ -6363,10 +6379,14 @@ async def chat_completion_async(
                         wire_provider, wire_model = row.get("provider", ""), row.get("model", "")
                         break
             prefix = tracker.finish(ticket, payload, wire_provider, wire_model)
-            if "result" in locals() and type(result) is dict:
-                usage = result.get("usage")
-                if type(usage) is dict and type(usage.get("cache_diagnostic")) is dict:
-                    usage["cache_diagnostic"]["prefix"] = prefix
+            if ("result" in locals() and type(result) is dict
+                    and observation is not None and observation[0] is not None
+                    and observation[0][0] is result.get("usage")
+                    and type(observation[0][1]) is dict):
+                result = dict(result)
+                usage = dict(result.get("usage") or {})
+                usage["cache_diagnostic"] = {**observation[0][1], "prefix": prefix}
+                result["usage"] = usage
         except Exception:
             pass
         finally:
@@ -6374,6 +6394,8 @@ async def chat_completion_async(
                 tracker.abandon(ticket)
             except Exception:
                 pass
+            if observation_token is not None:
+                _CACHE_USAGE_OBSERVATION.reset(observation_token)
     if attempt_trace is None:
         return result
     return _with_provider_attempt_trace(result, attempt_trace)
