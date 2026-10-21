@@ -412,7 +412,7 @@ Other `400` kinds from this endpoint:
 | `tls` | Certificate/TLS handshake failure — check `ca_pem` if the server uses a private CA. |
 | `codex_cert_chain_required` | The calling account's agent driver is `codex` and the server presented a single self-signed certificate (a CA acting as its own end entity) instead of a CA+leaf chain. See [`codex` needs a certificate chain](#codex-needs-a-certificate-chain-not-a-lone-self-signed-certificate) above. |
 | `transport` | The connection failed before a valid HTTP response arrived. |
-| `timeout` | Connect or read timeout, or the whole probe exceeded its 45-second wall-clock ceiling. A legacy HTTP+SSE endpoint that answers with a never-ending event stream lands here instead of hanging the request. |
+| `timeout` | Connect or read timeout, or the whole probe exceeded its 45-second wall-clock ceiling, including initial DNS resolution. A legacy HTTP+SSE endpoint that answers with a never-ending event stream lands here instead of hanging the request. |
 | `response_too_large` | An MCP response exceeded the 1 MiB probe limit. |
 | `http_401` / `http_403` / `http_404` / `http_4xx` / `http_5xx` | The server responded with an HTTP error status. |
 | `protocol` | The response wasn't a valid MCP handshake (bad JSON-RPC envelope, redirect, or empty SSE stream). A `200` whose body carries no `result` and no `error` lands here too — some vendors answer an auth failure with their own payload instead of a JSON-RPC error. |

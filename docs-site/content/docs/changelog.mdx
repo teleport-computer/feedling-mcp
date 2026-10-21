@@ -12,6 +12,10 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- MCP connection tests include initial DNS resolution in the existing 45-second
+  deadline, so a stalled resolver returns a timeout instead of leaving Save and
+  test waiting before the connection attempt starts.
+
 - Runtime V2 attempt logs can retain allowlisted upstream/normalized cache counts
   and a nullable, process-local system-prefix change observation. Missing fields
   stay unknown; content, credentials, endpoints and comparison digests are not
