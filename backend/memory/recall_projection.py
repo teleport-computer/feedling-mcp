@@ -47,7 +47,12 @@ def turn(rows, user_id: str, seq: int, message_id: str = "", *, require_current=
         recall_contract.owner(storage_source, user_id)
         expected_source = (source_snapshots or {}).get(mid)
         if expected_source is not None and storage_source != expected_source:
-            raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
+            # Only a verified, byte-identical inline→object promotion may
+            # differ from the source frozen by the prompt reader.
+            proof = attachment_reader(storage_source) if attachment_reader else None
+            if (not isinstance(proof, recall_attachments.AttachmentProof)
+                    or not recall_attachments.same_source(expected_source, storage_source, proof.body)):
+                raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
         if storage_source.get("seq") != row_seq:
             raise recall_contract.RecallFailure("frontier_invalid", category="binding_error")
         row = dict(source)

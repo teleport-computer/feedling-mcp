@@ -26,10 +26,15 @@ class AttachmentProof:
     seq: int
     source_json: str
     body: bytes
+    storage_source_json: str = ''
 
     @property
     def source(self):
         return json.loads(self.source_json)
+
+    @property
+    def storage_source(self):
+        return json.loads(self.storage_source_json or self.source_json)
 
 
 class HistoryPage(list):
@@ -128,6 +133,42 @@ def validate_bytes(row, body):
             raise recall_contract.RecallFailure('attachment_storage_invalid')
 
 
+def same_source(expected, current, body):
+    """Exact source, or the one-way inline→R2 promotion of identical bytes.
+
+    All non-storage coordinates remain exact. A pointer rewrite is not a
+    promotion; callers still validate the actual object and row around reads.
+    """
+    if expected == current:
+        return True
+    if (not isinstance(expected, dict) or not isinstance(current, dict)
+            or expected.get('content_type') not in {'image', 'file'}
+            or expected.get('body_key') or expected.get('body_ct') or expected.get('K_enclave')
+            or expected.get('body_object_format')
+            or not isinstance(expected.get('body_b64'), str)
+            or current.get('body_b64') is not None or current.get('body_ct') or current.get('K_enclave')
+            or current.get('body_object_format') != 'plaintext_v1'
+            or not isinstance(current.get('body_key'), str)
+            or not object_storage.chat_key_owned_by(current['body_key'], expected.get('owner_user_id'))):
+        return False
+    try:
+        if base64.b64decode(expected['body_b64'], validate=True) != body:
+            return False
+        validate_bytes(expected, body)
+    except (ValueError, TypeError, recall_contract.RecallFailure):
+        return False
+    digest = hashlib.sha256(body).hexdigest()
+    if (type(current.get('body_size_bytes')) is not int
+            or current['body_size_bytes'] != len(body) or current.get('body_sha256') != digest
+            or ('body_size_bytes' in expected and (type(expected['body_size_bytes']) is not int
+                                                   or expected['body_size_bytes'] != len(body)))
+            or ('body_sha256' in expected and expected['body_sha256'] != digest)):
+        return False
+    storage = {'body_b64', 'body_key', 'body_object_format', 'body_size_bytes', 'body_sha256'}
+    return ({k: v for k, v in expected.items() if k not in storage}
+            == {k: v for k, v in current.items() if k not in storage})
+
+
 def read(snapshot, user_id, deadline):
     """Verify source before/after hydration, returning the bytes consumers use."""
     recall_contract.owner(snapshot, user_id)
@@ -136,8 +177,6 @@ def read(snapshot, user_id, deadline):
         raise recall_contract.RecallFailure('attachment_binding_invalid', category='binding_error')
     try:
         current = _snapshot(user_id, mid, deadline)
-        if current != snapshot:
-            raise recall_contract.RecallFailure('attachment_changed', category='binding_error')
         if (snapshot.get('visibility') == 'local_only' or snapshot.get('body_ct')
                 or snapshot.get('K_enclave')
                 or (snapshot.get('body_key') and snapshot.get('body_object_format') != 'plaintext_v1')):
@@ -154,11 +193,32 @@ def read(snapshot, user_id, deadline):
                 raise recall_contract.RecallFailure('attachment_storage_invalid')
             body = plaintext_row.read_plaintext_row(snapshot, user_id, ValueError)
         validate_bytes(snapshot, body)
-        if _snapshot(user_id, mid, deadline) != snapshot:
-            raise recall_contract.RecallFailure('attachment_changed', category='binding_error')
+        verified = snapshot
+        for observed in (current, _snapshot(user_id, mid, deadline)):
+            if not same_source(snapshot, observed, body):
+                raise recall_contract.RecallFailure('attachment_changed', category='binding_error')
+            if observed != verified:
+                if verified.get('body_key'):
+                    raise recall_contract.RecallFailure('attachment_changed', category='binding_error')
+                if _object_bytes(observed, user_id, maximum, deadline) != body:
+                    raise recall_contract.RecallFailure('attachment_changed', category='binding_error')
+                verified = observed
+        final = _snapshot(user_id, mid, deadline)
+        if final != verified:
+            if verified.get('body_key') or not same_source(snapshot, final, body):
+                raise recall_contract.RecallFailure('attachment_changed', category='binding_error')
+            if _object_bytes(final, user_id, maximum, deadline) != body:
+                raise recall_contract.RecallFailure('attachment_changed', category='binding_error')
+            # A promotion first observed at the last boundary also needs an
+            # actual object read and a stable row afterwards. No retry loop.
+            if _snapshot(user_id, mid, deadline) != final:
+                raise recall_contract.RecallFailure('attachment_changed', category='binding_error')
+            verified = final
         _remaining(deadline)
         return AttachmentProof(user_id, mid, snapshot['seq'],
-                               json.dumps(snapshot, sort_keys=True, ensure_ascii=True), body)
+                               json.dumps(snapshot, sort_keys=True, ensure_ascii=True), body,
+                               (json.dumps(verified, sort_keys=True, ensure_ascii=True)
+                                if verified != snapshot else ''))
     except recall_contract.RecallFailure:
         raise
     except Exception as exc:
