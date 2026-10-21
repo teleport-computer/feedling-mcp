@@ -101,18 +101,27 @@ def select_off(user_id, seq, deps, *, deadline, permit, rollout, query_args,
                message_id="", hybrid=False, read_candidates=None, include_references=True,
                attachment_proofs=None, source_snapshots=None):
     read_candidates = read_candidates or recall_candidates.read_owned
+    verified_attachments = {}
     def attachment_reader(source):
         mid = source.get("id")
         expected = (source_snapshots or {}).get(mid)
-        if expected is not None and source != expected:
-            raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
-        proof = (attachment_proofs or {}).get(mid)
+        proof = verified_attachments.get(mid) or (attachment_proofs or {}).get(mid)
         if proof is not None:
             if (not isinstance(proof, recall_attachments.AttachmentProof)
-                    or proof.user_id != user_id or proof.source != source):
+                    or proof.user_id != user_id
+                    or not recall_attachments.same_source(proof.storage_source, source, proof.body)):
                 raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
-            return proof
-        return recall_attachments.read(source, user_id, deadline)
+            if proof.storage_source != source:
+                fresh = recall_attachments.read(source, user_id, deadline)
+                if fresh.body != proof.body:
+                    raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
+                proof = fresh
+        else:
+            proof = recall_attachments.read(source, user_id, deadline)
+        if expected is not None and not recall_attachments.same_source(expected, source, proof.body):
+            raise recall_contract.RecallFailure("attachment_changed", category="binding_error")
+        verified_attachments[mid] = proof
+        return proof
 
     # Required content is validated even when rollout disables optional recall.
     turn = _stage(lambda: recall_projection.turn(deps.history_page(user_id, seq),

@@ -16,6 +16,10 @@ change must not be interpreted as an API guarantee.
   deadline, so a stalled resolver returns a timeout instead of leaving Save and
   test waiting before the connection attempt starts.
 
+- Photo and file turns retain their validated content when a concurrent upload
+  moves identical inline bytes into object storage. Required attachment checks
+  still reject changed content, metadata, ownership, or object pointers.
+
 - Runtime V2 attempt logs can retain allowlisted upstream/normalized cache counts
   and a nullable, process-local system-prefix change observation. Missing fields
   stay unknown; content, credentials, endpoints and comparison digests are not
@@ -46,8 +50,9 @@ change must not be interpreted as an API guarantee.
   blocking valid conversation. Unavailable counts remain unknown, distinct
   from a healthy zero-match result. Candidate ordering and the fixed message
   frontier are retained; old sealed content is excluded without migration.
-  Required attachment bytes are bound to the same message version before media
-  processing. Explicit references are required content and keep their own
+  Required attachment bytes are bound to the same content version before media
+  processing; byte-identical inline-to-object storage promotion is allowed
+  after actual object verification. Explicit references are required content and keep their own
   message when stale backlog is collapsed. Turn selection returns attachment
   fingerprints and required reference cards; historical wake anchors may omit
   unused old references with `include_references: false`.
