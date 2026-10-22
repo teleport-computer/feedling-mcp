@@ -221,6 +221,82 @@ def test_a_single_next_event_payload_is_accepted_too():
     assert [r["source_event_id"] for r in rows] == ["ev9"]
 
 
+def test_current_ios_calendar_shape_keeps_three_part_identity_and_revision():
+    """IO iOS 发 `calendar_events`，不是旧 fixture 的 `events`。"""
+    rows = events.calendar_rows({"calendar_events": [{
+        "source_account_id": "icloud-account",
+        "calendar_id": "work-calendar",
+        "event_id": "event-1",
+        "revision": "2026-09-28T09:00:00+08:00",
+        "title": "站会",
+        "next_event_time": "2026-09-29T10:00:00+08:00",
+        "end_time": "2026-09-29T10:30:00+08:00",
+        "is_all_day": False,
+        "location": "会议室",
+    }]})
+
+    assert rows == [{
+        "source_account_id": "icloud-account",
+        "source_calendar_id": "work-calendar",
+        "source_event_id": "event-1",
+        "event_fields": {
+            "title": "站会",
+            "start_at": "2026-09-29T10:00:00+08:00",
+            "end_at": "2026-09-29T10:30:00+08:00",
+            "is_all_day": False,
+            "location_label": "会议室",
+        },
+        "source_revision": "2026-09-28T09:00:00+08:00",
+    }]
+
+
+def test_current_ios_reminder_shape_keeps_three_part_identity_and_revision():
+    rows = events.reminder_rows({"reminders": [{
+        "source_account_id": "icloud-account",
+        "list_id": "inbox",
+        "reminder_id": "reminder-1",
+        "revision": "2026-09-28T09:00:00+08:00",
+        "title": "买牛奶",
+        "due_time": "2026-09-29T18:00:00+08:00",
+        "priority": "high",
+        "is_overdue": False,
+    }]})
+
+    assert rows[0]["source_account_id"] == "icloud-account"
+    assert rows[0]["source_list_id"] == "inbox"
+    assert rows[0]["source_reminder_id"] == "reminder-1"
+    assert rows[0]["source_revision"] == "2026-09-28T09:00:00+08:00"
+    assert rows[0]["reminder_fields"]["due_at"] == "2026-09-29T18:00:00+08:00"
+
+
+def test_new_ios_mirror_rows_never_invent_missing_identity_parts():
+    assert events.calendar_rows({"calendar_events": [{
+        "source_account_id": None,
+        "calendar_id": "work",
+        "event_id": "event-1",
+        "next_event_time": "2026-09-29T10:00:00+08:00",
+    }]}) == []
+    assert events.reminder_rows({"reminders": [{
+        "source_account_id": "icloud",
+        "list_id": None,
+        "reminder_id": "reminder-1",
+    }]}) == []
+
+
+def test_reminder_tombstones_require_the_same_three_part_identity():
+    rows = events.reminder_deleted_rows({"reminder_deleted_items": [
+        {"source_account_id": "icloud", "list_id": "inbox",
+         "reminder_id": "gone-1"},
+        {"source_account_id": "icloud", "list_id": None,
+         "reminder_id": "unsafe"},
+    ]})
+    assert rows == [{
+        "source_account_id": "icloud",
+        "source_collection_id": "inbox",
+        "source_item_id": "gone-1",
+    }]
+
+
 # ---------------------------------------------------------------------------
 # 照片身份必须来自设备，不能是内容信封 id
 #

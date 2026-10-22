@@ -275,7 +275,7 @@ def test_the_dead_worker_cannot_overwrite_the_new_owners_state(clean):
                             received_at=T0 + timedelta(seconds=200)),
         next_state="delivered", claim_token=alive.claim_token,
     )
-    assert fresh_write is True
+    assert fresh_write == "delivered"
 
 
 def test_a_crash_between_accept_and_receipt_does_not_lose_the_event(clean):
@@ -303,7 +303,7 @@ def test_a_receipt_written_twice_does_not_double_advance(clean):
                           received_at=T0 + timedelta(seconds=5))
     s = store()
     assert s.record_wake_receipt(receipt=receipt, next_state="delivered",
-                                 claim_token=claimed.claim_token) is True
+                                 claim_token=claimed.claim_token) == "delivered"
     # 重放同一条回执：不该报错，也不该把状态再推一次
     s.record_wake_receipt(receipt=receipt, next_state="delivered",
                           claim_token=claimed.claim_token)
@@ -327,7 +327,7 @@ def test_purge_subject_removes_wake_receipt_before_its_outbox_owner(clean):
         ),
         next_state="delivered",
         claim_token=claimed.claim_token,
-    ) is True
+    ) == "delivered"
     assert s._q(
         "SELECT count(*) FROM perceptkit_wake_receipt WHERE event_id=%s",
         (event_id,),
@@ -879,8 +879,10 @@ def test_deleting_a_weight_sample_stops_it_from_being_the_current_value(clean):
                                       "source_event_id": oid,
                                       "value": {"weight_kg": kg}}]},
                    context=IngestContext("u1", at))
-    now = kit.get_current(subject_id="u1", signals=["health_weight"],
-                          now=T0 + timedelta(hours=2))["health_weight"]
+    now_entries = kit.get_current(subject_id="u1", signals=["health_weight"],
+                                  now=T0 + timedelta(hours=2))["health_weight"]
+    assert [entry.dimension_key for entry in now_entries] == ["health_weight"]
+    now = now_entries[0]
     assert now.value["weight_kg"] == 69.8
 
     with patch("db.get_pool", return_value=_pool(conn)), \
@@ -889,9 +891,11 @@ def test_deleting_a_weight_sample_stops_it_from_being_the_current_value(clean):
             {"signal": "health_weight", "sample_id": "w2"}]})
     assert out["ran"] and out["applied"] == 1, out
 
-    after = PerceptionKit(storage=store(conn)).get_current(
+    after_entries = PerceptionKit(storage=store(conn)).get_current(
         subject_id="u1", signals=["health_weight"],
         now=T0 + timedelta(hours=2))["health_weight"]
+    assert [entry.dimension_key for entry in after_entries] == ["health_weight"]
+    after = after_entries[0]
     assert after.value["weight_kg"] == 70.5, \
         f"删掉之后当前值应该重选到上一条，实际是 {after.value}"
 
@@ -914,11 +918,40 @@ def test_sleep_is_refused_out_loud_rather_than_silently_doing_nothing(clean):
     assert any("health_sleep" in w for w in out["warnings"]), out["warnings"]
 
 
+def test_every_healthkit_point_fact_with_a_sample_id_is_retractable():
+    """生产者给了稳定 sample id 的单样本事实，删除监听必须能走到 Kit。"""
+    from perception.perceptkit_adapter.shadow import RETRACTABLE_SIGNALS
+
+    assert RETRACTABLE_SIGNALS == frozenset({
+        "health_weight", "health_bmi", "health_body_fat", "health_height",
+        "health_glucose", "health_blood_pressure",
+        "health_resting_hr", "health_current_hr", "health_hrv",
+        "health_respiratory", "health_oxygen", "health_vo2max",
+        "health_workout",
+    })
+
+
+def test_a_partly_malformed_deletion_batch_is_not_acknowledged_as_complete(clean):
+    """有效项可幂等执行，但整批必须明确非 accepted，客户端才不会推进所有锚点。"""
+    from unittest.mock import patch
+    from perception.perceptkit_adapter import shadow
+    conn = connect()
+    with patch("db.get_pool", return_value=_pool(conn)), \
+         patch("perception.perceptkit_adapter.shadow.enabled", return_value=True):
+        out = shadow.apply_deletions("u1", {"deleted": [
+            {"signal": "health_weight", "sample_id": "w1"},
+            {"signal": "health_bmi"},
+            "not-an-object",
+        ]})
+    assert out["ran"] is True
+    assert out["applied"] == 1
+    assert out["rejected"] == 2
+    assert any("2 条删除" in warning for warning in out["warnings"])
+
+
 def test_a_deletion_never_takes_out_another_sources_same_id(clean):
     """同一个 id 在两个来源下是两件事。撤回只该命中它指名的那个来源。"""
     from unittest.mock import patch
-    from perceptkit.kit import PerceptionKit
-    from perceptkit.contracts import IngestContext
     from perception.perceptkit_adapter import shadow
     conn = connect()
     st = store(conn)
@@ -946,11 +979,17 @@ def test_the_deletion_key_is_encrypted_and_routed_but_not_expected_in_every_repo
                         （删除只在真有删除时才发）
     """
     from perception.ios_contract_v2 import (
-        ENCRYPTED_SIGNAL_KEYS_V2, EXPECTED_REPORT_KEYS_V2)
+        DIFFER_INPUTS_BY_IOS_KEY_V2,
+        ENCRYPTED_SIGNAL_KEYS_V2,
+        EXPECTED_REPORT_KEYS_V2,
+        WAKE_POLICY_BY_IOS_KEY_V2,
+    )
     from perception.service import _PERCEPTKIT_DECRYPTED_ENTRIES
     assert "health_deleted" in ENCRYPTED_SIGNAL_KEYS_V2
     assert _PERCEPTKIT_DECRYPTED_ENTRIES.get("health_deleted") == "apply_deletions"
     assert "health_deleted" not in EXPECTED_REPORT_KEYS_V2
+    assert DIFFER_INPUTS_BY_IOS_KEY_V2["health_deleted"] == ()
+    assert WAKE_POLICY_BY_IOS_KEY_V2["health_deleted"] == "retraction_only_after_decrypt"
 
 
 def test_every_routed_shadow_entry_actually_exists():
@@ -1053,6 +1092,79 @@ def test_a_client_that_sends_no_window_never_deletes(clean):
     assert _titles(conn) == ["e1", "e2"]
 
 
+def test_a_full_calendar_batch_with_an_invalid_identity_never_deletes(clean):
+    conn = connect()
+    _mirror(conn, _cal_payload([_event("e1"), _event("e2")]))
+    broken = _event("e1")
+    broken["source_account_id"] = None  # opts into strict identity, but incomplete
+    _mirror(conn, _cal_payload([broken]))
+    assert _titles(conn) == ["e1", "e2"]
+
+
+def _reminder_payload(items, *, deleted=(), truncated=False, window=True):
+    out = {
+        "reminders": items,
+        "reminder_deleted_items": list(deleted),
+        "reminders_truncated": truncated,
+    }
+    if window:
+        out["reminder_window_start"] = "2026-08-01T00:00:00+08:00"
+        out["reminder_window_end"] = "2026-10-01T00:00:00+08:00"
+    return out
+
+
+def _reminder(rid, *, due="2026-09-01T09:00:00+08:00"):
+    return {
+        "source_account_id": "icloud",
+        "list_id": "inbox",
+        "reminder_id": rid,
+        "title": rid,
+        "due_time": due,
+    }
+
+
+def _mirror_reminders(conn, payload):
+    from unittest.mock import patch
+    from perception.perceptkit_adapter import shadow
+    with patch("db.get_pool", return_value=_pool(conn)), \
+         patch("perception.perceptkit_adapter.shadow.enabled", return_value=True):
+        return shadow.mirror_reminders("u1", payload)
+
+
+def _reminder_ids(conn):
+    return sorted(r.source_reminder_id for r in
+                  store(conn).list_reminders(subject_id="u1", limit=50))
+
+
+def test_reminder_full_window_can_delete_the_last_dated_item(clean):
+    conn = connect()
+    _mirror_reminders(conn, _reminder_payload([_reminder("r1")]))
+    assert _reminder_ids(conn) == ["r1"]
+    _mirror_reminders(conn, _reminder_payload([]))
+    assert _reminder_ids(conn) == []
+
+
+def test_reminder_tombstone_deletes_undated_item_and_replay_is_idempotent(clean):
+    conn = connect()
+    _mirror_reminders(conn, _reminder_payload([_reminder("r1", due=None)]))
+    assert _reminder_ids(conn) == ["r1"]
+    tombstone = {"source_account_id": "icloud", "list_id": "inbox",
+                 "reminder_id": "r1"}
+    _mirror_reminders(conn, _reminder_payload([], deleted=[tombstone]))
+    assert _reminder_ids(conn) == []
+    _mirror_reminders(conn, _reminder_payload([], deleted=[tombstone]))
+    assert _reminder_ids(conn) == []
+
+
+def test_a_full_reminder_batch_with_an_invalid_identity_never_deletes(clean):
+    conn = connect()
+    _mirror_reminders(conn, _reminder_payload([_reminder("r1"), _reminder("r2")]))
+    broken = _reminder("r1")
+    broken["source_account_id"] = None
+    _mirror_reminders(conn, _reminder_payload([broken]))
+    assert _reminder_ids(conn) == ["r1", "r2"]
+
+
 def test_the_real_ios_per_segment_payload_lands_with_its_own_intervals(clean):
     """iOS 改成逐段上报之后的**真实载荷形状**（字段名按 .convertToSnakeCase
     之后的样子写），一路走到真库。
@@ -1135,12 +1247,12 @@ def test_retracting_a_fact_scrubs_the_value_from_the_alert_it_triggered(clean):
         event_id="evt-1", subject_id="u1", definition_id="weight_over",
         definition_version=1, event_type="health.weight_over",
         occurred_at=now, detected_at=now,
-        fact_snapshot={"current": 72.0, "previous": 70.0},
+        fact_snapshot={"signal": "health_weight", "current": 72.0, "previous": 70.0},
         source="ios", source_event_id="hk-B",
     ))
 
     hit = s.scrub_event_snapshots(subject_id="u1", signal="health_weight",
-                                  source="ios", source_event_id="hk-B")
+                                  source="ios", source_event_id="hk-B", now=now)
     assert hit == 1, "没找到那条提醒"
 
     raw = conn.execute(
@@ -1170,11 +1282,15 @@ def test_scrubbing_leaves_other_alerts_alone(clean):
             event_id=eid, subject_id=subject, definition_id="weight_over",
             definition_version=1, event_type="health.weight_over",
             occurred_at=now, detected_at=now,
-            fact_snapshot={"current": 72.0}, source="ios", source_event_id=src_id,
+            fact_snapshot={"signal": "health_weight", "current": 72.0},
+            source="ios", source_event_id=src_id,
+            fact_dependencies=({"subject_id": subject, "signal": "health_weight",
+                                "source": "ios", "source_event_id": src_id},),
+            fact_dependencies_complete=True,
         ))
 
     assert s.scrub_event_snapshots(subject_id="u1", signal="health_weight",
-                                   source="ios", source_event_id="hk-B") == 1
+                                   source="ios", source_event_id="hk-B", now=now) == 1
     kept = conn.execute(
         "SELECT event_id FROM perceptkit_event_outbox "
         "WHERE fact_snapshot->>'current' IS NOT NULL ORDER BY event_id"

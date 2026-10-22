@@ -200,6 +200,24 @@ def test_perception_signal_state_uses_snapshot_lane():
     assert entry.lane == reg.SNAPSHOT
 
 
+def test_perceptkit_v010_control_tables_are_explicit_rds_shadow_state():
+    """v0.10 control state stays with the RDS-only shadow until cutover."""
+    tables = {
+        "perceptkit_aggregate_generation",
+        "perceptkit_active_aggregate_generation",
+        "perceptkit_conflict",
+        "perceptkit_definition_history",
+    }
+
+    for table in tables:
+        entry = reg.REGISTRY.get(table)
+        assert entry is not None
+        assert entry.lane == reg.SKIP
+        assert entry.tee_required is False
+        assert "影子期" in entry.reason
+        assert "切换" in entry.reason
+
+
 def test_contract_rejection_stats_uses_mirror_lane_and_reconciler_key():
     from tee_shadow import reconciler
 
