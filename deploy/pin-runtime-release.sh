@@ -5,6 +5,12 @@ set -euo pipefail
 # The push is compare-and-swap: a newer branch head makes this run stop before
 # any CVM mutation. Runner jobs consume the exact emitted commit and never read
 # a moving branch head.
+#
+# Deployment-recovery note (2026-11-08): this comment is the only change in its
+# commit and exists solely to trigger a pre release. The pre database was
+# migrated to 0038 and later 0040 without a matching deploy, leaving the running
+# 335cdd6 workers crash-looping on the schema check, and the sealed
+# CF_API_TOKEN had stopped working. Rotated secrets reach a CVM only on deploy.
 
 branch="${1:?branch is required}"
 main_compose="${2:?main compose path is required}"
