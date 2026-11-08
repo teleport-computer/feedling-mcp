@@ -87,6 +87,7 @@ endif
 		--rpc-url $(RPC_URL) \
 		--private-key $(PRIVATE_KEY) \
 		--broadcast \
+		--gas-estimate-multiplier 400 \
 		-vvv
 
 # -----------------------------------------------------------------------------
