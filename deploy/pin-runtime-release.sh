@@ -16,6 +16,11 @@ set -euo pipefail
 # actually runs, so the deploy jobs were skipped again and prod stayed on the
 # previous release. Nothing this script executes changes here. The gate's
 # range comparison is recorded in the fleet backlog as a pipeline gap.
+#
+# Deployment-recovery note (2026-11-08): this comment is the only change in its
+# commit and exists solely to trigger a release after CF_API_TOKEN was rotated.
+# The token is sealed into each CVM at deploy time, so rotating the repository
+# secret does not reach running ingress containers until the next deploy.
 
 branch="${1:?branch is required}"
 main_compose="${2:?main compose path is required}"
