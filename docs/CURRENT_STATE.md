@@ -46,6 +46,7 @@ canonical_owner: self
 - 主 CVM：ingress、ASGI backend、enclave、pooled `serve-worker` 以及观测辅助服务，具体以对应环境的 `deploy/docker-compose.phala*.yaml` 为准。
 - 独立 V1 runner CVM：`deploy/docker-compose.phala.runner.yaml`、`deploy/docker-compose.phala.pre.runner.yaml`、`deploy/docker-compose.phala.prod.runner.yaml` 中的 `agent-runner`。
 - 用户 VPS：固定执行 `python tools/chat_resident_consumer.py`；这个单文件分发边界不拆分。
+- **pre 环境自 2026-11-09 起暂停**：全部 pre CVM（主 CVM、runner、TEE Postgres、Redis）已 stop，`pre-api.feedling.app` 不可达。CI 的 pre 部署链由 repo variable `PRE_DEPLOY_ENABLED` 控制（默认跳过），`pg-monitor.yml` 只监控 prod。下文和其他文档中关于 pre 的接线描述是暂停前的状态；恢复步骤见 `deploy/DEPLOYMENTS.md` 的 Pre CVM 一节。
 
 仓库 compose 只证明“准备部署什么”。确认“实际运行什么”时，先读环境 `/healthz` 的 `release.git_commit`，再对照该 SHA 的 compose/代码并执行受影响 lane 的真实探针。
 
