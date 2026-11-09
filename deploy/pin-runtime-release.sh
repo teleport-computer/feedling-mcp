@@ -22,6 +22,11 @@ set -euo pipefail
 # The token is sealed into each CVM at deploy time, so rotating the repository
 # secret does not reach running ingress containers until the next deploy.
 
+# Deployment-recovery note (2026-11-09): this comment only exists to start a
+# first-attempt test run. Release e972d15 deployed from a workflow re-run, and
+# compose_publisher refuses to publish from a re-run (run_attempt != 1), so its
+# compose hash was never authorized on Sepolia. Nothing this script does changes.
+
 branch="${1:?branch is required}"
 main_compose="${2:?main compose path is required}"
 runner_compose="${3:?runner compose path is required}"
