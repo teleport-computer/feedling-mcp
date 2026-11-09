@@ -113,6 +113,10 @@ services:
       - "443:443"
     environment:
       DNS_PROVIDER: "cloudflare"
+      # Negative on purpose: reuse persisted certificates that expired less than
+      # 90 days ago so HAProxy starts and the renewal daemon recovers them in the
+      # background. A failed full bootstrap otherwise keeps every domain offline.
+      INGRESS_CERT_MIN_VALIDITY_SEC: "-7776000"
       GATEWAY_DOMAIN: "_.dstack-pha-prod9.phala.network"
       SET_CAA: "true"
       CERTBOT_EMAIL: "security@feedling.app"
