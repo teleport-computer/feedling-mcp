@@ -2341,9 +2341,12 @@ jobs:
               exit 1
             fi
           done
+  # pre 环境 2026-11-09 起暂停（全部 pre CVM 已 stop）。整条 pre 部署链都挂在本
+  # job 下游；默认跳过，避免 push pre 分支时 `phala deploy` 把停掉的 CVM 拉起。
+  # 恢复 pre：把 repo variable PRE_DEPLOY_ENABLED 设为 'true'。
   detect-cvm-changes-pre:
     name: detect CVM changes (pre)
-    if: github.ref == 'refs/heads/pre' && github.event_name == 'push'
+    if: github.ref == 'refs/heads/pre' && github.event_name == 'push' && vars.PRE_DEPLOY_ENABLED == 'true'
     runs-on: ubuntu-24.04
     permissions:
       actions: read
