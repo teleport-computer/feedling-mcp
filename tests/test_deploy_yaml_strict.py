@@ -305,9 +305,15 @@ def _run_ingress_entrypoint(
     upstream = tmp_path / "upstream.sh"
     upstream.write_text("#!/bin/sh\nprintf 'upstream:%s\\n' \"$*\"\n")
     upstream.chmod(0o755)
+    certman = tmp_path / "certman.py"
+    certman.write_text("run(renew, timeout=300)\nrun(probe, timeout=10)\n")
+    cloudflare = tmp_path / "cloudflare.py"
+    cloudflare.write_text('CERTBOT_PACKAGE = "certbot-dns-cloudflare==4.0.0"\n')
     env = {
         **os.environ,
         "DOMAINS": domain,
+        "INGRESS_CERTMAN_SCRIPT": str(certman),
+        "INGRESS_CLOUDFLARE_PROVIDER": str(cloudflare),
         "INGRESS_CERT_ROOT": str(tmp_path / "letsencrypt"),
         "INGRESS_BOOTSTRAP_MARKER": str(tmp_path / "bootstrapped"),
         "INGRESS_VENV_MARKER": str(tmp_path / "venv_bootstrapped"),
@@ -344,6 +350,20 @@ def test_all_ingress_services_reuse_only_valid_matching_persisted_certificates(
     ]
     assert (tmp_path / "bootstrapped").exists()
     assert (tmp_path / "venv_bootstrapped").exists()
+
+
+def test_ingress_lets_certbot_finish_and_tolerates_leftover_challenges(tmp_path):
+    cert, key = _make_certificate(tmp_path, stem="valid", days=30)
+    _run_ingress_entrypoint(
+        tmp_path,
+        certificate=cert,
+        private_key=key,
+        min_validity_sec=7 * 24 * 60 * 60,
+    )
+    assert (tmp_path / "certman.py").read_text() == (
+        "run(renew, timeout=1200)\nrun(probe, timeout=10)\n"
+    )
+    assert "certbot-dns-cloudflare==5.9.0" in (tmp_path / "cloudflare.py").read_text()
 
 
 def test_ingress_does_not_skip_bootstrap_for_expiring_or_mismatched_certificates(
