@@ -60,6 +60,8 @@ services:
         certbot_bin="$${INGRESS_CERTBOT_BIN:-/opt/app-venv/bin/certbot}"
         upstream_entrypoint="$${INGRESS_UPSTREAM_ENTRYPOINT:-/scripts/entrypoint.sh}"
         min_validity="$${INGRESS_CERT_MIN_VALIDITY_SEC:-604800}"
+        certman_script="$${INGRESS_CERTMAN_SCRIPT:-/scripts/certman.py}"
+        cloudflare_provider="$${INGRESS_CLOUDFLARE_PROVIDER:-/scripts/dns_providers/cloudflare.py}"
 
         certificate_is_reusable() {
           local domain="$$1"
@@ -91,6 +93,12 @@ services:
           fi
           echo "Reusing persisted ingress certificates; renewal remains background-managed"
         fi
+
+        # The pinned image kills certbot after 300s, which leaves its challenge
+        # TXT record behind, and its Cloudflare plugin 4.0.0 then fails on that
+        # leftover. Allow a slow renewal to finish; plugin 5.9.0 tolerates it.
+        sed -i.orig 's/timeout=300/timeout=1200/' "$$certman_script"
+        sed -i.orig 's/certbot-dns-cloudflare==4\.0\.0/certbot-dns-cloudflare==5.9.0/' "$$cloudflare_provider"
 
         exec "$$upstream_entrypoint" "$$@"
       - --
