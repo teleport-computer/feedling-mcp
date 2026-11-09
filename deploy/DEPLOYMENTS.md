@@ -410,6 +410,13 @@ only the Python Runtime V2 `serve-worker`.
 
 ### Pre CVM (prod9, `pre` branch)
 
+> ⏸️ **pre 环境自 2026-11-09 起暂停。** `feedling-io-pre`、`feedling-io-agents-pre`、
+> `feedling-io-db-pre`、`feedling-redis-pre` 均已 stop（未删除），`pre-api.feedling.app` 不可达。
+> CI 中整条 pre 部署链（`detect-cvm-changes-pre` 及其下游）由 repo variable
+> `PRE_DEPLOY_ENABLED == 'true'` 控制，默认跳过；`pg-monitor.yml` 已把 pre 移出 matrix。
+> 恢复：先 `phala cvms start` 四个 CVM，再把 `PRE_DEPLOY_ENABLED` 设为 `true`，并把 `pre`
+> 加回 `pg-monitor.yml` matrix。下面的记录保留为暂停前的状态。
+
 Third environment: `pre` branch → `deploy-pre-cvm` CI job → this CVM. It shares
 the test Phala account/key, R2 buckets, runtime-token secret and most feature-flag
 vars (all `TEST_*` references in the CI job are deliberate), while DB, AppAuth
@@ -481,6 +488,8 @@ gate 还必须独立完成 Intel DCAP signature-chain verification，不能把�
 该密码学验证已经完成。
 
 ### Runtime V2 worker CVM (pre, `feedling-io-agents-pre`)
+
+> ⏸️ 自 2026-11-09 起随 pre 环境暂停（CVM 已 stop），见上文 [Pre CVM](#pre-cvm-prod9-pre-branch)。
 
 Mirror of the V2-only test worker CVM for the pre environment.
 
@@ -886,6 +895,8 @@ prod/pre 的 authority 与 selector 必须从各自 exact deployed release 和 l
 破坏 ensure-roles 的 SQL 与 compose 环境注入。
 
 ### Pre TEE Postgres（prod9）
+
+> ⏸️ 自 2026-11-09 起随 pre 环境暂停：`feedling-io-db-pre` 已 stop，`pg-monitor.yml` 不再对其做备份链检查。
 
 | | |
 |---|---|
