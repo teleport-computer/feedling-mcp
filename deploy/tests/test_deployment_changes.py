@@ -318,10 +318,11 @@ def test_workflow_bindings_and_existing_safety_gates():
         ("pre", "detect-cvm-changes-pre"),
     ]:
         j = jobs[key]
-        assert (
-            j["if"]
-            == f"github.ref == 'refs/heads/{branch}' && github.event_name == 'push'"
-        )
+        expected = f"github.ref == 'refs/heads/{branch}' && github.event_name == 'push'"
+        if branch == "pre":
+            # pre 暂停中（2026-11-09）：整条 pre 部署链须由 repo variable 显式开启。
+            expected += " && vars.PRE_DEPLOY_ENABLED == 'true'"
+        assert j["if"] == expected
         assert j["permissions"] == {"actions": "read", "contents": "read"}
         assert j["steps"][0]["with"]["fetch-depth"] == 0
         assert j["outputs"]["cvm"] == "${{ steps.filter.outputs.cvm }}"
