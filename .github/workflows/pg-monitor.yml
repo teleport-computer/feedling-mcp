@@ -1,7 +1,7 @@
 # .github/workflows/pg-monitor.yml — 没有监控 = 没有备份（spec §3）
-# 监控 **prod + pre** TEE Postgres 的 WAL-G 备份链（归档新鲜度 + WAL 堆积 +
-# R2 落地）。test 库数据可弃，故不监控；pre 是发布验收环境，备份失效会让迁移
-# 演练失真，因此与 prod 一起纳入定时检查。
+# 监控 **prod** TEE Postgres 的 WAL-G 备份链（归档新鲜度 + WAL 堆积 +
+# R2 落地）。test 库数据可弃，故不监控。pre 的 CVM 已于 2026-11-09 全部停用，
+# 故从 matrix 移除；重新启用 pre 时把它加回 matrix。
 name: PG backup monitor
 on:
   schedule: [{ cron: '*/30 * * * *' }]
@@ -12,7 +12,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        environment: [prod, pre]
+        environment: [prod]
     steps:
       - uses: actions/checkout@v4
       - name: Install psql 17 (direct TLS 需要 libpq>=17)
