@@ -17,6 +17,11 @@ set -euo pipefail
 # previous release. Nothing this script executes changes here. The gate's
 # range comparison is recorded in the fleet backlog as a pipeline gap.
 
+# Deployment-recovery note (2026-11-09): this comment only exists to start a
+# first-attempt prod run. Release e20166b stopped when a GitHub 504 failed the
+# Foundry install, before any CVM changed. A workflow re-run cannot finish it,
+# because compose_publisher refuses to publish from one (run_attempt != 1).
+
 branch="${1:?branch is required}"
 main_compose="${2:?main compose path is required}"
 runner_compose="${3:?runner compose path is required}"
