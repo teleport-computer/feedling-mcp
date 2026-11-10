@@ -76,6 +76,9 @@ x-agent-runner-env: &agent-runner-env
   R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
   AGENT_RUNTIME_USERS: "${AGENT_RUNTIME_USERS:-}"
   AGENT_RUNTIME_AUTODISCOVER: "${AGENT_RUNTIME_AUTODISCOVER:-}"
+  # Drop users idle this many days (no app session / user message / route
+  # setup) from discovery so their idle consumer exits; 0 = off. Encrypted env.
+  AGENT_RUNTIME_DORMANT_DAYS: "${AGENT_RUNTIME_DORMANT_DAYS:-0}"
   FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
   FEEDLING_HOST_ALL: "${FEEDLING_HOST_ALL:-}"
   # Genesis import worker: this runner is the only place genesis import jobs get
