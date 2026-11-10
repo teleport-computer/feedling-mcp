@@ -10744,7 +10744,7 @@ def list_agent_runtime_enabled_users() -> list[dict]:
         return []
 
 
-def list_agent_runtime_enabled_users_strict() -> list[dict]:
+def list_agent_runtime_enabled_users_strict(*, active_within_days: float = 0) -> list[dict]:
     """有 active route 且该 route test_status='ok'、其 credential 的 provider 能
     fit 的用户都纳入托管（与 hosted/agent_runtime_cutover.resolve_driver 一致——
     不再有 per-user ``agent_runtime_driver`` 开关；kill switch 改用删/换 active
@@ -10765,9 +10765,43 @@ def list_agent_runtime_enabled_users_strict() -> list[dict]:
     Missing/legacy route blobs therefore fail closed instead of silently
     spawning V1 beside a resident consumer.  V2 ownership remains the second,
     independent fence.
+
+    ``active_within_days > 0`` additionally drops dormant users so the runner
+    does not keep an idle resident consumer per long-gone account. A user counts
+    as active when, inside the window, ANY of: an ``app_session_end`` tracking
+    event, a real user chat message (verify_ping / resident_maintenance excluded),
+    or the active route was created / user-tested (fresh onboarding or
+    reconfiguration, before any message exists). A dormant user who comes back
+    and sends a message re-enters on the next supervisor tick; their consumer is
+    respawned and picks the message up. ``0`` (default) disables the filter.
     """
     providers = ["anthropic", "claude", "deepseek", "openai",
                  "gemini", "openrouter", "openai_compatible"]
+    activity_sql = ""
+    params: tuple = (providers,)
+    if active_within_days and active_within_days > 0:
+        cutoff = time.time() - float(active_within_days) * 86400.0
+        activity_sql = """
+              AND (
+                GREATEST(r.created_at, COALESCE(r.last_test_at, r.created_at))
+                  >= to_timestamp(%s)
+                OR EXISTS (
+                  SELECT 1 FROM user_logs ul
+                  WHERE ul.user_id = r.user_id
+                    AND ul.stream = 'tracking_events'
+                    AND ul.ts >= %s
+                    AND ul.doc->>'type' = 'app_session_end'
+                )
+                OR EXISTS (
+                  SELECT 1 FROM chat_messages cm
+                  WHERE cm.user_id = r.user_id
+                    AND cm.ts >= %s
+                    AND cm.doc->>'role' = 'user'
+                    AND COALESCE(cm.doc->>'source', '')
+                          NOT IN ('verify_ping', 'resident_maintenance')
+                )
+              )"""
+        params = (providers, cutoff, cutoff, cutoff)
     with get_pool().connection() as conn:
         rows = conn.execute(
             """
@@ -10800,10 +10834,10 @@ def list_agent_runtime_enabled_users_strict() -> list[dict]:
                 SELECT 1 FROM v2_runtime_state vrs
                 WHERE vrs.user_id = r.user_id
                   AND vrs.hosted_runtime_state IN ('v2', 'draining')
-              )
+              )""" + activity_sql + """
             ORDER BY r.user_id
             """,
-            (providers,),
+            params,
         ).fetchall()
     return [{"user_id": uid, "driver": driver, "provider": provider,
              "model": model, "base_url": base_url,

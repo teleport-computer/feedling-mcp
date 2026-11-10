@@ -3494,6 +3494,7 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
+          AGENT_RUNTIME_DORMANT_DAYS:   ${{ vars.TEST_AGENT_RUNTIME_DORMANT_DAYS }}
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
@@ -3521,6 +3522,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "AGENT_RUNTIME_DORMANT_DAYS=$AGENT_RUNTIME_DORMANT_DAYS" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
           # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
           # runner image pull + boot regularly exceeds it. Poll with our own
@@ -3941,6 +3943,7 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.PRE_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.PRE_AGENT_RUNTIME_AUTODISCOVER }}
+          AGENT_RUNTIME_DORMANT_DAYS:   ${{ vars.PRE_AGENT_RUNTIME_DORMANT_DAYS }}
           FEEDLING_HOST_ALL:            ${{ vars.PRE_FEEDLING_HOST_ALL }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
@@ -3968,6 +3971,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "AGENT_RUNTIME_DORMANT_DAYS=$AGENT_RUNTIME_DORMANT_DAYS" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
           # phala deploy --wait has a fixed 300-second ceiling; runner image
           # pulls routinely exceed it. Use the repo's explicit bounded poll.
@@ -4152,6 +4156,7 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
+          AGENT_RUNTIME_DORMANT_DAYS:    ${{ vars.AGENT_RUNTIME_DORMANT_DAYS }}
           FEEDLING_HOST_ALL:             ${{ vars.FEEDLING_HOST_ALL }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
@@ -4189,6 +4194,7 @@ jobs:
               -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
               -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
               -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+              -e "AGENT_RUNTIME_DORMANT_DAYS=$AGENT_RUNTIME_DORMANT_DAYS" \
               -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
             # NOT --wait: the CLI's readiness wait is hard-capped at 300s and
             # the runner image pull + boot regularly exceeds it. Poll with our
