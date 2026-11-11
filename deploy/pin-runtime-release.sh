@@ -22,10 +22,9 @@ set -euo pipefail
 # The token is sealed into each CVM at deploy time, so rotating the repository
 # secret does not reach running ingress containers until the next deploy.
 
-# Deployment-recovery note (2026-11-11): this comment only exists to start a
-# first-attempt test run. Release 725bb4a's test runner deploy failed before
-# touching the CVM (foundry install got a GitHub 502), and a workflow re-run may
-# not publish (run_attempt != 1). Nothing this script does changes.
+# Release-trigger note (2026-11-11): this comment only exists to start a fresh
+# prod release so the runner picks up AGENT_RUNTIME_DORMANT_DAYS=14 (repo var,
+# encrypted env; var changes alone do not deploy). Nothing this script does changes.
 
 # Deployment-recovery note (2026-11-09): this comment only exists to start a
 # first-attempt prod run. Release e20166b stopped when a GitHub 504 failed the
