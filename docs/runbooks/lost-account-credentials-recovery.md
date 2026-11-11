@@ -18,6 +18,128 @@ dry-run mode before using this procedure on production.
 
 ## Recovery boundary
 
+### Plaintext TEE-primary import into a new UID
+
+If the requested outcome is to retain the **new** UID, inspect the live database
+contract first. The credential-reassignment procedure below retains the old UID
+and does not implement that outcome. On a verified `tee` primary with
+`FEEDLING_PLAINTEXT_WRITES_ACCEPTED=1`, plaintext content can instead be copied
+with `tools/import_plaintext_account_content.py` inside the backend container.
+This tool is distinct from the same-public-key orphan migration.
+
+Its default invocation is read-only and verifies every attachment's size and
+SHA-256. It imports chat, memory, and identity; `--include-settings` also copies
+`proactive_settings` and `web_settings`. It preserves source rows and both user
+documents, including credentials and public keys. Sealed or `local_only`
+material in the selected content fails closed. Provider credentials, model
+routes, MCP configuration, perception/frame history, import checkpoints,
+runtime state, and logs are outside its scope and require separate review.
+
+Attachments must be copied into the destination UID's object-storage prefix;
+reusing the source pointer fails the ownership check. The tool allocates fresh
+versioned keys in the destination storage generation and verifies copied bytes.
+Its database transaction fences concurrent writes and refuses to proceed when
+the source/destination snapshot differs from the reviewed `--expected-plan`.
+The plan contains counts and a digest, never content or credentials.
+For a new destination without a chat-object lifecycle row, the plan reports
+initialization at generation zero; only the apply transaction creates that row.
+Concurrent lifecycle initialization invalidates the reviewed plan.
+
+Before applying, establish ownership, approve the concrete import scope, and
+review the dry-run plan with another operator. Supply `--operator`, `--ticket`,
+`--backup-dir` (existing mode `0700` directory), `--expected-plan`, and `--apply`.
+The backup is mode `0600` and contains both users, source content, and overwritten
+destination settings. Keep it inside the protected production environment.
+Production application requires final confirmation after plan review.
+
+After application, verify counts, source preservation, destination ownership,
+attachment access, unchanged credential/public-key documents, and functional
+history/Memory Garden/identity checks in the App. Reopen the App before checking.
+Do not rerun an import after a committed or ambiguous result: the destination is
+no longer empty. Investigate from the protected backup and database first.
+On failure, copied objects are retained because a COMMIT response may be lost;
+cleanup and rollback require a separately reviewed manifest-based operation.
+
+Synthetic integration checks:
+
+```bash
+ACCOUNT_IMPORT_TEST_DSN=<isolated-local-pg-dsn> \
+  python3 tests/test_import_plaintext_account_content.py -v
+```
+
+### Expanded copy into the new UID
+
+Use `tools/import_full_account_content.py` only after explicitly reviewing the
+expanded scope. Run it inside the backend of a verified plaintext TEE primary.
+The default is read-only, including every external object's full SHA-256 check
+and an enclave decrypt/reseal/decrypt roundtrip for each selected sealed
+envelope. It never accepts raw user credentials or private keys.
+
+The explicit allowlist covers live and archived chat, memories, world book,
+perception items and daily history, authoritative `frame_envelopes`, model
+credentials and routes, terminal genesis import jobs and outputs, identity,
+persona/voice, MCP and user settings. Model UUIDs are remapped together with
+their foreign keys. Sealed envelopes receive fresh body keys and wraps for the
+destination public key and current enclave, with destination-owner AAD.
+Objects are copied into the destination UID's prefix and read back to verify.
+The legacy `frames` mirror is not an additional source of business history.
+PerceptKit's `subject_id`-owned observations, daily aggregates, deduplication
+identities, ingest receipts, retractions and calendar/reminder mirrors are
+included too. Its current-value projection, rule/sync state and delivery outbox
+are preserved on the destination rather than replayed from the source.
+
+Existing destination perception history is retained; colliding primary keys
+fail closed. For daily aggregates only, the explicitly reviewed
+`--archive-aggregate-conflicts` policy may retain the destination's display
+values and preserve complete conflicting source rows in the destination's
+`account_import_aggregate_history` blob. This is preservation, not arithmetic
+merging: trends on those dates still show the destination values. Use it when
+source observations are incomplete or overlap and recomputation cannot be
+proven correct. The plan reports the archived count and display policy.
+Core destination content/configuration must be empty. Selected
+settings and frame indexes are explicitly shown in the overwrite plan.
+Capture progress is mapped from the source watermark to newly assigned live
+chat sequence numbers; dream watermarks are retained without pending/error
+state. Both complete user documents, device tokens, current device observations,
+runtime ownership/allowlists and runtime profile remain unchanged. Logs, old
+worker state, consumed staging tombstones and legacy model configuration
+projections remain with the source and are not replayed.
+
+The final plan includes a policy version and snapshot token. Production apply
+requires another operator's review and final confirmation of that plan, then
+`--expected-plan`, `--operator`, `--ticket`, an existing mode `0700`
+`--backup-dir` inside the protected production environment, and `--apply`.
+The mode `0600` backup contains both users, both selected database snapshots,
+and source-object manifests. A separate mode `0600` append-only upload journal
+records destination object keys, sizes and hashes as copies finish. Journal
+records are serialized while at most six objects are copied and verified
+concurrently. All copy workers finish before the database write fence begins.
+A short table write fence rechecks the complete snapshot before inserts.
+Source preservation, exact destination rows, unchanged
+user documents and selected blob values are checked within the transaction and
+again after commit. Policy v2 excludes only the idle source capture loop's
+`capture_state.updated_at` from the snapshot token: it is not imported, while
+the actual capture watermark and every other field remain guarded. This avoids
+an idle timestamp refresh invalidating a large copy. Real chat insert triggers rebuild the chat change stream;
+transactional wake notifications refresh the affected store sections.
+
+An ambiguous commit or postflight failure must be investigated from the backup;
+never rerun apply blindly or delete uploaded objects. Any rollback or orphan
+object cleanup needs a separate manifest-based review. Keep the App closed
+during the final plan/apply interval; source or destination changes invalidate
+the reviewed token. Afterward reopen the App and verify chat, memory, persona,
+world book, images, MCP and model operation before declaring recovery complete.
+
+Synthetic integration checks (real PostgreSQL, real envelope crypto, production
+chat change triggers):
+
+```bash
+ACCOUNT_IMPORT_TEST_DSN=<isolated-local-pg-dsn> \
+  python3 tests/test_import_full_account_content.py -v
+```
+
+### Encrypted lost-credential recovery preserving the old UID
+
 The recovery preserves the old account and reuses the current device's newly
 generated credentials:
 
