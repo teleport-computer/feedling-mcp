@@ -57,6 +57,11 @@ historical_reason: point-in-time
 
 ## Unreleased
 
+- pre 环境自 2026-11-09 起暂停：四个 pre CVM 已 stop（未删除）。CI 的 pre 部署链
+  改由 repo variable `PRE_DEPLOY_ENABLED == 'true'` 开启，默认跳过，避免 push `pre`
+  分支时 `phala deploy` 把停掉的 CVM 拉起（main #851/#852，pre #853）；`pg-monitor.yml`
+  把 pre 移出 matrix，避免每 30 分钟产生预期内失败。恢复步骤见 `deploy/DEPLOYMENTS.md`。
+
 - `GET /v1/chat/canvases` now includes agent-authored `.io.html` Chat cards
   from Resident and self-hosted delivery alongside workspace entries. Workspace
   entries win identical filenames; the combined result keeps the newest 500.

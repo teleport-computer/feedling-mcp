@@ -46,12 +46,17 @@ corruption is not treated as a sealed-data exclusion.
 
 For an attachment actually used by the turn, an omitted body or image placeholder
 is insufficient. A bounded canonical plaintext read verifies the same owner,
-message, sequence and storage version before media processing. Reads remain in
+message, sequence and content version before media processing. A one-way move
+from inline plaintext into an owned object is accepted only when actual object
+bytes, length and digest equal the original inline content, with every
+non-storage field unchanged. A pointer replacement is not this storage
+promotion. Reads remain in
 the original operation budget and do not retry or expand the page. Media uses
 the validated bytes; the bytes are not added to the recall query. The authenticated
 Resident response binds required attachment bytes through `required_attachments`
 (`id`, `seq`, `sha256`), which the consumer checks against its own validated input.
-A changed source, missing body or integrity failure stops the turn.
+Changed content, captions, media types, ownership, pointer replacements, missing
+bodies or integrity failures stop the turn.
 
 
 The request body remains limited to 1024 bytes, including streamed requests.

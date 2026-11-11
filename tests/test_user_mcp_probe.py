@@ -1,4 +1,6 @@
 import json
+import threading
+import time
 import sys
 from pathlib import Path
 
@@ -792,3 +794,68 @@ def test_first_reachable_ip_returns_first_success_and_stops(monkeypatch):
     chosen = mcp_probe._first_reachable_ip([_V6, "8.8.8.8", "1.1.1.1"], 443)
     assert chosen == "8.8.8.8"
     assert probed == [_V6, "8.8.8.8"]   # stopped before 1.1.1.1
+
+
+# T833: the save/test deadline includes initial DNS resolution.
+def test_probe_dns_is_inside_the_existing_wall_deadline(monkeypatch):
+    released = threading.Event()
+    entered = threading.Event()
+    network_started = []
+
+    def slow_dns(_host):
+        entered.set()
+        assert released.wait(1.0), "fixture DNS release was not delivered"
+        return ["93.184.216.34"]
+
+    async def exchange(*_args):
+        network_started.append(True)
+        return {"ok": True}
+
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", slow_dns)
+    monkeypatch.setattr(mcp_probe, "_probe_async", exchange)
+    monkeypatch.setattr(mcp_probe, "_WALL_TIMEOUT", 0.03)
+    # Finite release makes the old synchronous path fail deterministically
+    # instead of hanging the test. No DNS or MCP traffic leaves this process.
+    timer = threading.Timer(0.25, released.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        with pytest.raises(mcp_probe.ProbeError) as exc:
+            mcp_probe.probe("https://fixture.invalid/mcp", {})
+        assert exc.value.kind == "timeout"
+        assert entered.is_set()
+        assert time.monotonic() - started < 0.20
+        assert not network_started
+    finally:
+        released.set()
+        timer.cancel()
+        timer.join()
+
+
+@pytest.mark.parametrize("url,kind", [
+    ("https://127.0.0.1/mcp", "unreachable_from_backend"),
+    ("file:///fixture", "blocked_url"),
+])
+def test_probe_still_rejects_unsafe_targets_before_exchange(monkeypatch, url, kind):
+    async def forbidden_exchange(*_args):
+        pytest.fail("SSRF refusal must precede any MCP exchange")
+
+    monkeypatch.setattr(mcp_probe, "_probe_async", forbidden_exchange)
+    with pytest.raises(mcp_probe.ProbeError) as exc:
+        mcp_probe.probe(url, {})
+    assert exc.value.kind == kind
+
+
+@pytest.mark.parametrize("failure,kind", [
+    (mcp_probe.net_safety.ResolverBusy, "dns_busy"),
+    (mcp_probe.net_safety.ResolverUnavailable, "dns"),
+])
+def test_probe_resolver_unavailability_is_a_known_error(monkeypatch, failure, kind):
+    async def unavailable(*_args):
+        raise failure("fixture-secret-not-for-the-client")
+
+    monkeypatch.setattr(mcp_probe.net_safety, "run_on_dns_executor", unavailable)
+    with pytest.raises(mcp_probe.ProbeError) as exc:
+        mcp_probe.probe("https://fixture.invalid/mcp", {})
+    assert exc.value.kind == kind
+    assert "fixture-secret" not in str(exc.value)

@@ -56,7 +56,18 @@ def test_db_statement_timeout_uses_remaining_budget():
     assert calls==["SET LOCAL statement_timeout = '500ms'", "SET LOCAL lock_timeout = '500ms'", 'SELECT 1']
 
 
-def test_coordinator_real_transport_block_late_result_never_upgrades(tmp_path):
+def test_coordinator_real_transport_block_late_result_never_upgrades(tmp_path, monkeypatch):
+    from tools.release_window import coordinator
+
+    recovery_written = threading.Event()
+    write_private_json = coordinator._write_private_json
+
+    def record_write_completion(path, body):
+        write_private_json(path, body)
+        if path == tmp_path / 'late-worker-recovery.json':
+            recovery_written.set()
+
+    monkeypatch.setattr(coordinator, '_write_private_json', record_write_completion)
     local,peer=socket.socketpair(); headers=threading.Event();release=threading.Event(); done=threading.Event()
     class Backend:
         def connect_tcp(self,*args,**kwargs): return SyncStream(local)
@@ -85,9 +96,8 @@ def test_coordinator_real_transport_block_late_result_never_upgrades(tmp_path):
         assert result['status']=='INCOMPLETE' and result['io_status']=='IO_UNCONFIRMED'
         terminal=(tmp_path/'coordinator-terminal.json').read_bytes()
         release.set();assert done.wait(2)
-        for _ in range(100):
-            if (tmp_path/'late-worker-recovery.json').exists():break
-            time.sleep(.01)
+        # File creation precedes serialization; wait for the real writer to return.
+        assert recovery_written.wait(2)
         assert json.loads((tmp_path/'late-worker-recovery.json').read_text())['status']=='RECOVERY_ONLY_NOT_ACCEPTANCE'
         assert (tmp_path/'coordinator-terminal.json').read_bytes()==terminal
         assert list(tmp_path.glob('owned-recovery-*.json'))

@@ -121,6 +121,10 @@ services:
       - "443:443"
     environment:
       DNS_PROVIDER: "cloudflare"
+      # Negative on purpose: reuse persisted certificates that expired less than
+      # 90 days ago so HAProxy starts and the renewal daemon recovers them in the
+      # background. A failed full bootstrap otherwise keeps every domain offline.
+      INGRESS_CERT_MIN_VALIDITY_SEC: "-7776000"
       GATEWAY_DOMAIN: "_.dstack-pha-prod9.phala.network"
       SET_CAA: "true"
       CERTBOT_EMAIL: "security@feedling.app"
@@ -156,7 +160,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:c678514
+    image: &enclave-image ghcr.io/teleport-computer/feedling:59e9348
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -255,7 +259,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:c678514
+    image: ghcr.io/teleport-computer/feedling:59e9348
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -457,7 +461,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:c678514
+    image: ghcr.io/teleport-computer/feedling:59e9348
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -594,7 +598,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:c678514
+    image: ghcr.io/teleport-computer/feedling:59e9348
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped
@@ -624,7 +628,7 @@ services:
         condition: service_healthy
 
   log-shipper:
-    image: ghcr.io/teleport-computer/feedling:c678514
+    image: ghcr.io/teleport-computer/feedling:59e9348
     container_name: log-shipper
     command: ["python", "-u", "ops/log_shipper.py"]
     restart: unless-stopped

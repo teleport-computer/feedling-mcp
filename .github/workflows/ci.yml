@@ -358,7 +358,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install --require-hashes -r backend/requirements.lock
-          pip install requests  # test-only
+          pip install requests 'moto[s3]==5.2.4'  # test-only
 
       - name: Validate changed document lifecycle
         if: ${{ github.event_name != 'workflow_dispatch' }}
@@ -587,6 +587,7 @@ jobs:
             tests/test_recall_resident_identity.py \
             tests/test_recall_references.py \
             tests/test_recall_attachments.py \
+            tests/test_photo_offload_recall_race.py \
             tests/test_recall_observability.py \
             tests/test_memory_vectors_route_pg.py \
             tests/test_garden_selection_pluggable.py \
@@ -3496,6 +3497,7 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.TEST_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.TEST_AGENT_RUNTIME_AUTODISCOVER }}
+          AGENT_RUNTIME_DORMANT_DAYS:   ${{ vars.TEST_AGENT_RUNTIME_DORMANT_DAYS }}
           FEEDLING_HOST_ALL:            ${{ vars.TEST_FEEDLING_HOST_ALL }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
@@ -3523,6 +3525,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "AGENT_RUNTIME_DORMANT_DAYS=$AGENT_RUNTIME_DORMANT_DAYS" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
           # NOT --wait: the CLI's readiness wait is hard-capped at 300s and the
           # runner image pull + boot regularly exceeds it. Poll with our own
@@ -3943,6 +3946,7 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.TEST_FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:          ${{ secrets.PRE_AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:   ${{ vars.PRE_AGENT_RUNTIME_AUTODISCOVER }}
+          AGENT_RUNTIME_DORMANT_DAYS:   ${{ vars.PRE_AGENT_RUNTIME_DORMANT_DAYS }}
           FEEDLING_HOST_ALL:            ${{ vars.PRE_FEEDLING_HOST_ALL }}
         run: |
           echo ">>> deploy-runner-cvm target: $CVM_ID"
@@ -3970,6 +3974,7 @@ jobs:
             -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
             -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
             -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+            -e "AGENT_RUNTIME_DORMANT_DAYS=$AGENT_RUNTIME_DORMANT_DAYS" \
             -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
           # phala deploy --wait has a fixed 300-second ceiling; runner image
           # pulls routinely exceed it. Use the repo's explicit bounded poll.
@@ -4154,6 +4159,7 @@ jobs:
           FEEDLING_RUNTIME_TOKEN_SECRET: ${{ secrets.FEEDLING_RUNTIME_TOKEN_SECRET }}
           AGENT_RUNTIME_USERS:           ${{ secrets.AGENT_RUNTIME_USERS }}
           AGENT_RUNTIME_AUTODISCOVER:    ${{ vars.AGENT_RUNTIME_AUTODISCOVER }}
+          AGENT_RUNTIME_DORMANT_DAYS:    ${{ vars.AGENT_RUNTIME_DORMANT_DAYS }}
           FEEDLING_HOST_ALL:             ${{ vars.FEEDLING_HOST_ALL }}
         run: |
           if [ -z "$DATABASE_URL" ]; then
@@ -4191,6 +4197,7 @@ jobs:
               -e "FEEDLING_RUNTIME_TOKEN_SECRET=$FEEDLING_RUNTIME_TOKEN_SECRET" \
               -e "AGENT_RUNTIME_USERS=$AGENT_RUNTIME_USERS" \
               -e "AGENT_RUNTIME_AUTODISCOVER=$AGENT_RUNTIME_AUTODISCOVER" \
+              -e "AGENT_RUNTIME_DORMANT_DAYS=$AGENT_RUNTIME_DORMANT_DAYS" \
               -e "FEEDLING_HOST_ALL=$FEEDLING_HOST_ALL"
             # NOT --wait: the CLI's readiness wait is hard-capped at 300s and
             # the runner image pull + boot regularly exceeds it. Poll with our

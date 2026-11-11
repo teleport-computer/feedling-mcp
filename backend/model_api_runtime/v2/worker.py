@@ -5168,6 +5168,7 @@ def _note_provider_attempt(
             provider=provider,
             model=model,
             lane=lane,
+            cache_diagnostic=usage.get("cache_diagnostic"),
             input_tokens=usage.get("prompt_tokens"),
             output_tokens=usage.get("completion_tokens"),
             error_class=str(payload.get("error_class") or "") if failed else "",

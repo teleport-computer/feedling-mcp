@@ -852,9 +852,6 @@ def probe(url: str, headers: dict, *, ca_pem: str | None = None,
     is the MCP transport to try first ("sse"/"http"/""); the result's
     ``transport`` key reports what actually worked.
     """
-    kind = blocked_url_kind(url)
-    if kind in ("blocked_url", "dns", "unreachable_from_backend"):
-        raise ProbeError(kind, urlparse(url).hostname or "")
     return asyncio.run(_probe_bounded(url, headers, ca_pem, transport, transport_hint))
 
 
@@ -865,10 +862,24 @@ async def _probe_bounded(url: str, headers: dict, ca_pem: str | None,
     through the ``async with httpx.AsyncClient`` in ``_probe_async``, so the
     connection is closed, not leaked. The wall clock covers BOTH transport
     attempts when detection falls back — 45s total, not 45s per attempt."""
+    async def validated_probe():
+        # The initial SSRF/DNS check is part of the connection test too. A
+        # synchronous getaddrinfo before wait_for could hold "Save and test"
+        # indefinitely without ever starting the advertised wall deadline.
+        # Reuse the bounded DNS executor; cancelling this waiter must not wait
+        # for a native resolver thread or occupy the shared default executor.
+        try:
+            kind = await net_safety.run_on_dns_executor(blocked_url_kind, url)
+        except net_safety.ResolverBusy:
+            raise ProbeError("dns_busy", "resolver capacity exhausted") from None
+        except net_safety.ResolverUnavailable:
+            raise ProbeError("dns", "DNS resolver unavailable") from None
+        if kind is not None:
+            raise ProbeError(kind, urlparse(url).hostname or "")
+        return await _probe_async(url, headers, ca_pem, transport, transport_hint)
+
     try:
-        return await asyncio.wait_for(
-            _probe_async(url, headers, ca_pem, transport, transport_hint),
-            timeout=_WALL_TIMEOUT)
+        return await asyncio.wait_for(validated_probe(), timeout=_WALL_TIMEOUT)
     except asyncio.TimeoutError:
         raise ProbeError("timeout", f"no reply within {_WALL_TIMEOUT:.0f}s wall clock")
 

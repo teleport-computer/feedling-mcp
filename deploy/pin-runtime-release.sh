@@ -16,6 +16,16 @@ set -euo pipefail
 # actually runs, so the deploy jobs were skipped again and prod stayed on the
 # previous release. Nothing this script executes changes here. The gate's
 # range comparison is recorded in the fleet backlog as a pipeline gap.
+#
+# Deployment-recovery note (2026-11-08): this comment is the only change in its
+# commit and exists solely to trigger a release after CF_API_TOKEN was rotated.
+# The token is sealed into each CVM at deploy time, so rotating the repository
+# secret does not reach running ingress containers until the next deploy.
+
+# Deployment-recovery note (2026-11-11): this comment only exists to start a
+# first-attempt test run. Release 725bb4a's test runner deploy failed before
+# touching the CVM (foundry install got a GitHub 502), and a workflow re-run may
+# not publish (run_attempt != 1). Nothing this script does changes.
 
 # Deployment-recovery note (2026-11-09): this comment only exists to start a
 # first-attempt prod run. Release e20166b stopped when a GitHub 504 failed the

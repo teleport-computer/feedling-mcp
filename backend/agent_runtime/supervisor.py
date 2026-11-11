@@ -26,6 +26,7 @@ Env:
   AGENT_LEASE_TTL_SEC   lease TTL / heartbeat budget (default 60)
   AGENT_TICK_INTERVAL_SEC  loop interval (default 15)
   AGENT_MAX_SPAWNS_PER_TICK  new consumers spawned per tick (default 8; 0=unlimited)
+  AGENT_RUNTIME_DORMANT_DAYS  drop users idle this many days from discovery (0=off)
   AGENT_ENVELOPE_REFETCH_SEC  provider-key envelope cache TTL (default 300; 0=off)
   AGENT_RESOLVE_CONCURRENCY  per-tick roster-resolution fan-out (default 8; 1=serial)
   AGENT_RUNTIME_ISOLATION  process (default) | container
@@ -1083,13 +1084,33 @@ def _discover_enabled() -> dict[str, dict]:
     No per-user flag required — aligned with hosted/agent_runtime_cutover.resolve_driver.
     Unconditional: the LiteLLM gateway is retired, so every fit provider (including
     gemini/openrouter/openai_compatible, discovered as the pi driver) is discovered
-    every time — no include_gateway/include_pi flags."""
+    every time — no include_gateway/include_pi flags.
+
+    ``AGENT_RUNTIME_DORMANT_DAYS`` (>0) also drops users with no app session /
+    user message / route setup in that many days, so their idle consumer is
+    terminated via the normal left-the-roster path; they re-enter on the next
+    tick after they come back. Unset/0/invalid = no dormancy filter."""
+    dormant_days = _dormant_days()
+    rows = (db.list_agent_runtime_enabled_users_strict(active_within_days=dormant_days)
+            if dormant_days > 0 else db.list_agent_runtime_enabled_users_strict())
     return {u["user_id"]: {"driver": u["driver"], "provider": u.get("provider", ""),
                            "model": u.get("model", ""), "base_url": u.get("base_url", ""),
                            "supports_responses": bool(u.get("supports_responses", False)),
                            "reasoning_effort": u.get("reasoning_effort", ""),
                            "vision_test_status": u.get("vision_test_status", "untested")}
-            for u in db.list_agent_runtime_enabled_users_strict()}
+            for u in rows}
+
+
+def _dormant_days() -> float:
+    raw = os.environ.get("AGENT_RUNTIME_DORMANT_DAYS", "").strip()
+    if not raw:
+        return 0.0
+    try:
+        days = float(raw)
+    except ValueError:
+        log.warning("invalid AGENT_RUNTIME_DORMANT_DAYS=%r; dormancy filter off", raw)
+        return 0.0
+    return days if days > 0 else 0.0
 
 
 def _apply_discovery(roster: list[dict], enabled: dict[str, dict]) -> list[dict]:

@@ -511,3 +511,51 @@ def test_envelopes_allows_api_key(client, monkeypatch):
     _, key = _register(client)
     r = client.get("/v1/mcp/envelopes", headers={"X-API-Key": key})
     assert r.status_code == 200, r.get_data(as_text=True)
+
+
+def test_test_endpoint_returns_timeout_when_initial_dns_stalls(client, monkeypatch):
+    """Real route/core/probe reaches a typed error without contacting a server."""
+    import threading
+    from core import enclave as core_enclave
+    from hosted import mcp_core, mcp_probe
+
+    real_check = mcp_probe.blocked_url_kind
+    _fake_envelope(monkeypatch)
+    monkeypatch.setattr(mcp_probe, "blocked_url_kind", real_check)
+    monkeypatch.setattr(mcp_core, "_user_driver", lambda *_: "")
+    monkeypatch.setattr(
+        core_enclave, "_decrypt_envelope_via_enclave",
+        lambda *_args, **_kwargs: json.dumps({
+            "url": "https://fixture.invalid/mcp", "headers": {},
+        }).encode(),
+    )
+    released = threading.Event()
+
+    def stalled_dns(_host):
+        assert released.wait(1.0)
+        return ["93.184.216.34"]
+
+    async def forbidden_exchange(*_args):
+        pytest.fail("DNS timeout must finish before the MCP exchange")
+
+    monkeypatch.setattr(mcp_probe, "_resolve_ips", stalled_dns)
+    monkeypatch.setattr(mcp_probe, "_probe_async", forbidden_exchange)
+    monkeypatch.setattr(mcp_probe, "_WALL_TIMEOUT", 0.03)
+    _, key = _register(client)
+    headers = {"X-API-Key": key}
+    saved = client.post("/v1/mcp/servers", headers=headers, json={
+        "name": "fixture", "url": "https://fixture.invalid/mcp", "headers": {},
+    })
+    assert saved.status_code == 200
+    timer = threading.Timer(0.25, released.set)
+    timer.start()
+    try:
+        response = client.post("/v1/mcp/servers/fixture/test", headers=headers)
+        assert response.status_code == 400
+        assert response.get_json()["error"]["kind"] == "timeout"
+        # A failed test must not remove the already-saved configuration.
+        assert client.get("/v1/mcp/servers", headers=headers).get_json()["servers"][0]["name"] == "fixture"
+    finally:
+        released.set()
+        timer.cancel()
+        timer.join()

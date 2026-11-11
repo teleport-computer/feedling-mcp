@@ -1583,3 +1583,186 @@ def test_usage_normalization_keeps_unreported_cache_metrics_unknown(
     assert usage["cache_read_tokens"] is None
     assert usage["cache_write_tokens"] is None
     assert usage["cache_miss_tokens"] is None
+
+
+def test_host_prefix_baselines_ranges_and_no_content_output():
+    import provider_cache_diagnostics as diag
+    tracker = diag.PrefixTracker()
+    def compare(payload, provider="openai", model="fixture", scope="user-route-one"):
+        return tracker.finish(tracker.begin(scope), payload, provider, model)
+    payload = {"messages": [{"role": "system", "content": "PRIVATE-SYSTEM"}, {"role": "user", "content": "old-tail"}]}
+    assert compare(payload)["status"] == "baseline"
+    assert compare(payload)["changed"] is False
+    payload["messages"][1]["content"] = "new-tail"
+    assert compare(payload)["changed"] is False  # scope explicitly excludes history
+    payload["messages"][0]["content"] = "CHANGED-PRIVATE"
+    assert compare(payload)["changed"] is True
+    assert compare(payload, scope="other-user")["status"] == "baseline"
+    assert compare(payload, model="new-model")["status"] == "baseline"
+    assert compare({"messages": [{"role": "user", "content": "no-system"}]})["changed"] is None
+    assert compare(payload)["status"] == "baseline"  # unsupported clears baseline
+    for provider, body, expected in [
+        ("anthropic", {"system": [{"text": "secret"}]}, "anthropic_system"),
+        ("bedrock", {"system": [{"text": "secret"}]}, "bedrock_system"),
+        ("gemini", {"systemInstruction": {"parts": [{"text": "secret"}]}}, "gemini_system_instruction"),
+        ("openai", {"instructions": "secret"}, "openai_responses_instructions"),
+    ]:
+        result = compare(body, provider)
+        assert result["range"] == expected and result["status"] == "baseline"
+        assert compare(body, provider)["changed"] is False
+        assert "secret" not in json.dumps(result)
+    assert all(set(row) == {"active", "overlap", "baseline", "time"} for row in tracker._entries.values())
+
+
+def test_host_prefix_ttl_capacity_overlap_and_failed_comparison(monkeypatch):
+    import provider_cache_diagnostics as diag
+    now = [0.0]
+    tracker = diag.PrefixTracker(capacity=1, ttl=10, clock=lambda: now[0])
+    payload = {"messages": [{"role": "system", "content": "x"}]}
+    first = tracker.begin("a")
+    second = tracker.begin("a")
+    assert tracker.begin("b") is None  # active state never evicted
+    assert tracker.finish(first, payload)["status"] == "overlap"
+    assert tracker.finish(second, payload)["status"] == "overlap"
+    assert tracker.finish(tracker.begin("a"), payload)["status"] == "baseline"
+    assert tracker.finish(tracker.begin("a"), payload)["status"] == "same"
+    now[0] = 11
+    assert tracker.finish(tracker.begin("a"), payload)["status"] == "baseline"
+    tracker.finish(tracker.begin("b"), payload)
+    assert list(tracker._entries) == ["b"]
+    ticket = tracker.begin("b")
+    monkeypatch.setattr(diag, "system_prefix", lambda *a: (_ for _ in ()).throw(ValueError("secret")))
+    assert tracker.finish(ticket, payload)["status"] == "unmeasured"
+    assert ticket["entry"]["active"] == 0 and ticket["entry"]["baseline"] is None
+
+
+def test_async_cache_diagnostic_uses_actual_wire_not_host_messages(monkeypatch):
+    import provider_cache_diagnostics as diag
+    tracker = diag.PrefixTracker()
+    monkeypatch.setattr(diag, "prefix_tracker", tracker)
+    calls = []
+    async def post(url, *, json, **kwargs):
+        calls.append(copy.deepcopy(json))
+        return httpx.Response(200, json={"choices": [{"message": {"role": "assistant", "content": "ok"}}],
+                                       "usage": {"prompt_tokens": 10, "prompt_tokens_details": {"cached_tokens": 0}}})
+    class Client:
+        pass
+    client = Client()
+    client.post = post
+    monkeypatch.setattr(pc, "_async_http_client", lambda: client)
+    # Validate egress offline: no DNS/network needed in a synthetic protocol test.
+    monkeypatch.setattr(pc, "validate_config", lambda *a: ("openai_compatible", "fixture", "https://fixture.invalid/v1"))
+    config = pc.ProviderConfig("openai_compatible", "fixture", "SECRET-KEY", capture_attempt_trace=True, prompt_cache_key="opaque-user-route")
+    async def run():
+        messages = [{"role": "system", "content": "host-system"}, {"role": "user", "content": "PRIVATE-CHAT"}]
+        original = pc._build_openai_compat_payload
+        def builder(**kwargs):
+            payload = copy.deepcopy(original(**kwargs))
+            payload["messages"][0]["content"] = "wire-one" if len(calls) == 0 else "wire-two"
+            return payload
+        monkeypatch.setattr(pc, "_build_openai_compat_payload", builder)
+        first = await pc.chat_completion_async(config, messages)
+        second = await pc.chat_completion_async(config, messages)
+        assert first["usage"]["cache_diagnostic"]["prefix"]["status"] == "baseline"
+        evidence = diag.project(second["usage"]["cache_diagnostic"])
+        assert evidence["prefix"]["changed"] is True
+        assert evidence["normalized"]["cache_read_tokens"] == 0
+        assert not any(secret in json.dumps(evidence) for secret in ["PRIVATE-CHAT", "SECRET-KEY", "wire-two", "opaque-user-route", "fixture.invalid"])
+    asyncio.run(run())
+
+
+def test_async_prefix_cancellation_and_diagnostic_error_do_not_change_business(monkeypatch):
+    import provider_cache_diagnostics as diag
+    tracker = diag.PrefixTracker()
+    monkeypatch.setattr(diag, "prefix_tracker", tracker)
+    config = pc.ProviderConfig("openai", "fixture", "secret", capture_attempt_trace=True, prompt_cache_key="route")
+    async def cancelled(*a, **kw):
+        raise asyncio.CancelledError()
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", cancelled)
+    async def run_cancel():
+        with pytest.raises(asyncio.CancelledError):
+            await pc.chat_completion_async(config, [])
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
+    asyncio.run(run_cancel())
+    assert tracker._entries["route"]["active"] == 0
+    error = pc.ProviderError("original")
+    async def failure(*a, **kw):
+        raise error
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", failure)
+    async def run_error():
+        with pytest.raises(pc.ProviderError) as got:
+            await pc.chat_completion_async(config, [])
+        assert got.value is error
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
+    asyncio.run(run_error())
+    async def ok(*a, **kw):
+        return {"reply": "ok", "usage": {"cache_diagnostic": {}}}
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", ok)
+    monkeypatch.setattr(tracker, "finish", lambda *a: (_ for _ in ()).throw(RuntimeError("diagnostic")))
+    assert asyncio.run(pc.chat_completion_async(config, []))["reply"] == "ok"
+    assert tracker._entries["route"]["active"] == 0
+
+
+def test_cache_observation_is_opt_in_and_context_resets_between_calls(monkeypatch):
+    raw = {"prompt_tokens": 4, "prompt_tokens_details": {"cached_tokens": 0}}
+    async def impl(*args, **kwargs):
+        return {"reply": "ok", "usage": pc._observed_usage("openai", raw)}
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", impl)
+    async def run():
+        config = pc.ProviderConfig("openai", "fixture", "secret")
+        plain = await pc.chat_completion_async(config, [])
+        assert plain["usage"] == pc._normalize_usage("openai", raw)
+        from dataclasses import replace
+        observed = await pc.chat_completion_async(replace(config, capture_attempt_trace=True, prompt_cache_key="opaque"), [])
+        assert observed["usage"]["cache_diagnostic"]["normalized"]["cache_read_tokens"] == 0
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
+        again = await pc.chat_completion_async(config, [])
+        assert again["usage"] == plain["usage"]
+    asyncio.run(run())
+
+
+def test_cache_observation_nested_disabled_and_concurrent_isolation(monkeypatch):
+    from dataclasses import replace
+    base = pc.ProviderConfig("openai", "fixture", "secret")
+    observed = replace(base, capture_attempt_trace=True, prompt_cache_key="opaque")
+    async def impl(config, messages, **kwargs):
+        number = messages[0]["number"]
+        usage = pc._observed_usage("openai", {"prompt_tokens": number, "prompt_tokens_details": {"cached_tokens": number}})
+        await asyncio.sleep(0)
+        if number == 10:
+            child = await pc.chat_completion_async(base, [{"number": 999}])
+            assert "cache_diagnostic" not in child["usage"]
+        return {"reply": "ok", "usage": usage}
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", impl)
+    async def run():
+        nested, concurrent = await asyncio.gather(
+            pc.chat_completion_async(observed, [{"number": 10}]),
+            pc.chat_completion_async(replace(observed, prompt_cache_key="other-user"), [{"number": 20}]),
+        )
+        assert nested["usage"]["cache_diagnostic"]["normalized"]["cache_read_tokens"] == 10
+        assert concurrent["usage"]["cache_diagnostic"]["normalized"]["cache_read_tokens"] == 20
+        no_scope = await pc.chat_completion_async(replace(base, capture_attempt_trace=True), [{"number": 30}])
+        assert "cache_diagnostic" not in no_scope["usage"]
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
+    asyncio.run(run())
+
+
+def test_cache_observation_final_usage_identity_and_retry_no_stale(monkeypatch):
+    config = pc.ProviderConfig("openai", "fixture", "secret", capture_attempt_trace=True, prompt_cache_key="opaque")
+    async def impl(config, messages, **kwargs):
+        pc._observed_usage("openai", {"prompt_tokens": 111, "prompt_tokens_details": {"cached_tokens": 111}})
+        if messages:
+            return {"reply": "ok", "usage": pc._normalize_usage("openai", {"prompt_tokens": 9})}
+        final = pc._observed_usage("openai", {"prompt_tokens": 20, "prompt_tokens_details": {"cached_tokens": 0}})
+        return pc._with_request_diagnostics({"reply": "ok", "usage": final}, initial_payload={}, successful_payload={}, attempts=2, fallback_codes=[])
+    monkeypatch.setattr(pc, "_chat_completion_async_impl", impl)
+    async def run():
+        unknown = await pc.chat_completion_async(config, [1])
+        assert "cache_diagnostic" not in unknown["usage"]  # parser/raw not bound to final usage
+        retried = await pc.chat_completion_async(config, [])
+        raw = retried["usage"]["cache_diagnostic"]["raw"]
+        assert raw["prompt_tokens"]["value"] == 20
+        assert raw["prompt_tokens_details.cached_tokens"]["value"] == 0
+        assert retried["usage"]["provider_retry_count"] == 1
+        assert pc._CACHE_USAGE_OBSERVATION.get() is None
+    asyncio.run(run())

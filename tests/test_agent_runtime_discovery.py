@@ -264,3 +264,112 @@ def test_route_conflict_audit_dry_run_matches_apply_and_reports_live_lease(_clea
     assert all(
         row["user_id"] != uid for row in db.audit_resident_active_model_routes()
     )
+
+
+# ---- dormancy filter: active_within_days drops long-idle users ----
+
+
+def _backdate_route(user_id: str, days: float):
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "UPDATE model_api_routes SET created_at = now() - make_interval(secs => %s), "
+            "last_test_at = now() - make_interval(secs => %s) WHERE user_id = %s",
+            (days * 86400, days * 86400, user_id),
+        )
+
+
+def _add_session_end(user_id: str, days_ago: float):
+    import json, time, uuid
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO user_logs (user_id, stream, ts, item_key, doc) "
+            "VALUES (%s, 'tracking_events', %s, %s, %s::jsonb)",
+            (user_id, time.time() - days_ago * 86400, uuid.uuid4().hex,
+             json.dumps({"type": "app_session_end"})),
+        )
+
+
+def _add_chat(user_id: str, days_ago: float, *, role: str = "user", source: str = ""):
+    import json, time, uuid
+    doc = {"role": role}
+    if source:
+        doc["source"] = source
+    with db.get_pool().connection() as conn:
+        conn.execute(
+            "INSERT INTO chat_messages (user_id, msg_id, ts, doc) VALUES (%s, %s, %s, %s::jsonb)",
+            (user_id, uuid.uuid4().hex, time.time() - days_ago * 86400, json.dumps(doc)),
+        )
+
+
+@pytest.fixture()
+def _dormancy_world(_clean_blobs):
+    uids = ["fresh_route", "old_idle", "recent_session", "recent_msg",
+            "old_session", "agent_only", "verify_only"]
+    with db.get_pool().connection() as conn:
+        conn.execute("DELETE FROM user_logs WHERE user_id = ANY(%s)", (uids,))
+        conn.execute("DELETE FROM chat_turn_activity_events WHERE user_id = ANY(%s)", (uids,))
+        conn.execute("DELETE FROM chat_messages WHERE user_id = ANY(%s)", (uids,))
+    for uid in uids:
+        _seed_model_api(uid, provider="anthropic", test_status="ok")
+        if uid != "fresh_route":
+            _backdate_route(uid, 120)
+    _add_session_end("recent_session", 3)
+    _add_chat("recent_msg", 10)
+    _add_session_end("old_session", 45)
+    _add_chat("old_session", 40)
+    _add_chat("agent_only", 1, role="agent")                    # agent talking ≠ human activity
+    _add_chat("verify_only", 1, role="user", source="verify_ping")  # synthetic ≠ human activity
+    yield
+
+
+def test_dormancy_filter_off_by_default_keeps_everyone(_dormancy_world):
+    rows = {u["user_id"] for u in db.list_agent_runtime_enabled_users_strict()}
+    assert rows == {"fresh_route", "old_idle", "recent_session", "recent_msg",
+                    "old_session", "agent_only", "verify_only"}
+
+
+def test_dormancy_filter_keeps_only_recent_human_activity(_dormancy_world):
+    rows = {u["user_id"] for u in db.list_agent_runtime_enabled_users_strict(active_within_days=30)}
+    # fresh_route: just onboarded (route created/tested now) — must spawn for the intro
+    # before any message or session-end exists.
+    assert rows == {"fresh_route", "recent_session", "recent_msg"}
+
+
+def test_dormancy_filter_zero_or_negative_is_off(_dormancy_world):
+    all_rows = {u["user_id"] for u in db.list_agent_runtime_enabled_users_strict()}
+    assert {u["user_id"] for u in db.list_agent_runtime_enabled_users_strict(active_within_days=0)} == all_rows
+    assert {u["user_id"] for u in db.list_agent_runtime_enabled_users_strict(active_within_days=-5)} == all_rows
+
+
+def test_dormant_user_reenters_after_new_message(_dormancy_world):
+    assert "old_idle" not in {u["user_id"] for u in
+                              db.list_agent_runtime_enabled_users_strict(active_within_days=30)}
+    _add_chat("old_idle", 0)
+    assert "old_idle" in {u["user_id"] for u in
+                          db.list_agent_runtime_enabled_users_strict(active_within_days=30)}
+
+
+# ---- supervisor env wiring: AGENT_RUNTIME_DORMANT_DAYS ----
+
+
+@pytest.mark.parametrize("raw,expected", [
+    (None, None), ("", None), ("0", None), ("-3", None), ("junk", None),
+    ("30", 30.0), ("7.5", 7.5),
+])
+def test_discover_enabled_threads_dormant_days(monkeypatch, raw, expected):
+    seen = {}
+
+    def fake_list(**kwargs):
+        seen["kwargs"] = kwargs
+        return []
+
+    if raw is None:
+        monkeypatch.delenv("AGENT_RUNTIME_DORMANT_DAYS", raising=False)
+    else:
+        monkeypatch.setenv("AGENT_RUNTIME_DORMANT_DAYS", raw)
+    monkeypatch.setattr(supervisor_mod.db, "list_agent_runtime_enabled_users_strict", fake_list)
+    supervisor_mod._discover_enabled()
+    if expected is None:
+        assert seen["kwargs"] == {}          # off → legacy no-arg call
+    else:
+        assert seen["kwargs"] == {"active_within_days": expected}
