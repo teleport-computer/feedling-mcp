@@ -99,7 +99,7 @@ def _stage(fn, deadline, permit, *, optional=False):
 
 def select_off(user_id, seq, deps, *, deadline, permit, rollout, query_args,
                message_id="", hybrid=False, read_candidates=None, include_references=True,
-               attachment_proofs=None, source_snapshots=None):
+               attachment_proofs=None, source_snapshots=None, current_optional=False):
     read_candidates = read_candidates or recall_candidates.read_owned
     verified_attachments = {}
     def attachment_reader(source):
@@ -125,7 +125,8 @@ def select_off(user_id, seq, deps, *, deadline, permit, rollout, query_args,
 
     # Required content is validated even when rollout disables optional recall.
     turn = _stage(lambda: recall_projection.turn(deps.history_page(user_id, seq),
-                  user_id, seq, message_id, attachment_reader=attachment_reader,
+                  user_id, seq, message_id, current_optional=current_optional,
+                  attachment_reader=attachment_reader,
                   source_snapshots=source_snapshots), deadline, permit)
     current = next((row for row in turn.original if row.get("id") == turn.message_id), {})
     projected_current = next((row for row in turn.projected if row.get("id") == turn.message_id), {})
