@@ -1949,7 +1949,8 @@ def test_chat_memory_selection_reaches_provider_on_the_current_seq(monkeypatch, 
         raise provider_client.ProviderError("fixture authentication failure", status_code=401)
     monkeypatch.setattr(provider_client, "chat_completion_async", failing_provider)
     reads, events = [], []
-    def select(user_id, *, through_seq, coordinates=None):
+    def select(user_id, *, through_seq, coordinates=None, current_optional):
+        assert current_optional is False  # chat keeps its current-message anchor
         reads.append((user_id, through_seq, coordinates))
         if selection_fails:
             raise RuntimeError("selection unavailable")
@@ -2041,7 +2042,8 @@ def test_run_wake_records_whole_turn_metric_on_success(monkeypatch):
     monkeypatch.setattr(worker.db, "chat_max_seq", lambda _uid: 1)
     monkeypatch.setattr(worker.db, "chat_seqs_after_seq", lambda *_a, **_k: [1])
     selection_reads, wake_coordinates = [], []
-    def read_memories(user_id, *, through_seq, coordinates=None):
+    def read_memories(user_id, *, through_seq, coordinates=None, current_optional):
+        assert current_optional is True  # a wake has no current user message (T836)
         selection_reads.append((user_id, through_seq))
         wake_coordinates.append(coordinates)
         return {"context_memories": [{"id": "wake-memory", "summary": "露营灯保修码 NP-4286"}],
@@ -3285,3 +3287,76 @@ def test_off_optional_failure_cannot_finish_replaced_lease(monkeypatch, lane):
 def test_off_attachment_version_change_blocks_actual_dispatch(monkeypatch, lane, field):
     test_off_recall_real_reader_controls_provider_dispatch(
         monkeypatch, lane, 'between_proofs_'+field, True)
+
+
+@pytest.mark.parametrize('lane', ['heartbeat', 'scheduled'])
+def test_off_wake_without_user_row_in_recall_window_reaches_provider(monkeypatch, lane):
+    """T836: an idle user's newest rows are all assistant rows; a wake has no
+    current user message, so recall must not demand one (prod 2026-10-19 on:
+    every such wake failed as recall_binding_failed/message_not_in_window)."""
+    from model_api_runtime.v2 import serve_worker
+    from memory import plaintext_recall
+    from psycopg.types.json import Jsonb
+    uid = f'u_t836_{lane}'
+    conftest.seed_user(uid)
+    _reset(uid)
+    with db.get_pool().connection() as conn:
+        conn.execute('DELETE FROM chat_messages WHERE user_id=%s', (uid,))
+    jobs_store.enqueue_job(uid, lane)
+    job = jobs_store.claim_next_job('t836-wake')
+    rows = [dict(id='t836-user', ts=1.0, role='user', source='user', body='earlier question')]
+    rows += [dict(id=f't836-assistant-{i}', ts=float(i), role='openclaw', source='model_api',
+                  body=f'proactive note {i}') for i in range(2, 7)]
+    with db.get_pool().connection() as conn:
+        for row in rows:
+            row.update(v=1, owner_user_id=uid)
+            row['seq'] = conn.execute(
+                'INSERT INTO chat_messages (user_id,msg_id,ts,doc) VALUES (%s,%s,%s,%s) RETURNING seq',
+                (uid, row['id'], row['ts'], Jsonb(dict(row)))).fetchone()[0]
+    # The user row was answered long ago: the wake must not yield to chat.
+    profile = db.get_blob_strict(uid, 'model_api_runtime') or {}
+    db.set_blob_strict(uid, 'model_api_runtime', {**profile, 'v2_reply_cursor_seq': rows[1]['seq']})
+    monkeypatch.setattr(serve_worker.accounts_registry, 'effective_content_encryption', lambda _: 'off')
+    monkeypatch.setattr(serve_worker, '_mint_runtime_token', lambda _: 'synthetic-unused')
+    monkeypatch.setattr(plaintext_recall, 'mode', lambda: 'on')
+    # The real history page is the bounded recall window; prove it excludes the user row.
+    window = serve_worker._plaintext_history_page(uid, rows[-1]['seq'])
+    assert window and all(row.get('role') != 'user' for row in window)
+    failures = []
+    original_failure_code = worker._safe_failure_code
+    monkeypatch.setattr(worker, '_safe_failure_code',
+                        lambda prefix, exc: failures.append(repr(exc)) or original_failure_code(prefix, exc))
+    if lane == 'scheduled':
+        monkeypatch.setattr(worker.core_envelope, '_build_shared_envelope_for_store',
+            lambda store, raw, **kwargs: ({'id': kwargs.get('item_id', 'synthetic-reply'),
+                                           'owner_user_id': uid, 'v': 1, 'body': raw.decode('utf-8')}, None))
+        monkeypatch.setattr(worker, '_write_encrypted_reply',
+                            lambda store, text: {'id': 'synthetic-reply'})
+    calls = _script_provider(monkeypatch, [
+        _text_round('Reminder delivered') if lane == 'scheduled' else _stay_silent_round()])
+    def read(*args, **kwargs):
+        return serve_worker._decrypt_chat_rows_inner(uid, rows, user_only=False, preserve_unreadable=True)
+    def apply_effects(user):
+        def transactional_reply(effect_type, payload, connection):
+            serve_worker._sink_reply_in_transaction(user, payload, connection)
+            return lambda: None
+        return v2_effect_outbox.apply_pending_effects(user,
+            dispatch=_reply_effect_dispatch(user), dispatch_reply_in_transaction=transactional_reply)
+    deps = worker.TurnDeps(
+        read_messages=read,
+        read_messages_after_seq=lambda _uid, after_seq: [r for r in read() if r['seq'] > after_seq],
+        read_context_memories=serve_worker._read_context_memories,
+        read_summary_with_seq=lambda _: ('', 0.0, 0, 0),
+        read_tail_after_seq=read,
+        read_scheduled_wake_context=lambda *_a: [{'note': 'synthetic reminder'}],
+        read_recall_mode=lambda _: 'off',
+        prepare_recall_attachments=serve_worker._prepare_recall_attachments,
+        has_genuine_user_history=lambda _: True,
+        resolve_provider=lambda _: (_BYOK, {}), mint_enclave_token=lambda _: 'synthetic-unused',
+        apply_pending_effects=apply_effects,
+    )
+    result = asyncio.run(worker.process_job(job, deps, provider_config=_BYOK,
+                                           api_key=None, runtime_token='synthetic-unused'))
+    assert not any('message_not_in_window' in f for f in failures), failures
+    assert len(calls) == 1, failures
+    assert result == 'completed', failures

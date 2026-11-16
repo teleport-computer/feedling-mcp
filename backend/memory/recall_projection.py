@@ -15,7 +15,7 @@ def _read(row, user_id):
         raise recall_contract.RecallFailure("content_storage_invalid") from exc
 
 
-def turn(rows, user_id: str, seq: int, message_id: str = "", *, require_current=True, attachment_reader=None, source_snapshots=None):
+def turn(rows, user_id: str, seq: int, message_id: str = "", *, require_current=True, current_optional=False, attachment_reader=None, source_snapshots=None):
     if (not isinstance(rows, list) or isinstance(seq, bool)
             or not isinstance(seq, int) or seq < 1):
         raise recall_contract.RecallFailure("frontier_invalid", category="binding_error")
@@ -114,6 +114,10 @@ def turn(rows, user_id: str, seq: int, message_id: str = "", *, require_current=
             view = items[0]
         projected.append(view)
     expected = message_id or newest_user
+    if current_optional and not expected:
+        # A wake has no current message; an idle user's window may hold only
+        # assistant rows (T836). A user row that is present stays the anchor.
+        require_current = False
     if require_current and (not expected or newest_user != expected or expected not in ids):
         raise recall_contract.RecallFailure("message_not_in_window", category="binding_error")
     anchor = next((row for row in projected if row["id"] == expected), {})
