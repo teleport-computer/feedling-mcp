@@ -4,7 +4,8 @@ import time
 import httpx
 import pytest
 
-from test_chat_resident_consumer import crc
+import test_chat_resident_consumer  # noqa: F401 -- shared consumer test bootstrap
+from tools import chat_resident_consumer as crc
 from chat import service as chat_service
 
 UID = "usr_synthetic"
