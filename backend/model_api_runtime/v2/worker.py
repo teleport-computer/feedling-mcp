@@ -3445,14 +3445,16 @@ def _turn_coordinates(lane, job_id, trace_id, attempt) -> dict:
             "attempt": int(attempt or 0)}
 
 
-async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coordinates=None, *, required_rows=(), required_ids=(), prompt_through_seq=None, semaphore_held=False):
+async def _load_turn_memory_context(deps, user_id, through_seq, enclave_sem, coordinates=None, *, required_rows=(), required_ids=(), prompt_through_seq=None, semaphore_held=False, current_optional=False):
     """Best-effort selection with an explicit unavailable state, never fake 0.
 
     ``coordinates`` (optional) only labels diagnostics about this read; the
-    selection itself does not depend on it."""
+    selection itself does not depend on it. ``current_optional`` is for wake
+    lanes: there is no current user message, and an idle user's recent window
+    may hold only assistant rows (T836)."""
     if deps.read_context_memories is None or int(through_seq or 0) < 1:
         return {}
-    kwargs = {"through_seq": int(through_seq)}
+    kwargs = {"through_seq": int(through_seq), "current_optional": bool(current_optional)}
     if coordinates is not None:
         kwargs["coordinates"] = coordinates
     try:
@@ -9934,7 +9936,8 @@ async def _run_wake(
                 turn_memory_payload = await _load_turn_memory_context(
                     deps, user_id, wake_snapshot_seq, enclave_sem,
                     coordinates=_turn_coordinates(lane, job_id, trace_id, attempt_count),
-                    required_rows=raw_rows, semaphore_held=semaphore_held)
+                    required_rows=raw_rows, semaphore_held=semaphore_held,
+                    current_optional=True)
             elif turn_memory_payload.get("account_mode") == "off":
                 recall_contract.validate_prompt_rows(raw_rows, user_id, wake_snapshot_seq)
 

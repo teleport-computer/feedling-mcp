@@ -381,7 +381,10 @@ def test_memory_context_read_forwards_coordinates_only_when_given():
         return await worker._load_turn_memory_context(deps, "usr", 5, asyncio.Semaphore(1), **kw)
     asyncio.run(go())
     asyncio.run(go(coordinates={"job_id": "1"}))
-    assert calls == [{"through_seq": 5}, {"through_seq": 5, "coordinates": {"job_id": "1"}}]
+    asyncio.run(go(current_optional=True))
+    assert calls == [{"through_seq": 5, "current_optional": False},
+                     {"through_seq": 5, "current_optional": False, "coordinates": {"job_id": "1"}},
+                     {"through_seq": 5, "current_optional": True}]
 
 
 def test_shadow_event_carries_coordinates_and_scoped_timings(monkeypatch):
