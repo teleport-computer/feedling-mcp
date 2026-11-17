@@ -2,7 +2,7 @@
 
 The application role deliberately has no DDL path.  This command runs with
 ``TRACE_EVENTS_MIGRATION_DATABASE_URL`` after an RDS or TEE migration (and may
-be run again manually).  ``TEE_MIGRATION_DATABASE_URL`` remains a compatibility
+be run daily or manually).  ``TEE_MIGRATION_DATABASE_URL`` remains a compatibility
 fallback for the existing TEE workflow.  The DEFAULT partition preserves writes
 when maintenance is late; seeing any row there is still a degraded-state signal
 and is reported by the independent application monitor before this command
@@ -12,8 +12,9 @@ repairs it.
 from __future__ import annotations
 
 import argparse
+import json
 import os
-import re
+import time as clock
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
@@ -22,7 +23,14 @@ from psycopg import sql
 
 
 _ZONE = ZoneInfo("Asia/Shanghai")
-_PARTITION_RE = re.compile(r"^trace_events_p(\d{8})$")
+_MAINTENANCE_LOCK = (184, 839)
+LOSSLESS_PARTITION_MAINTENANCE = True
+_AUTOMATIC_BACKLOG_ROWS = 10000
+_AUTOMATIC_BACKLOG_BYTES = 8 * 1024 * 1024
+
+
+class _DeferredDay(RuntimeError):
+    """Future-only maintenance must not move occupied DEFAULT dates."""
 
 
 def _migration_database_url() -> str:
@@ -69,140 +77,221 @@ def _create_partition(conn: psycopg.Connection, day: date) -> None:
     )
 
 
+def _repair_day(conn: psycopg.Connection, day: date, *, lock_timeout_ms: int,
+                statement_timeout_ms: int, repair_default: bool = True) -> dict:
+    """One committed day; every removed DEFAULT row is inserted before ATTACH.
+
+    Copy and index preparation allow ordinary writes. The final parent lock
+    fences application inserts and DEFAULT's lock fences direct writers while
+    synchronizing the copy and validating ATTACH. Failure rolls back the day.
+    """
+    lower, upper = _bounds(day)
+    name = _name(day)
+    started = clock.monotonic()
+    acquired = started
+    with conn.transaction():
+        conn.execute("SELECT set_config('lock_timeout', %s, true)",
+                     (f"{lock_timeout_ms}ms",))
+        conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                     (f"{statement_timeout_ms}ms",))
+        existing = conn.execute(
+            "SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid "
+            "WHERE i.inhparent='trace_events'::regclass AND c.relname=%s",
+            (name,),
+        ).fetchone()
+        moved = 0
+        if not existing:
+            # CREATE PARTITION OF fails when DEFAULT contains this day's rows.
+            # Stage a structurally identical table, move first, then ATTACH.
+            # No IF NOT EXISTS: an unrelated unattached table is a hard error.
+            conn.execute(sql.SQL("CREATE TABLE {} (LIKE trace_events INCLUDING ALL)")
+                         .format(sql.Identifier(name)))
+            # Build the day table and its indexes while ordinary writes can
+            # still proceed. This transaction's ACCESS SHARE locks allow DML.
+            if repair_default:
+                _copy_day(conn, day)
+            prepared = clock.monotonic()
+            conn.execute("LOCK TABLE ONLY trace_events IN ACCESS EXCLUSIVE MODE")
+            acquired = clock.monotonic()
+            conn.execute("LOCK TABLE trace_events_default IN ACCESS EXCLUSIVE MODE")
+            if not repair_default and conn.execute(
+                "SELECT EXISTS (SELECT 1 FROM trace_events_default WHERE ts >= %s AND ts < %s)",
+                (lower, upper),
+            ).fetchone()[0]:
+                raise _DeferredDay("occupied date requires explicit repair window")
+            if repair_default:
+                delta_started = clock.monotonic()
+                # The source is fenced. Synchronize only real deltas rather than
+                # probing ON CONFLICT for every already-copied row/index entry.
+                # This also prevents concurrent explicit clears being resurrected.
+                conn.execute(sql.SQL(
+                    "DELETE FROM {} AS staged WHERE NOT EXISTS "
+                    "(SELECT 1 FROM trace_events_default d "
+                    "WHERE (d.id,d.ts)=(staged.id,staged.ts))"
+                ).format(sql.Identifier(name)))
+                conn.execute(sql.SQL(
+                    "INSERT INTO {} SELECT d.* FROM trace_events_default d "
+                    "WHERE d.ts >= %s AND d.ts < %s AND NOT EXISTS "
+                    "(SELECT 1 FROM {} staged WHERE (staged.id,staged.ts)=(d.id,d.ts))"
+                ).format(sql.Identifier(name), sql.Identifier(name)), (lower, upper))
+                columns = [r[0] for r in conn.execute(
+                    "SELECT attname FROM pg_attribute WHERE attrelid='trace_events'::regclass "
+                    "AND attnum>0 AND NOT attisdropped AND attname NOT IN ('id','ts') "
+                    "ORDER BY attnum"
+                ).fetchall()]
+                updates = sql.SQL(", ").join(sql.SQL("{}=d.{}").format(
+                    sql.Identifier(c), sql.Identifier(c)) for c in columns)
+                conn.execute(sql.SQL(
+                    "UPDATE {} staged SET {} FROM trace_events_default d "
+                    "WHERE (staged.id,staged.ts)=(d.id,d.ts) "
+                    "AND ROW(staged.*) IS DISTINCT FROM ROW(d.*)"
+                ).format(sql.Identifier(name), updates))
+                delete_started = clock.monotonic()
+                moved = conn.execute(
+                    "DELETE FROM trace_events_default WHERE ts >= %s AND ts < %s",
+                    (lower, upper),
+                ).rowcount
+                copied = conn.execute(sql.SQL("SELECT count(*) FROM {}")
+                                      .format(sql.Identifier(name))).fetchone()[0]
+                if copied != moved:
+                    raise RuntimeError("trace row conservation failed; rolling back day")
+                attach_started = clock.monotonic()
+            else:
+                delta_started = delete_started = attach_started = clock.monotonic()
+            conn.execute(sql.SQL(
+                "ALTER TABLE trace_events ATTACH PARTITION {} "
+                "FOR VALUES FROM ({}) TO ({})"
+            ).format(sql.Identifier(name), sql.Literal(lower), sql.Literal(upper)))
+        else:
+            prepared = acquired = delta_started = delete_started = attach_started = clock.monotonic()
+    finished = clock.monotonic()
+    return {"day": day.isoformat(), "created": not bool(existing),
+            "moved_rows": moved, "delta_seconds": delete_started - delta_started,
+            "delete_seconds": attach_started - delete_started,
+            "attach_commit_seconds": finished - attach_started,
+            "prepare_seconds": prepared - started,
+            "lock_wait_seconds": acquired - prepared,
+            "lock_held_seconds": finished - acquired if not existing else 0.0,
+            "elapsed_seconds": finished - started}
+
+
+def _copy_day(conn: psycopg.Connection, day: date) -> None:
+    lower, upper = _bounds(day)
+    conn.execute(sql.SQL(
+        "INSERT INTO {} SELECT * FROM trace_events_default WHERE ts >= %s AND ts < %s"
+    ).format(sql.Identifier(_name(day))), (lower, upper))
+
+
 def maintain(
     conn: psycopg.Connection,
     *,
     today: date | None = None,
-    retention_days: int = 30,
     future_days: int = 60,
+    lock_timeout_ms: int = 2000,
+    statement_timeout_ms: int = 30000,
+    repair_default: bool = True,
 ) -> dict:
-    """Repair DEFAULT, maintain the rolling window, and drop expired days.
+    """Keep every trace forever; repair occupied days and today..today+N only.
 
-    One parent ``ACCESS EXCLUSIVE`` lock makes detach/move/attach atomic with
-    respect to writers.  If anything fails, the surrounding transaction puts
-    the DEFAULT partition and all of its rows back exactly as they were.
+    Each day commits separately so writers can run between days. A failed day
+    rolls back completely; earlier days stay committed and reruns are safe.
+    Do not wrap this function in an outer transaction: that would retain every
+    day's table locks until the caller committed, defeating the batching.
     """
+    if conn.info.transaction_status != psycopg.pq.TransactionStatus.IDLE:
+        raise RuntimeError("maintenance requires an idle connection, no outer transaction")
+    horizon = int(future_days)
+    if not 0 <= horizon <= 366:
+        raise ValueError("future_days must be between 0 and 366")
+    if lock_timeout_ms <= 0 or statement_timeout_ms <= 0:
+        raise ValueError("maintenance timeouts must be positive")
     current = today or _beijing_today()
-    retention = max(1, int(retention_days))
-    horizon = max(1, int(future_days))
-    keep_from = current - timedelta(days=retention - 1)
-    created: list[str] = []
-    dropped: list[str] = []
-    default_before = 0
-    moved = 0
-    expired_default = 0
-
     with conn.transaction():
-        conn.execute("LOCK TABLE trace_events IN ACCESS EXCLUSIVE MODE")
-        row = conn.execute("SELECT count(*) FROM trace_events_default").fetchone()
-        default_before = int(row[0] if row else 0)
-
-        detached = default_before > 0
-        if detached:
-            conn.execute(
-                "ALTER TABLE trace_events DETACH PARTITION trace_events_default"
-            )
-            row = conn.execute(
-                "WITH gone AS ("
-                " DELETE FROM trace_events_default "
-                " WHERE ts < %s RETURNING 1"
-                ") SELECT count(*) FROM gone",
-                (_bounds(keep_from)[0],),
-            ).fetchone()
-            expired_default = int(row[0] if row else 0)
+        locked = conn.execute("SELECT pg_try_advisory_lock(%s,%s)",
+                              _MAINTENANCE_LOCK).fetchone()[0]
+    if not locked:
+        raise RuntimeError("trace partition maintenance is already running")
+    try:
+        with conn.transaction():
+            conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                         (f"{statement_timeout_ms}ms",))
             rows = conn.execute(
-                "SELECT DISTINCT (ts AT TIME ZONE 'Asia/Shanghai')::date "
-                "FROM trace_events_default ORDER BY 1"
+                "SELECT (ts AT TIME ZONE 'Asia/Shanghai')::date, count(*) "
+                "FROM trace_events_default GROUP BY 1 ORDER BY 1"
             ).fetchall()
-            stranded_days = {row[0] for row in rows}
-        else:
-            stranded_days = set()
-
-        wanted = {
-            keep_from + timedelta(days=offset)
-            for offset in range(retention + horizon)
-        }
-        wanted.update(stranded_days)
-        existing = {
-            str(row[0])
-            for row in conn.execute(
-                "SELECT child.relname FROM pg_inherits i "
-                "JOIN pg_class parent ON parent.oid=i.inhparent "
-                "JOIN pg_class child ON child.oid=i.inhrelid "
-                "WHERE parent.oid='trace_events'::regclass"
-            ).fetchall()
-        }
+            default_bytes = conn.execute(
+                "SELECT pg_total_relation_size('trace_events_default')"
+            ).fetchone()[0]
+            existing = {str(r[0]) for r in conn.execute(
+                "SELECT c.relname FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid "
+                "WHERE i.inhparent='trace_events'::regclass"
+            ).fetchall()}
+        wanted = {current + timedelta(days=n) for n in range(horizon + 1)}
+        occupied = {r[0] for r in rows}
+        if repair_default:
+            wanted.update(occupied)
+        batches = []
+        deferred = []
         for day in sorted(wanted):
-            name = _name(day)
-            if name not in existing:
-                _create_partition(conn, day)
-                created.append(name)
-
-        if detached:
-            row = conn.execute(
-                "WITH put AS ("
-                " INSERT INTO trace_events SELECT * FROM trace_events_default "
-                " RETURNING 1"
-                ") SELECT count(*) FROM put"
-            ).fetchone()
-            moved = int(row[0] if row else 0)
-            conn.execute("DELETE FROM trace_events_default")
-            conn.execute(
-                "ALTER TABLE trace_events "
-                "ATTACH PARTITION trace_events_default DEFAULT"
-            )
-
-        child_names = [
-            str(row[0])
-            for row in conn.execute(
-                "SELECT child.relname FROM pg_inherits i "
-                "JOIN pg_class parent ON parent.oid=i.inhparent "
-                "JOIN pg_class child ON child.oid=i.inhrelid "
-                "WHERE parent.oid='trace_events'::regclass"
-            ).fetchall()
-        ]
-        for child_name in child_names:
-            match = _PARTITION_RE.fullmatch(child_name)
-            if not match:
+            if _name(day) in existing:
                 continue
-            child_day = datetime.strptime(match.group(1), "%Y%m%d").date()
-            if child_day < keep_from:
-                conn.execute(
-                    sql.SQL("DROP TABLE {}").format(sql.Identifier(child_name))
-                )
-                dropped.append(child_name)
-
-        row = conn.execute("SELECT count(*) FROM trace_events_default").fetchone()
-        default_after = int(row[0] if row else 0)
-
-    return {
-        "today": current.isoformat(),
-        "keep_from": keep_from.isoformat(),
-        "future_through": (current + timedelta(days=horizon)).isoformat(),
-        "default_rows_before": default_before,
-        "default_rows_after": default_after,
-        "moved_rows": moved,
-        "expired_default_rows": expired_default,
-        "created": created,
-        "dropped": dropped,
-    }
+            if not repair_default and day in occupied:
+                deferred.append({"day": day.isoformat(), "reason": "occupied_date"})
+                continue
+            try:
+                batches.append(_repair_day(
+                    conn, day, repair_default=repair_default,
+                    lock_timeout_ms=lock_timeout_ms if repair_default else min(lock_timeout_ms, 100),
+                    statement_timeout_ms=statement_timeout_ms if repair_default else min(statement_timeout_ms, 250),
+                ))
+            except (_DeferredDay, psycopg.errors.QueryCanceled, psycopg.errors.LockNotAvailable) as exc:
+                if repair_default:
+                    raise
+                deferred.append({"day": day.isoformat(), "reason": type(exc).__name__})
+        with conn.transaction():
+            conn.execute("SELECT set_config('statement_timeout', %s, true)",
+                         (f"{statement_timeout_ms}ms",))
+            after = conn.execute("SELECT count(*) FROM trace_events_default").fetchone()[0]
+        return {
+            "today": current.isoformat(), "retention": "forever",
+            "mode": "repair" if repair_default else "future_only",
+            "default_bytes_before": default_bytes,
+            "large_backlog": bool(rows) and (sum(r[1] for r in rows) > _AUTOMATIC_BACKLOG_ROWS
+                              or default_bytes > _AUTOMATIC_BACKLOG_BYTES),
+            "backlog_row_threshold": _AUTOMATIC_BACKLOG_ROWS,
+            "backlog_byte_threshold": _AUTOMATIC_BACKLOG_BYTES,
+            "future_through": (current + timedelta(days=horizon)).isoformat(),
+            "default_rows_before": sum(r[1] for r in rows),
+            "default_rows_after": after,
+            "moved_rows": sum(b["moved_rows"] for b in batches),
+            "created": [_name(date.fromisoformat(b["day"])) for b in batches if b["created"]],
+            "batches": batches,
+            "deferred": deferred,
+        }
+    finally:
+        with conn.transaction():
+            conn.execute("SELECT pg_advisory_unlock(%s,%s)", _MAINTENANCE_LOCK)
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--retention-days", type=int, default=30)
+    parser = argparse.ArgumentParser(description="Lossless trace partition maintenance; no expiry")
     parser.add_argument("--future-days", type=int, default=60)
+    parser.add_argument("--lock-timeout-ms", type=int, default=2000)
+    parser.add_argument("--statement-timeout-ms", type=int, default=30000)
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--repair-default", action="store_true",
+                      help="explicit manual window: move DEFAULT rows under table locks")
+    mode.add_argument("--scheduled", action="store_true",
+                      help="future-only, short lock/statement budgets, no backlog moves")
     args = parser.parse_args()
-    dsn = _migration_database_url()
-    with psycopg.connect(dsn) as conn:
-        report = maintain(
-            conn,
-            retention_days=args.retention_days,
-            future_days=args.future_days,
-        )
-    print(report, flush=True)
-    if report["default_rows_after"]:
-        raise RuntimeError("trace_events_default remains non-empty")
+    with psycopg.connect(_migration_database_url()) as conn:
+        report = maintain(conn, future_days=args.future_days,
+                          lock_timeout_ms=args.lock_timeout_ms,
+                          statement_timeout_ms=args.statement_timeout_ms,
+                          repair_default=args.repair_default)
+    print(json.dumps(report), flush=True)
+    if report["default_rows_after"] or report["deferred"]:
+        raise RuntimeError("trace maintenance degraded; rows preserved, explicit repair window required")
     return 0
 
 

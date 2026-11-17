@@ -58,6 +58,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install --require-hashes -r backend/requirements.lock
 
+      - name: Require lossless trace maintenance code
+        env:
+          PYTHONPATH: backend
+        run: |
+          python - <<'PYGUARD'
+          import inspect
+          from admin import trace_events_partitions as partitions
+          if (getattr(partitions, "LOSSLESS_PARTITION_MAINTENANCE", False) is not True
+                  or "retention_days" in inspect.signature(partitions.maintain).parameters):
+              raise SystemExit("::error::checked-out trace maintenance is not lossless; release required")
+          PYGUARD
+
       # ⚠️ 下面三个 step 一律「两套机密都注入、在 shell 里按环境挑」，**绝不**写成
       # `${{ inputs.environment == 'prod' && secrets.PROD_X || secrets.TEST_X }}`。
       # GH 表达式的 &&/|| 是 JS 语义（返回值而非布尔，空串是 falsy）：PROD_X 恰好
@@ -104,7 +116,8 @@ jobs:
           export TEE_MIGRATION_DATABASE_URL="${DSN}&sslrootcert=/tmp/tee-ca.crt"
           python -m backend.alembic_tee upgrade
 
-      - name: Maintain trace event partitions
+      # Same lossless command as scheduled maintenance: no retention purge.
+      - name: Maintain trace event partitions (preserve every row)
         env:
           PYTHONPATH: backend
           ENVIRONMENT: ${{ inputs.environment }}

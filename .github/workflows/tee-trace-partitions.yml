@@ -1,0 +1,99 @@
+name: TEE trace partition maintenance
+
+on:
+  schedule:
+    - cron: '37 19 * * *'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment (pre is paused)
+        type: choice
+        options: [test, prod]
+        required: true
+      confirm:
+        description: 'Enter MAINTAIN-TEE-TRACE (prod: MAINTAIN-TEE-TRACE-PROD)'
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  maintain:
+    strategy:
+      fail-fast: false
+      matrix:
+        environment: [test, prod]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency: tee-trace-partitions-${{ matrix.environment }}
+    steps:
+      - name: Select authorized target
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET: ${{ matrix.environment }}
+          REQUESTED: ${{ inputs.environment }}
+          CONFIRM: ${{ inputs.confirm }}
+          PROD_ENABLED: ${{ vars.TRACE_PARTITIONS_PROD_ENABLED }}
+        run: |
+          if [ "$EVENT" = workflow_dispatch ]; then
+            if [ "$TARGET" != "$REQUESTED" ]; then exit 0; fi
+            want=MAINTAIN-TEE-TRACE
+            if [ "$TARGET" = prod ]; then want=MAINTAIN-TEE-TRACE-PROD; fi
+            test "$CONFIRM" = "$want" || { echo '::error::confirmation mismatch'; exit 1; }
+          fi
+          # Enable only after the reviewed release and explicit production approval.
+          if [ "$TARGET" = prod ] && [ "$PROD_ENABLED" != true ]; then
+            echo 'Production maintenance disabled: awaiting explicit release approval.'
+            exit 0
+          fi
+          echo 'enabled=true' >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        if: steps.target.outputs.enabled == 'true'
+        with:
+          ref: ${{ matrix.environment == 'prod' && 'main' || 'test' }}
+
+      - uses: actions/setup-python@v5
+        if: steps.target.outputs.enabled == 'true'
+        with:
+          python-version: '3.12'
+
+      - name: Install owner maintenance dependencies
+        if: steps.target.outputs.enabled == 'true'
+        run: pip install --require-hashes -r backend/requirements.lock
+
+      - name: Require lossless trace maintenance code
+        if: steps.target.outputs.enabled == 'true'
+        env:
+          PYTHONPATH: backend
+        run: |
+          python - <<'PYGUARD'
+          import inspect
+          from admin import trace_events_partitions as partitions
+          if (getattr(partitions, "LOSSLESS_PARTITION_MAINTENANCE", False) is not True
+                  or "retention_days" in inspect.signature(partitions.maintain).parameters):
+              raise SystemExit("::error::checked-out trace maintenance is not lossless; release required")
+          PYGUARD
+
+      - name: Preserve all trace rows and maintain daily partitions
+        if: steps.target.outputs.enabled == 'true'
+        env:
+          PYTHONPATH: backend
+          TARGET: ${{ matrix.environment }}
+          TEST_DSN: ${{ secrets.TEST_TEE_MIGRATION_DSN }}
+          PROD_DSN: ${{ secrets.PROD_TEE_MIGRATION_DSN }}
+          TEST_CA: ${{ secrets.TEST_TEE_PG_CA_PEM }}
+          PROD_CA: ${{ secrets.PROD_TEE_PG_CA_PEM }}
+        run: |
+          umask 077
+          case "$TARGET" in
+            test) dsn="$TEST_DSN"; ca="$TEST_CA" ;;
+            prod) dsn="$PROD_DSN"; ca="$PROD_CA" ;;
+            *) echo '::error::unknown environment'; exit 1 ;;
+          esac
+          test -n "$dsn" && test -n "$ca" || { echo '::error::owner DSN/CA missing'; exit 1; }
+          printf '%s' "$ca" > "$RUNNER_TEMP/trace-ca.crt"
+          trap 'rm -f "$RUNNER_TEMP/trace-ca.crt"' EXIT
+          export TRACE_EVENTS_MIGRATION_DATABASE_URL="${dsn}&sslrootcert=$RUNNER_TEMP/trace-ca.crt"
+          python -m admin.trace_events_partitions --scheduled --future-days 60
