@@ -69,3 +69,11 @@ Provision a private, non-versioned bucket and its lifecycle externally.
 The default `FEEDLING_EXPORT_DAILY_LIMIT` is 3.
 The serve-worker process hosts the export polling/expiry loop; no new Redis
 queue or provider dependency is introduced.
+
+Export job metadata participates in the existing RDS-to-TEE snapshot lane so
+status changes, recipient removal and object cleanup coordinates converge before
+primary promotion. Archives themselves are never copied into the shadow database.
+Dirty-key capture contains only the job ID. Like other snapshot tables, this
+history has a 200,000-row limit: exceeding it reports a replication failure for
+the table and requires a reviewed retention or replication change. It does not
+silently truncate job history or establish readiness for primary promotion.

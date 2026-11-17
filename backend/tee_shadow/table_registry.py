@@ -221,6 +221,14 @@ REGISTRY: dict[str, Entry] = {
         "FK 由 TEE 0004 §2 为独立刷新顺序有意省略；TEE-primary 后须复评",
     ),
     "agent_jobs": Entry(SNAPSHOT, "agent 作业表，status 流转，明文"),
+    "user_export_jobs": Entry(
+        SNAPSHOT,
+        "Durable export status, recipient scrubbing and object-cleanup coordinates "
+        "must converge before primary promotion, including account-deletion tombstones. "
+        "Mutable plaintext metadata, not archive contents; full snapshots retain job history. "
+        "The existing 200000-row snapshot limit fails this table explicitly; growing beyond "
+        "it requires a separately reviewed replication/retention change, not silent truncation.",
+    ),
     "agent_runtime_instances": Entry(
         SNAPSHOT,
         "V1 runtime 实例登记（租约/状态高频原地 UPDATE）。agent_runtime/leases.py 的 8 处"
@@ -508,6 +516,7 @@ _PRIMARY_KEYS: dict[str, tuple[str, ...]] = {
     "v2_workspace_entries": ("user_id", "path"),
     "agent_action_queue": ("id",),
     "agent_jobs": ("id",),
+    "user_export_jobs": ("job_id",),
     "agent_runtime_instances": ("user_id",),
     "agent_runtime_supervisor_heartbeats": ("owner",),
     "agent_status_events": ("id",),

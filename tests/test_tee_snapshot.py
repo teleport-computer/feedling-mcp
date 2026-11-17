@@ -206,6 +206,44 @@ def test_voice_call_sessions_snapshot_propagates_lifecycle_and_prunes():
                 conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
+def test_export_snapshot_scrubs_recipient_releases_active_slot_and_prunes():
+    """Use both real migration schemas, including the one-active partial index."""
+    uid = f"usr_export_snapshot_{uuid.uuid4().hex[:12]}"
+    old, new = f"{uid}_old", f"{uid}_new"
+    try:
+        for pool in (db.get_pool(), mirror.get_tee_pool()):
+            with pool.connection() as conn:
+                conn.execute("INSERT INTO users(user_id,created_at,doc) "
+                             "VALUES(%s,'','{}'::jsonb)", (uid,))
+        with db.get_pool().connection() as conn:
+            conn.execute("INSERT INTO user_export_jobs(job_id,user_id,email,object_key) "
+                         "VALUES(%s,%s,'test@example.invalid',%s)", (old, uid, old))
+        assert snapshot.snapshot_table("user_export_jobs")["ok"] is True
+        with db.get_pool().connection() as conn:
+            conn.execute("UPDATE user_export_jobs SET status='completed',email=NULL,"
+                         "expires_at=now()+interval '7 days' WHERE job_id=%s", (old,))
+            conn.execute("INSERT INTO user_export_jobs(job_id,user_id,email,object_key) "
+                         "VALUES(%s,%s,'new@example.invalid',%s)", (new, uid, new))
+        # Update retained old job before inserting its replacement active job.
+        assert snapshot.snapshot_table("user_export_jobs")["ok"] is True
+        with mirror.get_tee_pool().connection() as conn:
+            rows = conn.execute("SELECT job_id,status,email,object_key,expires_at IS NOT NULL "
+                                "FROM user_export_jobs WHERE user_id=%s ORDER BY job_id",
+                                (uid,)).fetchall()
+        assert rows == sorted([(old, "completed", None, old, True),
+                               (new, "queued", "new@example.invalid", new, False)])
+        with db.get_pool().connection() as conn:
+            conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+        assert snapshot.snapshot_table("user_export_jobs")["ok"] is True
+        with mirror.get_tee_pool().connection() as conn:
+            assert conn.execute("SELECT count(*) FROM user_export_jobs WHERE user_id=%s",
+                                (uid,)).fetchone()[0] == 0
+    finally:
+        for pool in (db.get_pool(), mirror.get_tee_pool()):
+            with pool.connection() as conn:
+                conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
+
+
 def test_snapshot_releases_stale_secondary_unique_key_before_upsert(unique_key_table):
     with db.get_pool().connection() as c:
         c.execute(
