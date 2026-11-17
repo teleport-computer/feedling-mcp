@@ -59,6 +59,9 @@ EXPECTED_PUBLIC_OPERATIONS = {
 }
 
 EXPECTED_API_KEY_ONLY_OPERATIONS = {
+    ("post", "/v1/content/export-jobs"),
+    ("get", "/v1/content/export-jobs/latest"),
+    ("get", "/v1/content/export-jobs/{job_id}"),
     ("post", "/v1/agent-body/generate"),
     ("get", "/v1/web/settings"),
     ("post", "/v1/web/settings"),
@@ -240,8 +243,9 @@ def test_public_operation_and_parameter_inventory(
     # Retiring legacy-card migration removes one GET and two POST operations.
     # 177 and 84 bodies since POST /v1/memory/turn-selection (T788, resident
     # per-turn selection for plaintext accounts; JSON body, one header).
-    assert len(operations) == 177
-    assert sum("requestBody" in operation for operation in operations.values()) == 84
+    # T837 adds one email-bearing POST and two status GETs.
+    assert len(operations) == 180
+    assert sum("requestBody" in operation for operation in operations.values()) == 85
 
     query_operations = {
         key for key, operation in operations.items() if _parameters(operation, "query")

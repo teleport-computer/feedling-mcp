@@ -1071,6 +1071,13 @@ def account_reset(
         }, 503
 
     # DB 权威、原子：删 users 行即 CASCADE 清净所有 per-user 数据(0011)。
+    # Never wait for a DB/object-storage fence while holding the process-global
+    # registry lock (whoami also uses it). Keep cached credentials until deletion
+    # has really succeeded, then evict under the short cache-only lock.
+    try:
+        db.delete_user(user_id)
+    except db.UserExportCleanupError:
+        return {"error": "export_cleanup_failed"}, 503
     with registry._users_lock:
         before = len(registry._users)
         registry._users[:] = [u for u in registry._users if u.get("user_id") != user_id]
@@ -1079,7 +1086,6 @@ def account_reset(
         to_evict = [h for h, uid in registry._key_to_user.items() if uid == user_id]
         for h in to_evict:
             registry._key_to_user.pop(h, None)
-        db.delete_user(user_id)                 # CASCADE 原子清净
         # Cross-worker: other workers still hold this user in their _users /
         # _key_to_user and would keep auth'ing the deleted account's key until
         # they reload. db.delete_user already removed the row, so their reload

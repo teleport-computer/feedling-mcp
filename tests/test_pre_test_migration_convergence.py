@@ -26,7 +26,8 @@ def _database_url(base: str, database: str) -> str:
 
 def test_rds_pre_and_test_heads_converge():
     script = _scripts("alembic")
-    assert script.get_heads() == ["0115_outbox_source_fact"]
+    assert script.get_heads() == ["0116_user_export_jobs"]
+    assert script.get_revision("0116_user_export_jobs").down_revision == "0115_outbox_source_fact"
     assert (
         script.get_revision("0115_outbox_source_fact").down_revision
         == "0114_agent_canvas_cards"
@@ -132,7 +133,8 @@ def test_rds_pre_and_test_heads_converge():
 
 def test_tee_chain_carries_test_runtime_schema():
     script = _scripts("alembic_tee")
-    assert script.get_heads() == ["0051_outbox_source_fact"]
+    assert script.get_heads() == ["0052_user_export_jobs"]
+    assert script.get_revision("0052_user_export_jobs").down_revision == "0051_outbox_source_fact"
     assert (
         script.get_revision("0051_outbox_source_fact").down_revision
         == "0050_user_logs_autovacuum"

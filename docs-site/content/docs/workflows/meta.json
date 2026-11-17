@@ -1,4 +1,11 @@
 {
   "title": "Core workflows",
-  "pages": ["index", "chat", "mcp", "memory", "perception"]
+  "pages": [
+    "index",
+    "chat",
+    "mcp",
+    "memory",
+    "perception",
+    "data-export"
+  ]
 }

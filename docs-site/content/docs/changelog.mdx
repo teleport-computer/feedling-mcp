@@ -12,6 +12,15 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Adds API-key-only asynchronous Markdown export jobs with per-user admission
+  limits, seven-day private download links and expiry/account-deletion cleanup.
+  Exports include archived memories and owned Markdown files across runtime
+  changes, plus identity/persona/world book/V2 profile. Cleared chat, Canvas,
+  images and internal messages are excluded. The supplied test mailer logs a
+  placeholder and does not send email; server-side plaintext processing is
+  explicitly authorized for this workflow.
+
+
 - Trace partition maintenance retains all historical rows and partitions,
   repairs DEFAULT one atomic day at a time in explicit manual windows, and
   prebuilds only the future

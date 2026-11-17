@@ -1061,3 +1061,14 @@ its baseline. The canary compares that key with the backend advertisement and
 checks an encrypt/decrypt round trip. Neither verifies AppAuth contract/chain,
 image digest, compose URL, or DCAP quote validity. A successful gate or canary
 must not be presented as complete policy verification.
+
+
+## User-authorized data export
+
+The [asynchronous export workflow](workflows/data-export) explicitly permits
+server-side decryption into a private, temporary Markdown ZIP. This is a
+user-initiated exception to ciphertext-only content transport. The dedicated
+plaintext export bucket needs private access and seven-day lifecycle deletion.
+The main serve-worker owns this queue for both hosted runtime cohorts; runner
+CLI caches, skills and Canvas are not export sources. Self-hosted users should
+export their local data rather than assume the hosted service has it.
