@@ -3707,6 +3707,55 @@ def _ensure_response_contract(operation: dict[str, Any]) -> None:
     )
 
 
+# Export-job handlers preserve the agreed error_code/400 contract instead of
+# FastAPI's generic validation 422. This documents their explicit parser.
+COMPONENT_SCHEMAS["UserExportJob"] = {
+    "type": "object",
+    "required": ["job_id", "status", "created_at", "expires_at", "error_code"],
+    "properties": {
+        "job_id": {"type": "string"},
+        "status": {"type": "string", "enum": [
+            "queued", "processing", "completed", "failed", "expired"]},
+        "created_at": {"type": "string", "format": "date-time"},
+        "expires_at": {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
+        "error_code": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+    },
+    "additionalProperties": False,
+}
+SPECIAL_REQUEST_BODIES[("post", "/v1/content/export-jobs")] = {
+    "required": True,
+    "content": {"application/json": {"schema": {
+        "type": "object", "required": ["email"], "properties": {
+            "email": {"type": "string", "format": "email", "maxLength": 254}},
+        "additionalProperties": True,
+    }}},
+}
+for _export_method, _export_path, _export_success in [
+    ("post", "/v1/content/export-jobs", "202"),
+    ("get", "/v1/content/export-jobs/latest", "200"),
+    ("get", "/v1/content/export-jobs/{job_id}", "200"),
+]:
+    _export_op = (_export_method, _export_path)
+    OPERATION_DESCRIPTIONS[_export_op] = (
+        "API-key-only asynchronous Markdown export. One active job per user; "
+        "default three requests per UTC day. Status contains no email or download URL. "
+        "Completed private download links last seven days; the currently supplied "
+        "mailer only logs a content-free placeholder and does not deliver email."
+    )
+    RESPONSE_OVERRIDES[_export_op] = {
+        _export_success: {"description": "Export job status.",
+                         "content": {"application/json": {"schema": {
+                             "$ref": "#/components/schemas/UserExportJob"}}}},
+        **{code: {"description": detail, "content": {"application/json": {
+            "schema": {"type": "object", "required": ["error_code"], "properties": {
+                "error_code": {"type": "string"}}, "additionalProperties": True}}}}
+           for code, detail in (
+               [("400", "invalid_email"), ("409", "export_in_progress; includes current job_id/status"),
+                ("429", "export_daily_limit"), ("503", "export_unavailable")]
+               if _export_method == "post" else [("404", "export_job_not_found")])},
+    }
+
+
 def apply_public_contracts(schema: dict[str, Any]) -> dict[str, Any]:
     """Mutate and return an already-filtered public OpenAPI document."""
     components = schema.setdefault("components", {})
@@ -3758,6 +3807,7 @@ def apply_public_contracts(schema: dict[str, Any]) -> dict[str, Any]:
                     ("post", "/v1/onboarding/archive"),
                     ("post", "/v1/diagnostics/logs"),
                     ("post", "/v1/identity/init"),
+                    ("post", "/v1/content/export-jobs"),
                 }:
                     operation["responses"].pop("200", None)
 

@@ -12,6 +12,10 @@ Auth/scope: ordinary content routes accept either authenticated credential.
 ``account/reset`` is API-key-only because a short-lived hosted runtime must not
 be able to delete the account or invalidate every long-lived credential.
 
+User-requested export-jobs explicitly authorize server-side decryption into
+a private seven-day Markdown archive; only account API keys may request it.
+The legacy export below remains ciphertext JSON for compatibility.
+
 E2E boundary: chat / memory / identity / frame ``content`` fields are v1 E2E
 envelopes, never decrypted server-side. ``export`` returns the stored ciphertext
 verbatim. ``rewrap`` forwards the caller's api key to the enclave — resolved with
@@ -39,7 +43,7 @@ from accounts.auth_core import AuthResult
 from asgi import threadpool
 from asgi.deps import require_api_key, require_auth
 from asgi import http as asgi_http
-from content import content_core
+from content import content_core, export_service
 
 router = APIRouter()
 
@@ -80,6 +84,25 @@ async def content_export(auth: AuthResult = Depends(require_auth)):
             headers=result.headers or None,
         )
     return JSONResponse(result.json_body, status_code=result.status)
+
+
+@router.post("/v1/content/export-jobs")
+async def create_export_job(request: Request, auth: AuthResult = Depends(require_api_key)):
+    payload = await asgi_http.read_json_silent(request)
+    body, status = await threadpool.run_db(export_service.submit, auth.store.user_id, payload)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/content/export-jobs/latest")
+async def latest_export_job(auth: AuthResult = Depends(require_api_key)):
+    body, status = await threadpool.run_db(export_service.status, auth.store.user_id)
+    return JSONResponse(body, status_code=status)
+
+
+@router.get("/v1/content/export-jobs/{job_id}")
+async def get_export_job(job_id: str, auth: AuthResult = Depends(require_api_key)):
+    body, status = await threadpool.run_db(export_service.status, auth.store.user_id, job_id)
+    return JSONResponse(body, status_code=status)
 
 
 @router.post("/v1/account/reset")

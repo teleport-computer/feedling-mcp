@@ -970,6 +970,7 @@ def save_all_users(users: list[dict]) -> None:
                         _mark_chat_r2_inventory_pending_on_cursor(
                             cur, removed_id, advance_generation=True,
                         )
+                        _purge_user_exports_on_cursor(cur, removed_id)
                         _delete_runtime_allowlist_on_cursor(cur, removed_id)
                         cur.execute("DELETE FROM memory_vectors WHERE user_id=%s", (removed_id,))
                         mirror_group.append(("DELETE FROM memory_vectors WHERE user_id=%s", (removed_id,)))
@@ -1015,6 +1016,26 @@ def save_all_users(users: list[dict]) -> None:
     mirror.execute_many(mirror_group)
 
 
+class UserExportCleanupError(RuntimeError):
+    """Account removal must fail closed while export links remain usable."""
+
+
+def _purge_user_exports_on_cursor(cur, user_id: str) -> None:
+    # Caller holds the exclusive chat lifecycle fence; the export worker takes
+    # that fence shared only for upload/mail/completion, so it cannot upload
+    # a new object after this inventory and before the users-row cascade.
+    cur.execute(
+        "SELECT object_key FROM user_export_jobs WHERE user_id=%s AND "
+        "(status IN ('queued','processing','completed') OR "
+        "(status='failed' AND expires_at IS NOT NULL))", (user_id,),
+    )
+    for row in cur.fetchall():
+        try:
+            object_storage.delete_export(row[0])
+        except Exception as exc:
+            raise UserExportCleanupError("export_cleanup_failed") from exc
+
+
 def delete_user(user_id: str) -> bool:
     """False means no such account — callers answer 404 instead of claiming a
     deletion that never happened."""
@@ -1031,6 +1052,7 @@ def delete_user(user_id: str) -> bool:
                 cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
                 if cur.fetchone() is None:
                     return False
+                _purge_user_exports_on_cursor(cur, user_id)
                 # Lock before the users-row DELETE/FK cascade. The chat DELETE
                 # trigger writes cleanup rows with no users FK, so both lifecycle
                 # generation and exact-key intents survive account removal.

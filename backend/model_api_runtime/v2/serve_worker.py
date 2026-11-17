@@ -83,6 +83,7 @@ from core import chat_images
 from core.store_sections import StoreSection
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
+from content import export_service
 from hosted import config_store as hosted_config_store
 from hosted import mcp_core
 from hosted import mcp_status
@@ -7030,6 +7031,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     tasks = [
         asyncio.create_task(_reaper_loop(stop_event)),
         asyncio.create_task(_r2_cleanup_loop(stop_event)),
+        asyncio.create_task(export_service.run(stop_event)),
         *[
             asyncio.create_task(
                 _fleet_heartbeat_loop(worker_id, pool, fleet, stop_event)

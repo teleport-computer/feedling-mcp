@@ -1372,3 +1372,14 @@ whole recall result unavailable; an ownership, authorization, required-content
 or unknown shared-read failure stops the turn. See the [memory workflow](./workflows/memory)
 for fixed-frontier, unavailable-count and deadline behavior. Whoami public
 attestation metadata remains compatible and may still make network requests.
+
+
+## User-authorized data export
+
+The [asynchronous export workflow](workflows/data-export) explicitly permits
+server-side decryption into a private, temporary Markdown ZIP. This is a
+user-initiated exception to ciphertext-only content transport. The dedicated
+plaintext export bucket needs private access and seven-day lifecycle deletion.
+The main serve-worker owns this queue for both hosted runtime cohorts; runner
+CLI caches, skills and Canvas are not export sources. Self-hosted users should
+export their local data rather than assume the hosted service has it.

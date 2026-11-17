@@ -6,7 +6,7 @@ matching a slug regex would also admit user identifiers and secret strings.
 Stdlib only: the Actions reporter imports this without backend dependencies.
 """
 PURPOSE_LABELS = frozenset({
-    "genesis_checkpoint", "genesis_staged_payload", "genesis_chunk",
+    "user_export", "genesis_checkpoint", "genesis_staged_payload", "genesis_chunk",
     "genesis_persona", "genesis_voice", "identity_get", "identity_update_merge",
     "mcp_server_config", "memory_action", "model_api_provider_key",
     "model_api_recap_history", "runtime_v2_trajectory_review",

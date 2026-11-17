@@ -1,0 +1,79 @@
+---
+title: Data export
+description: User-requested asynchronous Markdown archives.
+document_lifecycle: current
+canonical_owner: self
+---
+
+Submit an account API key to `POST /v1/content/export-jobs` with
+`{"email":"person@example.com"}`. The address may be any valid recipient.
+The response is 202 with `job_id`, `status`, `created_at`, `expires_at`
+and `error_code`. Runtime tokens cannot request or inspect these jobs.
+There is one active job per account, with three accepted requests per UTC day
+by default. An active request returns 409 and its job ID; the daily limit returns 429.
+
+Poll `GET /v1/content/export-jobs/{job_id}`, or
+`GET /v1/content/export-jobs/latest` when opening the export page.
+Status is queued, processing, completed, failed or expired. These responses
+never return the recipient or signed download URL.
+
+The archive contains Markdown: current chat grouped by UTC date, all memory
+cards with archived cards individually marked **已归档 / Archived**, identity,
+persona, world book, the V2 MEMORY/STYLE/user profile, `/memory/WORKING.md`
+and `/workspace/**/*.md`. Files are selected by account ownership across
+past and current runtimes. Conversation-compaction summaries are temporary
+context caches, not long-term user descriptions, and are excluded.
+
+Internal verify/maintenance messages and their replies, system-role notices,
+cleared chat, image bytes, screen frames, binary attachments, Canvas HTML,
+skills and artifact caches are excluded. Chat text attachments are included
+only for text MIME types with .md or .txt filenames.
+Photo messages retain an Image placeholder plus any readable caption, without
+fetching the image. Speakers are Me/Agent; chat times and date files use UTC.
+Encrypted device-only (local_only) records without a server decryption key are
+omitted and counted by section in README.md. Plaintext local_only records remain
+included. Unexpected decryption failures still fail the job; they are not
+silently counted as exclusions.
+No provider/model request is needed to create an export.
+
+An export is an explicit authorization to decrypt account content on the
+server. Unlike the legacy ciphertext JSON endpoint, this worker receives
+plaintext, writes a temporary private ZIP, uploads it to private object storage,
+and removes its local temporary directory. Treat this export bucket as
+plaintext user data. It is separate from encrypted chat attachment storage.
+A signed download URL is a bearer credential; never place it in application logs.
+
+Links last seven days. Expiry cleanup deletes objects automatically and retries
+storage failures. Operators must additionally provision a seven-day bucket
+lifecycle rule as a backstop; this application does not mutate bucket policy.
+Account deletion/reset revokes existing export objects and removes pending jobs.
+If storage cleanup fails, deletion fails rather than reporting success with a
+readable package left behind. Archive generation does not block account deletion. Immediately before
+publication, the worker takes the per-user lifecycle fence and rechecks the
+account/job. A result built for a deleted account is discarded without upload
+or mail. Only upload/mail/completion and existing-object cleanup hold the fence.
+Account reset does not wait for these operations under the global registry lock.
+
+The supplied mailer is a **test logging placeholder**. It records only the job ID
+and whether a link was generated. It never sends mail or logs the address/link.
+A completed test job therefore proves archive/upload/placeholder completion,
+not actual delivery to an inbox. Integrating a real mail service is a separate
+release decision. Mail adapters must deduplicate sends by job ID.
+
+## Operator configuration
+
+Exports default to disabled. Set `FEEDLING_EXPORT_ENABLED=1`,
+`FEEDLING_EXPORT_MAILER=log`, `FEEDLING_RUNTIME_TOKEN_SECRET`,
+`R2_EXPORTS_BUCKET` and the existing R2 endpoint/access credentials.
+Provision a private, non-versioned bucket and its lifecycle externally.
+The default `FEEDLING_EXPORT_DAILY_LIMIT` is 3.
+The serve-worker process hosts the export polling/expiry loop; no new Redis
+queue or provider dependency is introduced.
+
+Export job metadata participates in the existing RDS-to-TEE snapshot lane so
+status changes, recipient removal and object cleanup coordinates converge before
+primary promotion. Archives themselves are never copied into the shadow database.
+Dirty-key capture contains only the job ID. Like other snapshot tables, this
+history has a 200,000-row limit: exceeding it reports a replication failure for
+the table and requires a reviewed retention or replication change. It does not
+silently truncate job history or establish readiness for primary promotion.
