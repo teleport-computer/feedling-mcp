@@ -4320,7 +4320,9 @@ def _fetch_plaintext_or_mixed_history(
             else:
                 resolved = {**row, **decrypted}
         elif shape == "plaintext_text":
-            resolved = {**row, "content": str(row.get("body") or "")}
+            resolved = {**row, "content": (_read_plaintext_attachment_caption(row)
+                        if row.get("content_type") in {"image", "file"}
+                        else str(row.get("body") or ""))}
         elif shape == "plaintext_binary":
             hydrated = _hydrate_plaintext_binary_body(row)
             resolved = hydrated
@@ -4401,7 +4403,9 @@ def _hydrate_backend_history_body(row: dict, *, plaintext_only: bool) -> dict:
         if merged.get("body_b64") is not None:
             merged = _hydrate_plaintext_binary_body(merged)
         else:
-            merged["content"] = merged["body"]
+            merged["content"] = (_read_plaintext_attachment_caption(merged)
+                if merged.get("content_type") in {"image", "file"}
+                else merged["body"])
         for key in ("body_omitted", "body_omitted_reason", "image_omitted", "file_omitted"):
             merged.pop(key, None)
         return _finalize_plaintext_or_mixed_history_row(merged)
@@ -17210,6 +17214,10 @@ def _message_text_for_context(msg: dict) -> str:
         or msg.get("body")
         or ""
     )
+    # An explicitly projected attachment caption may legitimately be empty.
+    # Falling back to body here would reintroduce legacy binary-as-text data.
+    if msg.get("content_type") in {"image", "file"} and "content" in msg:
+        text = msg["content"]
     if isinstance(text, dict):
         text = json.dumps(text, ensure_ascii=False)
     if not isinstance(text, str):
@@ -21549,8 +21557,22 @@ def _collapse_stale_backlog(messages: list) -> list:
     return out
 
 
+class _RecallRetryBackoff:
+    """One poll loop's bounded delay; HTTP poll success does not reset it."""
+
+    def __init__(self):
+        self.delay = 0
+
+    def fail(self):
+        self.delay = min(self.delay * 2, 300) if self.delay else 5
+        time.sleep(self.delay)
+
+    def reset(self):
+        self.delay = 0
+
+
 @_recall_scope
-def _process_messages(messages: list) -> float:
+def _process_messages(messages: list, *, recall_backoff: _RecallRetryBackoff | None = None) -> float:
     """Process a batch of messages, return the highest timestamp seen."""
     global _last_user_message_wall, _screen_runtime_unsupported
     messages = _collapse_stale_backlog(messages)
@@ -21699,6 +21721,8 @@ def _process_messages(messages: list) -> float:
                               summary="Required turn content unavailable",
                               detail={"reason": "required_content_unavailable",
                                       "input_reason": failure.input_reason})
+            if recall_backoff is not None:
+                recall_backoff.fail()
             break
 
         content = str(msg.get("content") or "").strip()
@@ -23020,6 +23044,8 @@ def _process_messages(messages: list) -> float:
                 trace_id=trace_id,
             )
         elif pending_failure_notice is None and not reply_delivery_incomplete:
+            if recall_backoff is not None:
+                recall_backoff.reset()
             _emit_agent_turn_success(
                 foreground=True,
                 lane="chat",
@@ -24611,6 +24637,7 @@ def run() -> None:
 
     _clear_startup_exit()
     consecutive_errors = 0
+    recall_backoff = _RecallRetryBackoff()
 
     while _running:
         try:
@@ -24921,7 +24948,7 @@ def run() -> None:
                         time.monotonic() + max(10, CAPTURE_TICK_INTERVAL_SEC)
                     )
 
-            new_ts = _process_messages(messages)
+            new_ts = _process_messages(messages, recall_backoff=recall_backoff)
             if new_ts > last_ts:
                 last_ts = new_ts
                 _save_checkpoint(last_ts)

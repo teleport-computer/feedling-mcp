@@ -376,7 +376,11 @@ def test_run_without_enclave_reads_backend_and_distinguishes_empty_from_failure(
         crc._running = False
         return {"timed_out": False, "messages": [row(content="poll is only a trigger")]}
     monkeypatch.setattr(crc, "poll_chat", poll)
-    monkeypatch.setattr(crc, "_process_messages", lambda messages: processed.extend(messages) or 2.0)
+    def process(messages, *, recall_backoff):
+        assert isinstance(recall_backoff, crc._RecallRetryBackoff)
+        processed.extend(messages)
+        return 2.0
+    monkeypatch.setattr(crc, "_process_messages", process)
     crc.run()
     assert saved == expected_checkpoints
     assert [m["content"] for m in processed] == ([] if expected_content is None else [expected_content])

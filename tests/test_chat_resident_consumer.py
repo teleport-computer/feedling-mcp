@@ -563,7 +563,8 @@ def test_run_fires_capture_tick_before_a_long_foreground_turn(monkeypatch):
         lambda: order.append("capture") or {"enqueued": False, "reason": "quiet_not_due"},
     )
 
-    def _process(_messages):
+    def _process(_messages, *, recall_backoff):
+        assert isinstance(recall_backoff, crc._RecallRetryBackoff)
         order.append("process")
         crc._running = False
         return 2.0
