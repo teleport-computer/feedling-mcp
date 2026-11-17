@@ -206,4 +206,8 @@ jieba==0.42.1  # deterministic Chinese BM25 tokenization; hash in requirements.l
 #
 # ⚠️ 破坏性：observation_id 的算法变了（只影响新写入的行）。入口同时查新旧
 # 两个摘要兜住已落库的数据，否则"每次重传都翻倍"会变成"升级当天翻一次"。
-perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.9.0/perceptkit-0.9.0-py3-none-any.whl
+# 0.9.0 → 0.10.0（2026-09-30）。这一版是一次 Host 协议 cutover：Report 逐条
+# outcome、Fact revision/ownership、Event invalidation/reconciliation、multi-current、
+# aggregate generation/coverage proof 和 persistent definitions 都要由同版 Host adapter
+# 持久执行。配套迁移头是 0118；不允许只换 wheel 不跑迁移与真 PG 门禁。
+perceptkit @ https://github.com/teleport-computer/perceptkit/releases/download/v0.10.0/perceptkit-0.10.0-py3-none-any.whl

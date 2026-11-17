@@ -78,7 +78,13 @@ def test_agent_jobs_chain_has_one_installed_head_and_available_at_baseline():
     script = ScriptDirectory.from_config(cfg)
 
     heads = script.get_heads()
-    assert heads == ["0115_outbox_source_fact"]
+    assert heads == ["0118_perceptkit_report_outcomes"]
+    assert (script.get_revision("0118_perceptkit_report_outcomes").down_revision
+            == "0117_perceptkit_def_history")
+    assert (script.get_revision("0117_perceptkit_def_history").down_revision
+            == "0116_perceptkit_v010_storage")
+    assert (script.get_revision("0116_perceptkit_v010_storage").down_revision
+            == "0115_outbox_source_fact")
     assert (script.get_revision("0109_divergence_skew").down_revision
             == "0108_perceptkit_retraction")
     assert (script.get_revision("0108_perceptkit_retraction").down_revision
@@ -232,7 +238,7 @@ def test_perception_signal_schema_is_installed_at_the_merged_head():
             "AND indexname='ix_agent_jobs_pending_available_at'"
         ).fetchone()
 
-    assert installed_head == ("0115_outbox_source_fact",)
+    assert installed_head == ("0118_perceptkit_report_outcomes",)
     assert available_at[:2] == ("timestamp with time zone", "NO")
     assert "now()" in str(available_at[2])
     assert pending_index is not None
@@ -300,7 +306,7 @@ def test_0075_usage_rollup_schema_is_installed_without_source_backfill():
             "AND tgrelid='v2_turn_metrics'::regclass"
         ).fetchone()[0]
 
-    assert heads == {"0115_outbox_source_fact"}
+    assert heads == {"0118_perceptkit_report_outcomes"}
     assert tables == {
         "v2_usage_daily_users",
         "v2_usage_daily_dimensions",

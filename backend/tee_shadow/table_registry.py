@@ -255,8 +255,8 @@ REGISTRY: dict[str, Entry] = {
         "V2 感知去重基线，频繁原地 UPDATE；只含 HMAC 指纹、事件标识与时间戳，明文整表收敛",
     ),
 
-    # PerceptKit 的十一张表。TEE 迁移链（0040）会建它们，所以 required_in_tee，
-    # 但影子期不复制数据 —— 理由逐条写在下面。
+    # PerceptKit 的初始对象。TEE 迁移链（0040-0044/0051）会建它们，所以
+    # required_in_tee；但影子期不复制数据 —— 理由逐条写在下面。
     "perceptkit_ingest_receipt": Entry(
         SKIP,
         "PerceptKit 影子期产物：只有 backend 的影子写，没有任何读者（不管 RDS 侧还是 TEE 侧）。搬过去等于给一份诊断数据配一条复制通道，而 TEE 那边没有东西读它。**切换（让活路径去读 kit 的结果）时必须重新定这一条**——那时它就是用户看到的答案的来源，lane 得跟着感知现有的表走（perception_items/daily = MIRROR，perception_signal_state_v2 = SNAPSHOT）。",
@@ -325,6 +325,30 @@ REGISTRY: dict[str, Entry] = {
         SKIP,
         "影子比对的计数账：kit 的结论和活路径的结论逐字段比出来的判定与计数。纯诊断，切换之后也不该复制——它记的是两条路的差异，不是用户的事实。",
         required_in_tee=True,
+    ),
+    "perceptkit_aggregate_generation": Entry(
+        SKIP,
+        "PerceptKit v0.10 的 RDS 影子期聚合覆盖证明；0116 明确只落 RDS，当前没有"
+        "活路径读者，也不把未发布/不完整 generation 搬去 TEE。切换到 kit 活路径时必须"
+        "先给 TEE 建同版 schema，再与 active pointer 一起定义原子迁移合同。",
+    ),
+    "perceptkit_active_aggregate_generation": Entry(
+        SKIP,
+        "PerceptKit v0.10 的 RDS 影子期 active generation 指针；它只有和对应 generation"
+        "及聚合行同库提交才有意义，单独复制会把展示指向不存在或未完成的数据。切换到 kit"
+        "活路径时必须与 generation 数据一起重新定 TEE 原子迁移合同。",
+    ),
+    "perceptkit_conflict": Entry(
+        SKIP,
+        "PerceptKit v0.10 的 RDS 影子期冲突候选账；当前只服务影子诊断，没有活路径读者，"
+        "也不属于现行 TEE 复制集合。切换到 kit 活路径并让冲突处置生效时必须重新定 lane"
+        "与保留/清理合同。",
+    ),
+    "perceptkit_definition_history": Entry(
+        SKIP,
+        "PerceptKit v0.10 的 RDS 影子期规则版本审计；当前事件生产仍不以 TEE 里的这张表"
+        "为权威，0117 也明确只落 RDS。切换到 kit 活路径前必须给 TEE 建同版 schema，"
+        "并保证 Event 引用的定义版本与历史一起迁移。",
     ),
     "provider_health": Entry(SNAPSHOT, "provider 健康状态，UPDATE 密集，明文"),
     "retention_cohort_snapshot": Entry(

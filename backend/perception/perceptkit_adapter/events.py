@@ -375,7 +375,11 @@ def calendar_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     say that. The mirror keys on the source's own id so a revision replaces the
     row instead of appending a second truth.
     """
-    events = payload.get("events")
+    # Current IO iOS names the full window `calendar_events`; keep `events`
+    # for older producers and fixtures.
+    events = payload.get("calendar_events")
+    if not isinstance(events, Sequence) or isinstance(events, (str, bytes)):
+        events = payload.get("events")
     if not isinstance(events, Sequence) or isinstance(events, (str, bytes)):
         one = payload.get("calendar_next_event")
         events = [one] if isinstance(one, Mapping) else []
@@ -383,18 +387,26 @@ def calendar_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     for item in events:
         if not isinstance(item, Mapping):
             continue
+        # event_id + calendar_id is the legacy contract. Presence of the new
+        # account scope opts the row into the strict three-part identity contract.
+        strict_identity = "source_account_id" in item
+        account_id = str(item.get("source_account_id") or "")
+        calendar_id = str(item.get("calendar_id") or "")
         source_id = str(item.get("event_id") or item.get("id") or "")
-        if not source_id:
+        if not source_id or (strict_identity and (not account_id or not calendar_id)):
             # Without the source's id there is no way to tell a revision from a
-            # new event, which is the one thing the mirror exists to do.
+            # new event. New producers send the full three-part identity; if
+            # any part is missing, skipping is safer than aliasing two accounts
+            # or calendars under a made-up default.
             continue
         rows.append({
-            "source_account_id": "ios",
-            "source_calendar_id": str(item.get("calendar_id") or "default"),
+            "source_account_id": account_id or "ios",
+            "source_calendar_id": calendar_id or "default",
             "source_event_id": source_id,
             "event_fields": {
                 "title": item.get("title"),
-                "start_at": item.get("start_time") or item.get("start_at"),
+                "start_at": (item.get("start_time") or item.get("start_at")
+                             or item.get("next_event_time")),
                 "end_at": item.get("end_time") or item.get("end_at"),
                 "is_all_day": bool(item.get("is_all_day")),
                 "location_label": item.get("location"),
@@ -413,12 +425,15 @@ def reminder_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     for item in items:
         if not isinstance(item, Mapping):
             continue
+        strict_identity = "source_account_id" in item
+        account_id = str(item.get("source_account_id") or "")
+        list_id = str(item.get("list_id") or "")
         source_id = str(item.get("reminder_id") or item.get("id") or "")
-        if not source_id:
+        if not source_id or (strict_identity and (not account_id or not list_id)):
             continue
         rows.append({
-            "source_account_id": "ios",
-            "source_list_id": str(item.get("list_id") or "default"),
+            "source_account_id": account_id or "ios",
+            "source_list_id": list_id or "default",
             "source_reminder_id": source_id,
             "reminder_fields": {
                 "title": item.get("title"),
@@ -431,8 +446,29 @@ def reminder_rows(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def reminder_deleted_rows(payload: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Explicit EventKit tombstones emitted from the last accepted identity set."""
+    items = payload.get("reminder_deleted_items")
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        return []
+    rows: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        account_id = str(item.get("source_account_id") or "")
+        list_id = str(item.get("list_id") or "")
+        reminder_id = str(item.get("reminder_id") or "")
+        if account_id and list_id and reminder_id:
+            rows.append({
+                "source_account_id": account_id,
+                "source_collection_id": list_id,
+                "source_item_id": reminder_id,
+            })
+    return rows
+
+
 __all__ = [
     "PHOTOS_PER_EVALUATE", "ANCHOR_TYPE",
     "photo_envelope", "device_event_envelope", "app_event_envelope",
-    "location_envelope", "calendar_rows", "reminder_rows",
+    "location_envelope", "calendar_rows", "reminder_rows", "reminder_deleted_rows",
 ]
