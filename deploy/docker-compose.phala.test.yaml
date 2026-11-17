@@ -381,6 +381,11 @@ services:
       # MUST also be scoped to this bucket (else PUT 403 → graceful inline
       # Postgres fallback). Set a short lifecycle (7d) on the bucket.
       R2_USER_LOGS_BUCKET: "${R2_USER_LOGS_BUCKET:-io-user-logs}"
+      # Test export activation is injected only after a dedicated bucket exists.
+      FEEDLING_EXPORT_ENABLED: "${FEEDLING_EXPORT_ENABLED:-0}"
+      FEEDLING_EXPORT_MAILER: "${FEEDLING_EXPORT_MAILER:-log}"
+      R2_EXPORTS_BUCKET: "${R2_EXPORTS_BUCKET:-}"
+      FEEDLING_EXPORT_DAILY_LIMIT: "${FEEDLING_EXPORT_DAILY_LIMIT:-3}"
       # APNs developer key for push (Dynamic Island / Live Activity).
       # Injected via `phala deploy -e APNS_KEY_P8_B64=...` (encrypted env
       # channel, NOT baked into compose_hash). Empty default keeps dev
@@ -486,6 +491,10 @@ services:
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
       R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
       R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
+      FEEDLING_EXPORT_ENABLED: "${FEEDLING_EXPORT_ENABLED:-0}"
+      FEEDLING_EXPORT_MAILER: "${FEEDLING_EXPORT_MAILER:-log}"
+      R2_EXPORTS_BUCKET: "${R2_EXPORTS_BUCKET:-}"
+      FEEDLING_EXPORT_DAILY_LIMIT: "${FEEDLING_EXPORT_DAILY_LIMIT:-3}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       # 1c/2g test CVM: resource-bounded three-pool topology. These are
       # deployment values, not secrets, so keep them literal and reviewable.

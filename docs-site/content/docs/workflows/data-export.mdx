@@ -70,6 +70,16 @@ The default `FEEDLING_EXPORT_DAILY_LIMIT` is 3.
 The serve-worker process hosts the export polling/expiry loop; no new Redis
 queue or provider dependency is introduced.
 
+For the hosted test environment, `deploy-test-cvm` reads the GitHub repository
+variable `TEST_R2_EXPORTS_BUCKET`. A nonempty value enables export admission;
+an empty or unset value explicitly disables it. Only set this variable after
+provisioning the private test bucket, its seven-day lifecycle and access for
+the existing test R2 credentials. The deployment forwards the bucket and
+enable flag to both backend and serve-worker, with the logging mailer only.
+`TEST_FEEDLING_EXPORT_DAILY_LIMIT` optionally overrides the default of 3.
+Changing these variables requires a test deployment. Production and pre
+deployments do not enable this feature through this test configuration.
+
 Export job metadata participates in the existing RDS-to-TEE snapshot lane so
 status changes, recipient removal and object cleanup coordinates converge before
 primary promotion. Archives themselves are never copied into the shadow database.
