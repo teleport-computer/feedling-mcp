@@ -34,7 +34,7 @@ Encrypted device-only (local_only) records without a server decryption key are
 omitted and counted by section in README.md. Plaintext local_only records remain
 included. Unexpected decryption failures still fail the job; they are not
 silently counted as exclusions.
-No provider/model request is needed to create an export.
+No model request is needed to create an export.
 
 An export is an explicit authorization to decrypt account content on the
 server. Unlike the legacy ciphertext JSON endpoint, this worker receives
@@ -54,11 +54,37 @@ account/job. A result built for a deleted account is discarded without upload
 or mail. Only upload/mail/completion and existing-object cleanup hold the fence.
 Account reset does not wait for these operations under the global registry lock.
 
-The supplied mailer is a **test logging placeholder**. It records only the job ID
-and whether a link was generated. It never sends mail or logs the address/link.
-A completed test job therefore proves archive/upload/placeholder completion,
-not actual delivery to an inbox. Integrating a real mail service is a separate
-release decision. Mail adapters must deduplicate sends by job ID.
+The default `log` mailer is a **logging placeholder**. It records only the job ID
+and whether a link was generated, without sending mail or logging the address/link.
+A completed job in this mode proves archive/upload/placeholder completion only.
+
+The opt-in `cloudflare` mailer uses the official
+[Cloudflare Email Sending REST API](https://developers.cloudflare.com/email-service/api/send-emails/rest-api/).
+Its bilingual email contains only a private download link and a seven-day validity
+notice, never chat content or archive attachments. Cloudflare receives the recipient
+address and bearer download link; this is an additional data recipient outside the
+confidential VM. A provider response must explicitly report the recipient as
+delivered or queued before the job completes. Queued acceptance does not prove
+arrival in the inbox; bounced or suppressed recipients fail the job.
+
+The mail HTTP operation has an eight-second total deadline within the publication
+fence, follows no redirects and uses no environment proxy. HTTP 429 throttling,
+5xx and network/timeouts use the existing maximum of three attempts with a
+one-minute backoff; other HTTP 4xx is terminal. Failed attempts
+delete the uploaded object and reuse the same object key on retry. The API does not
+document provider-side idempotency; the job header is correlation only. A timeout,
+or a crash after sending but before recording completion, can produce a duplicate
+email. This is best-effort delivery, not exactly-once delivery. Application mail logs
+contain only recipient domain, outcome, HTTP/numeric code and fixed error category.
+Non-2xx bodies share the deadline and size cap; only an integer provider error code
+is extracted. Malformed or oversized diagnostics use code 0 and preserve the HTTP
+failure classification. Raw provider message text is never logged.
+
+An address outside the configured allowlist ends as `failed` with
+`error_code=export_recipient_not_allowed`, before archive building/upload, and its
+stored email is cleared. Terminal delivery failure also clears the email; existing
+cleanup retry coordinates remain until object deletion succeeds. Status fields and
+the iOS contract are unchanged.
 
 ## Operator configuration
 
@@ -75,10 +101,30 @@ variable `TEST_R2_EXPORTS_BUCKET`. A nonempty value enables export admission;
 an empty or unset value explicitly disables it. Only set this variable after
 provisioning the private test bucket, its seven-day lifecycle and access for
 the existing test R2 credentials. The deployment forwards the bucket and
-enable flag to both backend and serve-worker, with the logging mailer only.
+enable flag to both backend and serve-worker.
 `TEST_FEEDLING_EXPORT_DAILY_LIMIT` optionally overrides the default of 3.
 Changing these variables requires a test deployment. Production and pre
 deployments do not enable this feature through this test configuration.
+
+To select real mail on test, also provision GitHub secret
+`TEST_CLOUDFLARE_EMAIL_TOKEN` and repository variables
+`TEST_CLOUDFLARE_EMAIL_ACCOUNT_ID`, `TEST_EXPORT_EMAIL_FROM` (the approved sender is
+`welcome@rokku.ai`) and `TEST_EXPORT_EMAIL_ALLOWLIST` (comma-separated concrete
+addresses). Only when all four are nonempty does the test deployment select
+`cloudflare`; otherwise it selects `log`. Test deployment rejects wildcard lists.
+The existing private export bucket and credentials are still required.
+Token Email Sending permission and domain verification must be checked separately;
+a token merely being active does not establish either prerequisite. CI uses mock
+HTTP only and never sends email.
+
+At runtime, explicitly choosing `FEEDLING_EXPORT_MAILER=cloudflare` requires
+`CLOUDFLARE_EMAIL_TOKEN`, `CLOUDFLARE_EMAIL_ACCOUNT_ID`,
+`FEEDLING_EXPORT_EMAIL_FROM` and `FEEDLING_EXPORT_EMAIL_ALLOWLIST`. Missing or invalid
+settings make admission unavailable (503) and park pending jobs; there is no runtime
+fallback. An empty allowlist fails closed. Explicit `*` allows arbitrary recipients
+only when an operator deliberately selects it outside the test deployment;
+concrete lists are case-insensitive exact addresses. Production/pre configuration
+is unchanged and does not select this mailer.
 
 Export job metadata participates in the existing RDS-to-TEE snapshot lane so
 status changes, recipient removal and object cleanup coordinates converge before

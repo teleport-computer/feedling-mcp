@@ -1,4 +1,4 @@
-"""User-initiated exports; no model/provider calls or real email implementation."""
+"""User-initiated exports with explicit logging or Cloudflare email delivery."""
 from __future__ import annotations
 
 import asyncio
@@ -14,7 +14,7 @@ from psycopg.rows import dict_row
 
 import db
 import object_storage
-from content import export_archive, export_store
+from content import export_archive, export_store, export_mailer
 from core import runtime_token
 
 log = logging.getLogger(__name__)
@@ -22,7 +22,7 @@ log = logging.getLogger(__name__)
 
 class ExportMailer(Protocol):
     def send(self, *, email: str, download_url: str, job_id: str) -> None:
-        """Implementations must use job_id as an idempotency key."""
+        """job_id correlates attempts; transport-specific deduplication is not guaranteed."""
 
 
 class LogExportMailer:
@@ -34,7 +34,9 @@ class LogExportMailer:
 
 def configured() -> bool:
     return (os.environ.get("FEEDLING_EXPORT_ENABLED") == "1"
-            and os.environ.get("FEEDLING_EXPORT_MAILER", "log") == "log"
+            and (os.environ.get("FEEDLING_EXPORT_MAILER", "log") == "log"
+                 or (os.environ.get("FEEDLING_EXPORT_MAILER") == "cloudflare"
+                     and export_mailer.configured()))
             and bool(os.environ.get("FEEDLING_RUNTIME_TOKEN_SECRET", "").strip())
             and object_storage.exports_enabled())
 
@@ -123,6 +125,13 @@ def tick(mailer: ExportMailer | None = None) -> bool:
                 try:
                     if job["attempts"] > 3:
                         raise RuntimeError("export_attempts_exhausted")
+                    delivery = mailer
+                    if delivery is None:
+                        if os.environ.get("FEEDLING_EXPORT_MAILER", "log") == "cloudflare":
+                            delivery = export_mailer.CloudflareExportMailer()
+                            delivery.check_recipient(job["email"])  # Before build/upload.
+                        else:
+                            delivery = LogExportMailer()
                     with tempfile.TemporaryDirectory(prefix="io-export-") as tmp:
                         path = Path(tmp) / "export.zip"
                         export_archive.build(uid, _token(uid), path)
@@ -139,10 +148,10 @@ def tick(mailer: ExportMailer | None = None) -> bool:
                         object_storage.upload_export(job["object_key"], str(path))
                     # The shared lifecycle fence excludes account deletion until
                     # PUT/mail/DB completion finish; no user-row lock delays status
-                    # queries or admission. Mail adapters must dedupe by job_id.
+                    # queries or admission. Cloudflare network work has an 8s total deadline.
                     expires = datetime.now(timezone.utc) + timedelta(days=7)
                     url = object_storage.export_download_url(job["object_key"])
-                    (mailer or LogExportMailer()).send(
+                    delivery.send(
                         email=job["email"], download_url=url, job_id=jid)
                     cur.execute("UPDATE user_export_jobs SET status='completed',email=NULL,"
                                 "expires_at=%s,error_code=NULL WHERE job_id=%s", (expires, jid))
@@ -154,12 +163,14 @@ def tick(mailer: ExportMailer | None = None) -> bool:
                         object_storage.delete_export(job["object_key"])
                     except Exception:
                         log.warning("export_cleanup_pending job=%s", jid)
-                    terminal = job["attempts"] >= 3
+                    mail_error = isinstance(exc, export_mailer.MailDeliveryError)
+                    terminal = job["attempts"] >= 3 or (mail_error and not exc.retryable)
+                    code = exc.code if mail_error else "export_failed"
                     cur.execute("UPDATE user_export_jobs SET status=%s,email=CASE WHEN %s "
-                                "THEN NULL ELSE email END,error_code='export_failed',"
+                                "THEN NULL ELSE email END,error_code=%s,"
                                 "available_at=now()+interval '1 minute',"
                                 "expires_at=CASE WHEN %s THEN now() ELSE NULL END WHERE job_id=%s",
-                                ("failed" if terminal else "queued", terminal, terminal, jid))
+                                ("failed" if terminal else "queued", terminal, code, terminal, jid))
                 return True
     return False
 

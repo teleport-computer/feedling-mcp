@@ -1383,3 +1383,18 @@ plaintext export bucket needs private access and seven-day lifecycle deletion.
 The main serve-worker owns this queue for both hosted runtime cohorts; runner
 CLI caches, skills and Canvas are not export sources. Self-hosted users should
 export their local data rather than assume the hosted service has it.
+
+When the optional Cloudflare export mailer is selected, the recipient address and
+seven-day bearer download link leave the VM for Cloudflare Email Sending. The email
+contains no chat content or archive attachment. Concrete allowlists restrict test
+delivery; provider acceptance does not prove inbox delivery. See the
+[data export operator guide](workflows/data-export) for fail-closed configuration
+and bounded retry/duplicate-delivery limits. Production/pre settings are unchanged.
+
+```mermaid
+flowchart LR
+    Worker[Serve-worker in confidential VM] -->|Plaintext ZIP| R2[Private export bucket]
+    Worker -->|Recipient and seven-day bearer link| CF[Cloudflare Email Sending]
+    CF -->|Bilingual link-only message| Inbox[Allowed recipient]
+    Inbox -->|Bearer download| R2
+```
