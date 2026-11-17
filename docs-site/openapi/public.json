@@ -13554,7 +13554,8 @@
               {
                 "type": "null"
               }
-            ]
+            ],
+            "description": "Stable job failure category; recipient allowlist rejection uses export_recipient_not_allowed. Email rejection/not-accepted/invalid-response is terminal; transient/timeout may be queued within the attempt budget."
           }
         },
         "additionalProperties": false

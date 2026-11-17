@@ -13,12 +13,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+import httpx
 from psycopg.types.json import Jsonb
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend"))
 import db
 import object_storage
-from content import export_archive, export_service, export_store
+from content import export_archive, export_service, export_store, export_mailer
 from core import enclave as core_enclave
 from core import runtime_token
 
@@ -65,6 +66,215 @@ def archive(uid):
 def test_invalid_email(ready, email):
     result, status = export_service.submit(user(), {"email": email})
     assert status == 400 and result["error_code"] == "invalid_email"
+
+
+@pytest.fixture
+def cloudflare(ready, monkeypatch):
+    monkeypatch.setenv("FEEDLING_EXPORT_MAILER", "cloudflare")
+    monkeypatch.setenv("CLOUDFLARE_EMAIL_TOKEN", "unit-only-token-do-not-log")
+    monkeypatch.setenv("CLOUDFLARE_EMAIL_ACCOUNT_ID", "a" * 32)
+    monkeypatch.setenv("FEEDLING_EXPORT_EMAIL_FROM", "welcome@rokku.ai")
+    monkeypatch.setenv("FEEDLING_EXPORT_EMAIL_ALLOWLIST", "allow@example.com,other@example.net")
+    return monkeypatch
+
+
+def cf_response(*, status=200, field="queued"):
+    return httpx.Response(status, json={"success": True, "errors": [], "result": {
+        "message_id": "<unit-message-id>", field: ["allow@example.com"]}})
+
+
+@pytest.mark.parametrize("missing", ["CLOUDFLARE_EMAIL_TOKEN", "CLOUDFLARE_EMAIL_ACCOUNT_ID",
+                                    "FEEDLING_EXPORT_EMAIL_FROM", "FEEDLING_EXPORT_EMAIL_ALLOWLIST"])
+def test_cloudflare_missing_configuration_never_falls_back(cloudflare, missing):
+    cloudflare.delenv(missing)
+    assert not export_service.configured()
+    assert export_service.submit(user(), {"email": "allow@example.com"}) == (
+        {"error": "export_unavailable", "error_code": "export_unavailable"}, 503)
+    with pytest.raises(export_mailer.MailDeliveryError, match="export_email_unconfigured"):
+        export_mailer.CloudflareExportMailer().check_recipient("allow@example.com")
+
+
+def test_cloudflare_allowlist_empty_wildcard_and_concrete(cloudflare):
+    mail = export_mailer.CloudflareExportMailer()
+    cloudflare.setenv("FEEDLING_EXPORT_EMAIL_ALLOWLIST", "")
+    assert not export_mailer.configured()
+    cloudflare.setenv("FEEDLING_EXPORT_EMAIL_ALLOWLIST", "*")
+    assert export_mailer.configured()
+    mail.check_recipient("any@example.org")
+    cloudflare.setenv("FEEDLING_EXPORT_EMAIL_ALLOWLIST", " Allow@Example.com ,other@example.net ")
+    mail.check_recipient("allow@example.com")
+    with pytest.raises(export_mailer.MailDeliveryError, match="export_recipient_not_allowed"):
+        mail.check_recipient("not-listed@example.com")
+    cloudflare.setenv("FEEDLING_EXPORT_EMAIL_ALLOWLIST", "*,allow@example.com")
+    assert not export_mailer.configured()
+
+
+@pytest.mark.parametrize("key,value", [("CLOUDFLARE_EMAIL_ACCOUNT_ID", "../another-account"),
+                                      ("FEEDLING_EXPORT_EMAIL_FROM", "sender\r\n@rokku.ai"),
+                                      ("CLOUDFLARE_EMAIL_TOKEN", "two\nheaders"),
+                                      ("FEEDLING_EXPORT_EMAIL_ALLOWLIST", "not-an-address")])
+def test_cloudflare_malformed_configuration_fails_closed(cloudflare, key, value):
+    cloudflare.setenv(key, value)
+    assert not export_service.configured()
+
+
+@pytest.mark.parametrize("field", ["queued", "delivered"])
+def test_cloudflare_official_request_and_success_private_logs(cloudflare, caplog, field):
+    calls = []
+    url = "https://private.invalid/export?signature=never-log-this"
+    def handler(request):
+        import json
+        calls.append(request)
+        assert str(request.url) == ("https://api.cloudflare.com/client/v4/accounts/" +
+                                    "a" * 32 + "/email/sending/send")
+        assert request.headers["authorization"] == "Bearer unit-only-token-do-not-log"
+        body = json.loads(request.content)
+        assert body["to"] == "allow@example.com" and body["from"] == "welcome@rokku.ai"
+        assert "7 天" in body["text"] and "7 days" in body["text"] and url in body["text"]
+        assert set(body) == {"from", "to", "subject", "text", "headers"}
+        assert body["headers"] == {"X-IO-Export-Job": "unit-job-id"}
+        return cf_response(field=field)
+    caplog.set_level("INFO")
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(handler))
+    mail.send(email="allow@example.com", download_url=url, job_id="unit-job-id")
+    assert len(calls) == 1 and "success=true" in caplog.text and "domain=example.com" in caplog.text
+    for private in ("allow@example.com", url, "never-log-this", "unit-only-token-do-not-log"):
+        assert private not in caplog.text and private not in repr(mail)
+
+
+@pytest.mark.parametrize("status,retryable", [(400, False), (401, False), (403, False),
+                                             (429, True), (500, True), (503, True), (302, False)])
+def test_cloudflare_http_failures_do_not_leak_response_or_redirect(cloudflare, caplog, status, retryable):
+    seen = []
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(status, headers={"location": "https://evil.invalid/token"},
+                              text="allow@example.com signed-link unit-only-token-do-not-log")
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(handler))
+    with pytest.raises(export_mailer.MailDeliveryError) as error:
+        mail.send(email="allow@example.com", download_url="https://private.invalid", job_id="j")
+    assert error.value.retryable is retryable and len(seen) == 1
+    for private in ("allow@example.com", "signed-link", "unit-only-token-do-not-log", "evil.invalid"):
+        assert private not in caplog.text and private not in str(error.value)
+
+
+@pytest.mark.parametrize("status,code", [(401, 10101), (403, 10203), (403, 10207), (429, 10004), (503, 10100)])
+def test_cloudflare_non_2xx_logs_integer_provider_code_only(cloudflare, caplog, status, code):
+    private = "allow@example.com unit-only-token-do-not-log https://private.invalid/signed"
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(
+        lambda request: httpx.Response(status, json={"success": False, "errors": [
+            {"code": code, "message": private}]})))
+    with pytest.raises(export_mailer.MailDeliveryError) as error:
+        mail.send(email="allow@example.com", download_url="https://private.invalid/signed", job_id="j")
+    assert error.value.retryable == (status == 429 or status >= 500)
+    assert f"provider_code={code}" in caplog.text
+    assert private not in caplog.text and "allow@example.com" not in caplog.text
+    assert "unit-only-token-do-not-log" not in caplog.text and "private.invalid" not in caplog.text
+
+
+@pytest.mark.parametrize("body", [b"not json", b"[]", b'{"errors":[{"code":"10203"}]}',
+                                b'{"errors":[{"code":true}]}', b"x" * 65537])
+def test_cloudflare_bad_error_body_keeps_http_classification_code_zero(cloudflare, caplog, body):
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(
+        lambda request: httpx.Response(403, content=body)))
+    with pytest.raises(export_mailer.MailDeliveryError, match="export_email_rejected") as error:
+        mail.send(email="allow@example.com", download_url="https://private.invalid", job_id="j")
+    assert not error.value.retryable and "provider_code=0" in caplog.text
+
+
+@pytest.mark.parametrize("status,retryable", [(403, False), (429, True), (503, True)])
+def test_cloudflare_non_2xx_body_stall_obeys_deadline_and_http_semantics(cloudflare, status, retryable):
+    closed = []
+    class StalledBody(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'{"errors":['
+            await asyncio.sleep(10)
+        async def aclose(self):
+            closed.append(True)
+    async def handler(request):
+        return httpx.Response(status, stream=StalledBody())
+    cloudflare.setattr(export_mailer, "SEND_DEADLINE_SECONDS", 0.02)
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(handler))
+    started = time.monotonic()
+    with pytest.raises(export_mailer.MailDeliveryError) as error:
+        mail.send(email="allow@example.com", download_url="https://private.invalid", job_id="j")
+    assert error.value.retryable is retryable
+    assert error.value.code == ("export_email_timeout" if retryable else "export_email_rejected")
+    assert closed == [True] and time.monotonic() - started < 1
+
+
+@pytest.mark.parametrize("field", ["permanent_bounces", "suppressed_recipients", "other"])
+def test_cloudflare_2xx_unaccepted_recipient_is_terminal(cloudflare, field):
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(lambda req: cf_response(field=field)))
+    with pytest.raises(export_mailer.MailDeliveryError, match="export_email_not_accepted") as error:
+        mail.send(email="allow@example.com", download_url="https://private.invalid", job_id="j")
+    assert not error.value.retryable
+
+
+def test_cloudflare_total_deadline_stops_slow_transport(cloudflare):
+    async def slow(request):
+        await asyncio.sleep(10)
+        return cf_response()
+    cloudflare.setattr(export_mailer, "SEND_DEADLINE_SECONDS", 0.02)
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(slow))
+    started = time.monotonic()
+    with pytest.raises(export_mailer.MailDeliveryError, match="export_email_timeout") as error:
+        mail.send(email="allow@example.com", download_url="https://private.invalid", job_id="j")
+    assert error.value.retryable and time.monotonic() - started < 1
+
+
+def test_cloudflare_transport_timeout_logs_only_category(cloudflare, caplog):
+    def handler(request):
+        raise httpx.ReadTimeout("unit-only-token-do-not-log allow@example.com full-signed-url")
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(handler))
+    with pytest.raises(export_mailer.MailDeliveryError, match="export_email_timeout"):
+        mail.send(email="allow@example.com", download_url="https://private.invalid", job_id="j")
+    assert "code=timeout" in caplog.text
+    assert "full-signed-url" not in caplog.text and "allow@example.com" not in caplog.text
+
+
+def test_cloudflare_allowlist_denial_ends_before_build_and_upload(cloudflare):
+    uid = user()
+    row = export_store.create(uid, "blocked@example.com", 3)
+    def forbidden(*args, **kwargs):
+        pytest.fail("blocked recipient reached build/upload/HTTP")
+    cloudflare.setattr(export_archive, "build", forbidden)
+    cloudflare.setattr(object_storage, "upload_export", forbidden)
+    cloudflare.setattr(export_mailer.CloudflareExportMailer, "send", forbidden)
+    assert export_service.tick()
+    job = export_store.get(uid, row["job_id"])
+    assert (job["status"], job["error_code"], job["email"], job["attempts"]) == (
+        "failed", "export_recipient_not_allowed", None, 1)
+    assert export_service.status(uid, row["job_id"])[0]["error_code"] == "export_recipient_not_allowed"
+
+
+@pytest.mark.parametrize("status", [200, 403, 429, 503, "timeout"])
+def test_cloudflare_worker_http_state_retry_cleanup_and_scrub(cloudflare, status):
+    uid = user()
+    row = export_store.create(uid, "allow@example.com", 3)
+    uploads, deleted, requests = [], [], []
+    def handler(request):
+        requests.append(request)
+        if status == "timeout":
+            raise httpx.ReadTimeout("private exception must never leave the transport")
+        return cf_response(status=status)
+    mail = export_mailer.CloudflareExportMailer(transport=httpx.MockTransport(handler))
+    cloudflare.setattr(export_mailer, "CloudflareExportMailer", lambda: mail)
+    cloudflare.setattr(object_storage, "upload_export", lambda key, path: uploads.append(key))
+    cloudflare.setattr(object_storage, "delete_export", deleted.append)
+    cloudflare.setattr(object_storage, "export_download_url", lambda key: "https://private.invalid")
+    count = 3 if status in (429, 503, "timeout") else 1
+    for attempt in range(count):
+        assert export_service.tick()
+        job = export_store.get(uid, row["job_id"])
+        if attempt < count - 1:
+            assert job["status"] == "queued" and job["email"] == "allow@example.com"
+            with db.get_pool().connection() as conn:
+                conn.execute("UPDATE user_export_jobs SET available_at=now() WHERE job_id=%s", (row["job_id"],))
+    assert job["email"] is None and job["attempts"] == count
+    assert job["status"] == ("completed" if status == 200 else "failed")
+    assert len(requests) == count and uploads == [row["object_key"]] * count
+    assert deleted == ([] if status == 200 else uploads)
 
 
 def test_http_auth_latest_isolation_and_no_address_or_url(client, ready, monkeypatch):

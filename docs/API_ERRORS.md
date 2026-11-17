@@ -542,4 +542,8 @@ trace 不记录异常消息、response_detail 或原始响应正文。
 - `export_unavailable` (503): export worker/storage configuration is unavailable.
 - `export_job_not_found` (404): no owned export job exists.
 - `export_failed`: durable job failure, exposed only as job error_code.
+- `export_recipient_not_allowed`: terminal unsent job; recipient is outside the email allowlist, no archive is built/uploaded.
+- `export_email_rejected` / `export_email_not_accepted` / `export_email_invalid_response`: terminal mail failure; provider did not establish recipient acceptance.
+- `export_email_transient` / `export_email_timeout`: HTTP 429 throttling, 5xx or network/timeout failure; queued with a one-minute backoff within the three-attempt budget, then terminal failed. Other 4xx is terminal.
+- `export_email_unconfigured`: selected real mailer configuration became unavailable; never falls back to logging completion.
 - `export_cleanup_failed` (503 on reset): plaintext export object cleanup failed; account deletion aborted.

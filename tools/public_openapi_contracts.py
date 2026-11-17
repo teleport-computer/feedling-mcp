@@ -3718,7 +3718,10 @@ COMPONENT_SCHEMAS["UserExportJob"] = {
             "queued", "processing", "completed", "failed", "expired"]},
         "created_at": {"type": "string", "format": "date-time"},
         "expires_at": {"anyOf": [{"type": "string", "format": "date-time"}, {"type": "null"}]},
-        "error_code": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+        "error_code": {"anyOf": [{"type": "string"}, {"type": "null"}],
+                       "description": "Stable job failure category; recipient allowlist rejection uses "
+                                      "export_recipient_not_allowed. Email rejection/not-accepted/invalid-response "
+                                      "is terminal; transient/timeout may be queued within the attempt budget."},
     },
     "additionalProperties": False,
 }

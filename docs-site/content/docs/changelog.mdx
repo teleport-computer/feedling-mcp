@@ -12,12 +12,19 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Adds opt-in Cloudflare Email Sending for data exports, with explicit recipient
+  allowlists, bounded delivery attempts and visible failure states. Mail contains
+  only a seven-day bearer download link; the recipient and link are disclosed to
+  Cloudflare when enabled. The default logging mailer remains available; test
+  requires concrete recipient addresses. Provider acceptance is not inbox delivery,
+  and retry/crash ambiguity can produce duplicate messages.
+
 - Adds API-key-only asynchronous Markdown export jobs with per-user admission
   limits, seven-day private download links and expiry/account-deletion cleanup.
   Exports include archived memories and owned Markdown files across runtime
   changes, plus identity/persona/world book/V2 profile. Cleared chat, Canvas,
-  images and internal messages are excluded. The supplied test mailer logs a
-  placeholder and does not send email; server-side plaintext processing is
+  images and internal messages are excluded. The default mailer logs a
+  placeholder; server-side plaintext processing is
   explicitly authorized for this workflow.
 
 

@@ -386,6 +386,10 @@ services:
       FEEDLING_EXPORT_MAILER: "${FEEDLING_EXPORT_MAILER:-log}"
       R2_EXPORTS_BUCKET: "${R2_EXPORTS_BUCKET:-}"
       FEEDLING_EXPORT_DAILY_LIMIT: "${FEEDLING_EXPORT_DAILY_LIMIT:-3}"
+      CLOUDFLARE_EMAIL_TOKEN: "${CLOUDFLARE_EMAIL_TOKEN:-}"
+      CLOUDFLARE_EMAIL_ACCOUNT_ID: "${CLOUDFLARE_EMAIL_ACCOUNT_ID:-}"
+      FEEDLING_EXPORT_EMAIL_FROM: "${FEEDLING_EXPORT_EMAIL_FROM:-}"
+      FEEDLING_EXPORT_EMAIL_ALLOWLIST: "${FEEDLING_EXPORT_EMAIL_ALLOWLIST:-}"
       # APNs developer key for push (Dynamic Island / Live Activity).
       # Injected via `phala deploy -e APNS_KEY_P8_B64=...` (encrypted env
       # channel, NOT baked into compose_hash). Empty default keeps dev
@@ -495,6 +499,10 @@ services:
       FEEDLING_EXPORT_MAILER: "${FEEDLING_EXPORT_MAILER:-log}"
       R2_EXPORTS_BUCKET: "${R2_EXPORTS_BUCKET:-}"
       FEEDLING_EXPORT_DAILY_LIMIT: "${FEEDLING_EXPORT_DAILY_LIMIT:-3}"
+      CLOUDFLARE_EMAIL_TOKEN: "${CLOUDFLARE_EMAIL_TOKEN:-}"
+      CLOUDFLARE_EMAIL_ACCOUNT_ID: "${CLOUDFLARE_EMAIL_ACCOUNT_ID:-}"
+      FEEDLING_EXPORT_EMAIL_FROM: "${FEEDLING_EXPORT_EMAIL_FROM:-}"
+      FEEDLING_EXPORT_EMAIL_ALLOWLIST: "${FEEDLING_EXPORT_EMAIL_ALLOWLIST:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       # 1c/2g test CVM: resource-bounded three-pool topology. These are
       # deployment values, not secrets, so keep them literal and reviewable.
