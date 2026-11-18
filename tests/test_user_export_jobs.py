@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import io
+import json
 import asyncio
 import sys
 import threading
@@ -355,6 +356,10 @@ def test_full_pg_history_excludes_internal_images_system_and_archive(ready):
         assert data.count("visible-") == 5002
         assert "visible-1\n" in data and "visible-5002" in data
         assert "DO-NOT-EXPORT" not in data and "OTHER-USER" not in data
+        imported = z.read("conversations.json").decode()
+        assert imported.count("visible-") == 5002
+        assert all(value not in imported for value in (
+            "DO-NOT-EXPORT", "OTHER-USER", "CLEARED-MUST-NOT-RETURN"))
         assert not any("cleared" in n for n in names)
 
 
@@ -746,7 +751,7 @@ def test_image_retains_caption_and_readable_speaker_without_fetching_image(
         assert text.count("[图片 / Image]")==2
         assert text.count("MY-CAPTION")==2
         assert "BINARY-IMAGE" not in text
-        assert "我 / Me" in text and "TA / Agent" in text
+        assert "] 用户:" in text and "] 助手:" in text
         assert "openclaw" not in text and " — user" not in text
         assert "UTC" in z.read("README.md").decode()
 
@@ -807,3 +812,106 @@ def test_deleted_expired_objects_do_not_require_storage_again_to_delete_account(
     monkeypatch.setattr(object_storage,"delete_export",
                         lambda *a:pytest.fail("already-cleaned historic key must not incur R2 I/O"))
     assert db.delete_user(uid)
+
+
+def test_export_chat_markers_and_json_use_same_rows(ready):
+    uid = user()
+    literal = "Opening\n用户: quoted user\nAssistant: quoted assistant\n````python\nprint(1)\n```\nTrailing"
+    with db.get_pool().connection() as conn:
+        for offset, role in enumerate(("user", "human", "openclaw", "agent", "assistant")):
+            doc = body(uid, literal, source="chat", role=role, content_type="text")
+            conn.execute("INSERT INTO chat_messages(user_id,msg_id,ts,doc) VALUES(%s,%s,%s,%s)",
+                         (uid, doc["id"], 1700000000 + offset, Jsonb(doc)))
+    with archive(uid) as z:
+        assert "conversations.json" in z.namelist()
+        messages = json.loads(z.read("conversations.json"))[0]["messages"]
+        assert len(messages) == 5
+        assert [m["role"] for m in messages] == ["user", "user", "assistant", "assistant", "assistant"]
+        assert all(m["content"] == literal for m in messages)
+        assert messages[0]["created_at"] == "2023-11-14T22:13:20+00:00"
+        data = z.read("chat/2023-11-14.md").decode()
+        assert data.startswith("[2023-11-14T22:13:20+00:00] 用户: ")
+        assert data.count("] 用户:") == 2 and data.count("] 助手:") == 3
+        assert data.count("`````text\n" + literal + "\n`````\n") == 5
+        assert "conversations.json and memories/*.json" in z.read("README.md").decode()
+        assert "Plaintext local_only records are included" in z.read("README.md").decode()
+
+
+@pytest.mark.parametrize("role", [None, "tool", "unexpected-role"])
+def test_export_does_not_misattribute_unknown_chat_roles(ready, role):
+    uid = user()
+    doc = body(uid, "do not silently merge this into a prior speaker", source="chat", role=role)
+    with db.get_pool().connection() as conn:
+        conn.execute("INSERT INTO chat_messages(user_id,msg_id,ts,doc) VALUES(%s,%s,%s,%s)",
+                     (uid, doc["id"],1700000000,Jsonb(doc)))
+    with pytest.raises(ValueError, match="^export_chat_role_invalid$"):
+        archive(uid)
+
+
+def test_export_memory_json_shards_preserve_archive_and_owned_sections(ready):
+    uid = user()
+    with db.get_pool().connection() as conn:
+        for i, archived in enumerate((False, True)):
+            doc = body(uid, "memory-content-" + str(i), is_archived=archived,
+                       occurred_at="2026-11-01T10:00:00+00:00")
+            conn.execute("INSERT INTO memory_moments(user_id,moment_id,occurred_at,doc) VALUES(%s,%s,%s,%s)",
+                         (uid, str(i), doc["occurred_at"], Jsonb(doc)))
+        for path in ("/memory/WORKING.md", "/workspace/notes.md", "/skills/no.md", "/artifacts/no.md", "/workspace/no.html"):
+            conn.execute("INSERT INTO v2_workspace_entries(user_id,path,kind,content_envelope,mime_type,revision) "
+                         "VALUES(%s,%s,'workspace',%s,'text/markdown',1)",
+                         (uid,path,Jsonb(body(uid,"FILE " + path))))
+    insert_blob(uid, "identity", body(uid,"Fictional identity"))
+    insert_blob(uid, "genesis_persona", {"content_envelope": body(uid,"Fictional persona")})
+    insert_blob(uid, "v2_agent_profile", {"user":{"envelope": body(uid,"Fictional profile"),"chars":17}})
+    with archive(uid) as z:
+        names = sorted(n for n in z.namelist() if n.startswith("memories/"))
+        assert len(names) == 7  # two cards + identity/persona/profile + two owned files
+        items = [json.loads(z.read(n)) for n in names]
+        assert all(d["account_uuid"] == "io-export" and len(d["memory_files"]) == 1 for d in items)
+        files = [d["memory_files"][0] for d in items]
+        assert len({f["path"] for f in files}) == 7
+        contents = "\n".join(f["content"] for f in files)
+        assert "memory-content-0" in contents and "memory-content-1" in contents
+        assert contents.count("已归档 / Archived") == 1
+        assert "Fictional identity" in contents and "Fictional profile" in contents
+        assert "/skills/" not in contents and "/artifacts/" not in contents and ".html" not in contents
+        assert uid not in "".join(z.read(n).decode() for n in names)
+
+
+@pytest.mark.parametrize("text", ["Plain English\nSecond ordinary line", "用户: opening line", "中文消息\n第二行正文"])
+def test_plain_chat_markdown_preserves_body_without_fences(text):
+    stamp = datetime(2026,11,18,16,19,10,tzinfo=timezone.utc)
+    assert export_archive._chat_markdown(stamp,"user",text) == f"[2026-11-18T16:19:10+00:00] 用户: {text}\n\n"
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-11-18T12:34:56.123456", "2026-11-18T12:34:56.123456+00:00"),
+    ("2026-11-18", "2026-11-18T00:00:00+00:00"),
+    ("2026-11-18T20:34:56+08:00", "2026-11-18T12:34:56+00:00"),
+    ("", None), (None, None), ("2026-11", None), ("not-a-date", None),
+])
+def test_import_memory_dates_follow_legacy_utc_without_inventing_missing(raw, expected):
+    conversations, memories = io.BytesIO(), io.BytesIO()
+    writer = export_archive._ImportJSON(conversations, memories)
+    writer.memory("card.md", "original body", raw)
+    value = json.loads(memories.getvalue())
+    assert value["content"] == "original body"
+    if expected is None:
+        assert "updated_at" not in value
+    else:
+        assert value["updated_at"] == expected
+
+
+def test_workspace_import_uses_table_timestamp_not_envelope(ready):
+    uid = user()
+    with db.get_pool().connection() as conn:
+        conn.execute("INSERT INTO v2_workspace_entries "
+                     "(user_id,path,kind,content_envelope,mime_type,revision,updated_at) "
+                     "VALUES(%s,'/memory/WORKING.md','working_memory',%s,'text/markdown',1,%s)",
+                     (uid, Jsonb(body(uid, "workspace body", updated_at="1999-01-01")),
+                      "2026-11-18T20:34:56+08:00"))
+    with archive(uid) as z:
+        value = json.loads(z.read(next(n for n in z.namelist() if n.startswith("memories/"))))
+        item = value["memory_files"][0]
+        assert item["updated_at"] == "2026-11-18T12:34:56+00:00"
+        assert item["content"] == "workspace body"

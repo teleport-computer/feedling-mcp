@@ -1,4 +1,4 @@
-"""Streaming Markdown archive from one repeatable-read durable snapshot.
+"""Streaming Markdown and import JSON from one repeatable-read durable snapshot.
 
 Conversation summaries are bounded context-compaction caches, not user profiles.
 The long-term MEMORY/STYLE/user profile is exported separately.
@@ -10,11 +10,15 @@ import json
 import time
 import uuid
 import posixpath
+import re
+import shutil
+import tempfile
 import zipfile
 from datetime import datetime, timezone
 from collections import Counter
 
 from psycopg.rows import dict_row
+from memgarden import timestamps as memory_timestamps
 
 import db
 from chat.service import NON_CONVERSATION_USER_SOURCES
@@ -97,6 +101,87 @@ def _safe_workspace_path(path: str) -> str | None:
     return None
 
 
+def _chat_speaker(role: str) -> tuple[str, str]:
+    if role in {"user", "human"}:
+        return "用户", "user"
+    if role in {"openclaw", "agent", "assistant"}:
+        return "助手", "assistant"
+    raise ValueError("export_chat_role_invalid")
+
+
+# Compatibility superset of Rokku's generic speaker grammar (7845015f).
+# Leading indentation is included conservatively; ordinary prose stays literal.
+_SPEAKER_LINE = re.compile(
+    r"^\s*(?:\[[^\]\r\n]*\]\s*)?(?:#{1,6}\s*|\*\*)?"
+    r"(?:User|Human|Assistant|Bot|ChatGPT|Claude|你|用户|助手)"
+    r"(?:\*\*)?\s*(?::|：|$)", re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _chat_markdown(stamp: datetime, role: str, text: str) -> str:
+    """Keep plain messages unchanged; protect risky Markdown continuations."""
+    speaker, _ = _chat_speaker(role)
+    continuation = text.partition("\n")[2]
+    if "```" in text or "~~~" in text or _SPEAKER_LINE.search(continuation):
+        longest = max((len(match[0]) for match in re.finditer(r"`+", text)), default=2)
+        fence = "`" * max(3, longest + 1)
+        text = f"{fence}text\n{text}\n{fence}"
+    return f"[{stamp.isoformat()}] {speaker}: {text}\n\n"
+
+
+class _ImportJSON:
+    """Spool the same selected plaintext rows; never retain the whole archive."""
+
+    def __init__(self, conversations, memories):
+        self.conversations, self.memories = conversations, memories
+        self.day = None
+        self.first_message = True
+        self.conversations.write(b"[")
+
+    def chat(self, stamp, role, message_id, text):
+        day = stamp.strftime("%Y-%m-%d")
+        if day != self.day:
+            if self.day is not None:
+                self.conversations.write(b"]},")
+            header = {"id": "io-chat:" + day, "title": "IO chat " + day}
+            self.conversations.write(json.dumps(header, ensure_ascii=False).encode()[:-1])
+            self.conversations.write(b',"messages":[')
+            self.day, self.first_message = day, True
+        if not self.first_message:
+            self.conversations.write(b",")
+        self.first_message = False
+        value = {"id": message_id, "role": _chat_speaker(role)[1],
+                 "content": text, "created_at": stamp.isoformat()}
+        self.conversations.write(json.dumps(value, ensure_ascii=False).encode())
+
+    def memory(self, path, text, updated_at=None):
+        if not text.strip():
+            return
+        # One memory_file per shard avoids Rokku's root=True whole-document
+        # construction growing with the total number of cards/workspace files.
+        value = {"path": path, "content": text}
+        # Match IO's historical UTC read convention (memgarden.timestamps), also
+        # used by Rokku for naive/date-only values. Never invent a missing date.
+        stamp = memory_timestamps.parse_ts(updated_at)
+        if stamp is not None:
+            value["updated_at"] = stamp.isoformat()
+        self.memories.write(json.dumps(value, ensure_ascii=False).encode() + b"\n")
+
+    def finish(self, archive):
+        self.conversations.write(b"]}]" if self.day is not None else b"]")
+        self.conversations.seek(0)
+        with archive.open("conversations.json", "w", force_zip64=True) as output:
+            shutil.copyfileobj(self.conversations, output)
+        self.memories.seek(0)
+        for line in self.memories:
+            item = json.loads(line)
+            name = hashlib.sha256(item["path"].encode()).hexdigest()
+            # A stable non-personal namespace; paths and content keep unchanged
+            # reimports stable without exposing the IO account identifier.
+            value = {"account_uuid": "io-export", "memory_files": [item]}
+            archive.writestr(f"memories/{name}.json", json.dumps(value, ensure_ascii=False))
+
+
 def build(user_id: str, token: str, destination) -> None:
     with db.get_pool().connection() as conn, conn.transaction():
         conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
@@ -105,8 +190,11 @@ def build(user_id: str, token: str, destination) -> None:
         def rows(query, params):
             return _rows(conn, query, params, deadline)
 
-        with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED,
-                             allowZip64=True) as archive:
+        with (tempfile.TemporaryFile() as conversations,
+              tempfile.TemporaryFile() as memories,
+              zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED,
+                              allowZip64=True) as archive):
+            migration = _ImportJSON(conversations, memories)
             skipped = Counter()
 
             def read(doc, section, *, hydrate=False):
@@ -121,7 +209,7 @@ def build(user_id: str, token: str, destination) -> None:
             day = None
             try:
                 for item in rows(
-                        "SELECT ts,doc FROM chat_messages WHERE user_id=%s "
+                        "SELECT ts,doc,msg_id FROM chat_messages WHERE user_id=%s "
                         "ORDER BY ts,seq", (user_id,)):
                     doc = item["doc"]
                     if (doc.get("source") in NON_CONVERSATION_USER_SOURCES
@@ -156,18 +244,14 @@ def build(user_id: str, token: str, destination) -> None:
                             chat.close()
                         day = next_day
                         chat = archive.open(f"chat/{day}.md", "w", force_zip64=True)
-                    role = doc.get("role")
-                    speaker = ("我 / Me" if role in {"user", "human"} else
-                               "TA / Agent" if role in {"openclaw", "agent", "assistant"}
-                               else "对话 / Conversation")
-                    heading = f"## {stamp.isoformat()} — {speaker}\n\n"
-                    chat.write((heading + text + "\n\n").encode("utf-8"))
+                    chat.write(_chat_markdown(stamp, doc.get("role"), text).encode("utf-8"))
+                    migration.chat(stamp, doc.get("role"), item["msg_id"], text)
             finally:
                 if chat:
                     chat.close()
             with archive.open("memories.md", "w", force_zip64=True) as output:
                 output.write(b"# Memories\n\n")
-                for item in rows( "SELECT doc FROM memory_moments "
+                for item in rows( "SELECT moment_id,doc FROM memory_moments "
                                   "WHERE user_id=%s ORDER BY occurred_at,moment_id", (user_id,)):
                     doc = item["doc"]
                     value = read(doc, "Memory cards")
@@ -178,6 +262,10 @@ def build(user_id: str, token: str, destination) -> None:
                     text = _present(value)
                     output.write((f"## {doc.get('occurred_at', '')}{label}\n\n"
                                   f"{text}\n\n").encode("utf-8"))
+                    mid = str(item["moment_id"])
+                    migration.memory("memory-cards/" + mid + ".md",
+                                     ("已归档 / Archived\n\n" if archived else "") + text,
+                                     doc.get("occurred_at"))
             for item in rows( "SELECT kind,doc FROM user_blobs "
                               "WHERE user_id=%s AND kind=ANY(%s) ORDER BY kind",
                               (user_id, ["identity", "genesis_persona", "v2_agent_profile"])):
@@ -211,26 +299,45 @@ def build(user_id: str, token: str, destination) -> None:
                         fields.append(f"## {key}\n\n{value}")
                     text, name = "\n\n".join(fields), "profile.md"
                 archive.writestr(name, text)
+                migration.memory(name, text, doc.get("updated_at"))
             for item in rows( "SELECT entry_id,doc FROM world_book_entries "
                               "WHERE user_id=%s ORDER BY entry_id", (user_id,)):
                 # Stable safe name, not a user-authored filename with traversal.
                 name = hashlib.sha256(str(item["entry_id"]).encode()).hexdigest()[:24]
                 value = read(item["doc"], "World book entries")
                 if value is not None:
-                    archive.writestr(f"world-book/{name}.md", _present(value))
-            for item in rows( "SELECT path,content_envelope FROM v2_workspace_entries "
+                    path = f"world-book/{name}.md"
+                    archive.writestr(path, _present(value))
+                    migration.memory(path, _present(value), item["doc"].get("updated_at"))
+            for item in rows( "SELECT path,content_envelope,updated_at FROM v2_workspace_entries "
                               "WHERE user_id=%s ORDER BY path", (user_id,)):
                 target = _safe_workspace_path(item["path"])
                 if target:
                     value = read(item["content_envelope"], "Workspace files")
                     if value is not None:
                         archive.writestr(target, value)
+                        migration.memory(target, value, item["updated_at"])
+            migration.finish(archive)
             labels = ("Chat messages", "Image captions", "Memory cards", "Identity",
                       "Persona", "Profile fields", "World book entries", "Workspace files")
             archive.writestr("README.md", (
                 "# IO data export\n\n"
                 f"Exported at {datetime.now(timezone.utc).isoformat()}.\n\n"
-                "Chat timestamps and date files use UTC. Speakers: 我 / Me and TA / Agent.\n\n"
+                "Chat timestamps and date files use UTC (+00:00). Speakers: 用户 (you) and 助手 (assistant).\n\n"
+                "Chat Markdown uses bracketed ISO timestamps and readable speakers. "
+                "Ordinary message bodies are unchanged. Risky speaker-like continuations "
+                "and embedded code fences use a variable-length literal code block.\n\n"
+                "conversations.json and memories/*.json are for Rokku history import. "
+                "They use the same selected plaintext as the Markdown, without Markdown "
+                "chat fences. JSON takes precedence, so Markdown is not imported twice. "
+                "Memories, identity, persona, profile, world book and owned workspace "
+                "Markdown become imported memory summaries, not restored Rokku settings "
+                "or workspace files. Archived cards remain explicitly marked. "
+                "Rokku may label this mixed archive as Claude because it recognizes the "
+                "memory_files structure; this label does not identify the source product. "
+                "The stable io-export namespace and stable paths aid repeated imports; "
+                "content changes remain separate records. Missing original dates produce "
+                "timestamp_missing warnings. Rokku's own import size/resource limits apply.\n\n"
                 "Contains current chat, all memory cards (archived cards individually marked), "
                 "identity, persona, world book, profile and owned Markdown workspace files.\n\n"
                 "Excluded: cleared chat, internal messages, image bytes/frames, binary files, "
