@@ -76,7 +76,21 @@ maintain 不接受 retention_days；旧 main 删除版会失败，不能仅靠�
 3. ATTACH 校验日表及 DEFAULT；失败恢复该批所有行和 DDL。先前已成功日期保留，
    重跑安全、幂等。没有整次运行的全局回滚承诺。不要在外层事务中调用 `maintain()`，
    它会拒绝，避免 savepoint 将锁延长到整轮结束。
-4. parent 的 ACCESS EXCLUSIVE 会阻塞写入和经 parent 的读取；每个批次结束释放。
+4. repair 的日期早于本次维护启动的北京日期时，parent ONLY 取 SHARE UPDATE EXCLUSIVE；
+   当前日/未来日仍取 ACCESS EXCLUSIVE。DEFAULT 仍取 ACCESS EXCLUSIVE；读到 DEFAULT 的查询及
+   路由进 DEFAULT 的写入仍会等待。只有实际已挂载的当日日分区写入可在旧日整理期间继续，
+   「已建明天分区」不能替代今天已覆盖，需等新北京日到来再只读确认。
+   迟到写入可能先路由 DEFAULT、等 ATTACH 提交后报23514；strict writer 在整批事务完整回滚后
+   有界重试，重新取得用户锁并重读 clear tombstone，避免半批重复或清除后复活。重试预算为
+   batch中不同过去北京日的个数（最少1次）；不能映射Python日期的时间戳保守按值计入有限预算，
+   仍交由数据库校验。这样连续两个日子的ATTACH不会在一次重试后就丢整批；永久CHECK错误
+   耗尽预算仍上报，其他SQLSTATE/连接或commit不明不重试。
+   strict clear先取用户advisory、再同事务取得parent SUE，最后规划DELETE；debug-tool delete
+   直接同事务取parent SUE再规划DELETE。避免旧分区计划在DEFAULT等锁后漏掉已搬行。
+   clear不能持parent锁等待用户advisory：排队的parent AEX可能挡住该用户writer的ROW EXCLUSIVE
+   请求形成死锁。维护不取得用户advisory，按用户→parent的顺序没有维护反向等用户的环路。
+   新旧维护与writer/clear代码需配套发布；
+   不对旧writer单独放宽父锁，不承诺生产锁窗<5s。每个批次结束释放锁。
    DEFAULT 在 ATTACH 时仍可能被扫描，逐日不等于完全在线或毫秒级。遇锁等待超过2s、
    单语句超过30s则该批回滚并失败；语句超时不是整个批次耗时上限。
 5. session advisory lock 防止两路维护同时运行；结束/异常释放，断线由PG释放。
