@@ -12,6 +12,12 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Data exports preserve Markdown and add Rokku-compatible chat JSON plus sharded
+  memory JSON from the same selected content. Memory, profile and owned workspace
+  content imports as memory summaries. Chat Markdown uses readable speakers and
+  ISO UTC timestamps, protecting risky continuations from accidental splitting.
+  Rokku's import limits apply; no live import or production rollout is implied.
+
 - Adds opt-in Cloudflare Email Sending for data exports, with explicit recipient
   allowlists, bounded delivery attempts and visible failure states. Mail contains
   only a seven-day bearer download link; the recipient and link are disclosed to

@@ -1,6 +1,6 @@
 ---
 title: Data export
-description: User-requested asynchronous Markdown archives.
+description: User-requested asynchronous Markdown and history-import archives.
 document_lifecycle: current
 canonical_owner: self
 ---
@@ -17,7 +17,7 @@ Poll `GET /v1/content/export-jobs/{job_id}`, or
 Status is queued, processing, completed, failed or expired. These responses
 never return the recipient or signed download URL.
 
-The archive contains Markdown: current chat grouped by UTC date, all memory
+The archive preserves human-readable Markdown: current chat grouped by UTC date, all memory
 cards with archived cards individually marked **已归档 / Archived**, identity,
 persona, world book, the V2 MEMORY/STYLE/user profile, `/memory/WORKING.md`
 and `/workspace/**/*.md`. Files are selected by account ownership across
@@ -29,12 +29,48 @@ cleared chat, image bytes, screen frames, binary attachments, Canvas HTML,
 skills and artifact caches are excluded. Chat text attachments are included
 only for text MIME types with .md or .txt filenames.
 Photo messages retain an Image placeholder plus any readable caption, without
-fetching the image. Speakers are Me/Agent; chat times and date files use UTC.
+fetching the image. Chat speakers are 用户 (you) and 助手 (assistant), with bracketed ISO timestamps
+and UTC (+00:00) date files. Ordinary message bodies stay literal; embedded code
+fences and speaker-like continuation lines use a variable-length code fence to
+prevent a Markdown importer from splitting one message into several. Unknown
+chat roles fail the export rather than being silently attributed to a speaker.
 Encrypted device-only (local_only) records without a server decryption key are
 omitted and counted by section in README.md. Plaintext local_only records remain
 included. Unexpected decryption failures still fail the job; they are not
 silently counted as exclusions.
 No model request is needed to create an export.
+
+The same selection and decryption pass also writes `conversations.json` and
+`memories/*.json` for Rokku history import. JSON chat contains the original
+unfenced body, normalized user/assistant role, stable IO message ID and ISO
+UTC timestamp; each UTC day is one conversation. The Markdown remains available
+for reading and as a chat-only import fallback when JSON is absent. With JSON
+present, Rokku selects JSON instead of importing the Markdown a second time.
+
+Each readable memory card, identity, persona, V2 profile, world-book entry and
+owned Markdown workspace file becomes one Claude-shaped `memory_file`, with
+one file per JSON shard. Archived cards retain an explicit archived label.
+These are **imported memory summaries**, not a restoration of Rokku settings,
+persona configuration or workspace files. The mixed archive may receive Rokku's
+`claude` format label because of this memory schema; that label does not identify
+the source product. A fixed `io-export` namespace avoids exposing the IO account
+ID. Stable paths and message IDs support deduplication on repeated imports;
+changed memory content remains a separate record. Importing different IO accounts
+into the same Rokku account shares this namespace, so identical metadata at the
+same path can deduplicate. Workspace dates come from the durable table's `updated_at` column, not its
+content envelope. Naive historical ISO dates follow IO's existing UTC read
+convention; date-only values use midnight UTC, matching Rokku's interpretation
+(the original date remains visible in Markdown). Empty or invalid dates are
+omitted, never replaced with export time. Undated profile or memory content can
+therefore produce `timestamp_missing` warnings without losing that content.
+
+Compatibility is verified against Rokku parser commit `7845015f`. Rokku's own
+resource limits still apply: by default 8 MiB per normalized record, 64 MiB per
+conversation/JSON root, 50,000 conversations, 2 million records and archive
+compression checks. Memory sharding avoids a single growing memory root; it
+does not split an oversized individual note or a day's chat. The IO exporter
+does not truncate account data to fit those limits. Parser acceptance of a local
+archive does not prove completion of a live Rokku import.
 
 An export is an explicit authorization to decrypt account content on the
 server. Unlike the legacy ciphertext JSON endpoint, this worker receives
