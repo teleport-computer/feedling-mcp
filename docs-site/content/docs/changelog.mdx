@@ -12,6 +12,11 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Production export deployment wiring now keeps admission disabled until both a
+  dedicated bucket and complete real-mail configuration are supplied. Arbitrary
+  recipients require an explicit operator allowlist choice. No production rollout
+  or provisioning is implied.
+
 - Data exports preserve Markdown and add Rokku-compatible chat JSON plus sharded
   memory JSON from the same selected content. Memory, profile and owned workspace
   content imports as memory summaries. Chat Markdown uses readable speakers and
