@@ -12,6 +12,14 @@ change must not be interpreted as an API guarantee.
 
 ## Unreleased
 
+- Past-day trace partition repair permits writes to existing daily partitions
+  while DEFAULT remains locked. After PostgreSQL `23514`, the strict writer
+  retries the entire batch within a budget based on its distinct past dates,
+  rechecking explicit-clear state after rollback; persistent failures remain
+  visible. Explicit clears coordinate with ATTACH before planning DELETE so
+  relocated rows cannot escape a clear. Current/future-day repair retains the
+  parent write fence. This does not authorize production repair.
+
 - Production export deployment wiring now keeps admission disabled until both a
   dedicated bucket and complete real-mail configuration are supplied. Arbitrary
   recipients require an explicit operator allowlist choice. No production rollout

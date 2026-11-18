@@ -654,7 +654,8 @@ In managed deployments, each trace event is an append-only row in the selected
 primary PostgreSQL database. The RDS and TEE migration chains carry the same
 table, index, and partition contract, but the service writes only the database
 selected as primary; it does not mirror or double-write trace rows. Daily
-partitions use Beijing-day boundaries and retain 30 days. A default partition
+partitions use Beijing-day boundaries; maintenance retains all historical rows
+and partitions. A default partition
 preserves events if rolling partition maintenance is late, but any row in that
 partition is a degraded state that the backend reports independently of the
 owner-only repair command.
@@ -665,8 +666,16 @@ end-to-end encrypted user envelopes. Their trust boundary follows the selected
 database: RDS-primary deployments store them in RDS, while TEE-primary
 deployments store them in TEE PostgreSQL. The table has no foreign key to the
 account row: deleting an account intentionally leaves its recent trace
-queryable by exact uid for incident diagnosis until retention or an explicit
-operator trace clear removes it. Each event also carries the same outcome
+queryable by exact uid for incident diagnosis until an explicit trace clear
+removes it. Past-day repair permits writes to already attached daily partitions
+while locking DEFAULT. A batch routed to DEFAULT before ATTACH can encounter
+PostgreSQL `23514`; the strict writer rolls back the entire transaction and retries
+with a fresh route and user-clear tombstone check. The finite budget permits one
+retry per distinct past Beijing date in the batch, with a minimum of one retry.
+Explicit trace clears serialize with ATTACH before planning their DELETE, including
+both strict user clear and the debug-tool deletion helper. Current/future-day repair
+still fences the parent; reads and writes accessing DEFAULT can remain blocked.
+This does not promise a maximum production lock duration. Each event also carries the same outcome
 classification used by Runtime job reporting: operational failure, timeout,
 control flow, or safety suppression. Keeping that vocabulary shared prevents
 trace investigation and the operational failure-rate dashboard from assigning

@@ -9144,23 +9144,56 @@ def insert_trace_events_strict(
         "provider,model,enqueue_source,summary,explain,detail,content_excerpt,dur_ms"
         ") VALUES (%s,to_timestamp(%s),%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)"
     )
-    with get_pool().connection() as conn:
-        with conn.transaction(), conn.cursor() as cur:
-            cur.execute(
-                "SELECT pg_advisory_xact_lock(hashtextextended(%s,184))",
-                (uid,),
-            )
-            row = cur.execute(
-                "SELECT CASE WHEN doc->>'cleared_at' ~ "
-                "'^[0-9]+([.][0-9]+)?$' THEN (doc->>'cleared_at')::double precision "
-                "ELSE 0 END FROM user_blobs WHERE user_id=%s AND kind=%s",
-                (uid, str(clear_flag_kind)),
-            ).fetchone()
-            cleared_at = float(row[0] or 0) if row else 0.0
-            eligible = [params for params in normalized if params[1] > cleared_at]
-            if eligible:
-                cur.executemany(statement, eligible)
-    return len(eligible)
+    # ATTACH can invalidate a DEFAULT route after this transaction waited for
+    # maintenance. PostgreSQL rejects that stale route with 23514. Roll back the
+    # whole batch before retrying, so earlier executemany rows cannot be
+    # duplicated and the user-clear tombstone is read under a fresh lock.
+    # Each past date can be attached once by the serialized maintainer. Allow
+    # one retry per distinct past date, since consecutive ATTACHes may race the
+    # same multi-day batch. Keep at least one retry for a first CHECK failure.
+    retries = 0
+    retry_budget = None
+    while True:
+        try:
+            with get_pool().connection() as conn:
+                with conn.transaction(), conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended(%s,184))",
+                        (uid,),
+                    )
+                    row = cur.execute(
+                        "SELECT CASE WHEN doc->>'cleared_at' ~ "
+                        "'^[0-9]+([.][0-9]+)?$' THEN (doc->>'cleared_at')::double precision "
+                        "ELSE 0 END FROM user_blobs WHERE user_id=%s AND kind=%s",
+                        (uid, str(clear_flag_kind)),
+                    ).fetchone()
+                    cleared_at = float(row[0] or 0) if row else 0.0
+                    eligible = [params for params in normalized if params[1] > cleared_at]
+                    if eligible:
+                        cur.executemany(statement, eligible)
+            return len(eligible)
+        except psycopg.errors.CheckViolation:
+            # Permanent CHECK failures still surface to the trace error ruler;
+            # connection/commit failures and other SQLSTATEs are never retried.
+            if retry_budget is None:
+                zone = ZoneInfo("Asia/Shanghai")
+                current_day = datetime.now(zone).date()
+                past_days = set()
+                for params in normalized:
+                    try:
+                        event_day = datetime.fromtimestamp(params[1], zone).date()
+                    except (OverflowError, OSError, ValueError):
+                        # Do not replace PostgreSQL's timestamp validation with
+                        # a Python date-range error. Count an unrepresentable
+                        # value conservatively; any DB error still surfaces.
+                        past_days.add(("unrepresentable", params[1]))
+                    else:
+                        if event_day < current_day:
+                            past_days.add(event_day)
+                retry_budget = max(1, len(past_days))
+            if retries >= retry_budget:
+                raise
+            retries += 1
 
 
 def enclave_decrypt_health_windows(window_minutes: int, *, now: datetime | None = None) -> tuple:
@@ -9574,11 +9607,15 @@ def delete_trace_events_for_user(user_id: str) -> int:
     if not uid:
         return 0
     with get_pool().connection() as conn:
-        row = conn.execute(
-            "WITH gone AS (DELETE FROM trace_events WHERE user_id=%s RETURNING 1) "
-            "SELECT count(*) FROM gone",
-            (uid,),
-        ).fetchone()
+        with conn.transaction():
+            # Plan DELETE only after an ATTACH has committed. Otherwise a plan
+            # waiting on DEFAULT can miss rows relocated to the new child.
+            conn.execute("LOCK TABLE ONLY trace_events IN SHARE UPDATE EXCLUSIVE MODE")
+            row = conn.execute(
+                "WITH gone AS (DELETE FROM trace_events WHERE user_id=%s RETURNING 1) "
+                "SELECT count(*) FROM gone",
+                (uid,),
+            ).fetchone()
     return int(row[0] if row else 0)
 
 
@@ -9600,6 +9637,11 @@ def clear_trace_events_strict(
                 "SELECT pg_advisory_xact_lock(hashtextextended(%s,184))",
                 (uid,),
             )
+            # User fence first: never hold the parent while waiting for a
+            # writer's user lock, since a queued parent AEX could block that
+            # writer. Then serialize with ATTACH before planning DELETE.
+            # Maintenance takes no user advisory locks, so it cannot wait back.
+            conn.execute("LOCK TABLE ONLY trace_events IN SHARE UPDATE EXCLUSIVE MODE")
             conn.execute(
                 "INSERT INTO user_blobs(user_id,kind,doc) VALUES (%s,%s,%s) "
                 "ON CONFLICT(user_id,kind) DO UPDATE SET doc=jsonb_set("
