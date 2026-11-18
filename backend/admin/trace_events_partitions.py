@@ -78,12 +78,14 @@ def _create_partition(conn: psycopg.Connection, day: date) -> None:
 
 
 def _repair_day(conn: psycopg.Connection, day: date, *, lock_timeout_ms: int,
-                statement_timeout_ms: int, repair_default: bool = True) -> dict:
+                statement_timeout_ms: int, repair_default: bool = True,
+                current_day: date | None = None) -> dict:
     """One committed day; every removed DEFAULT row is inserted before ATTACH.
 
-    Copy and index preparation allow ordinary writes. The final parent lock
-    fences application inserts and DEFAULT's lock fences direct writers while
-    synchronizing the copy and validating ATTACH. Failure rolls back the day.
+    Copy and index preparation allow ordinary writes. Past-day repairs allow
+    writes to other daily partitions while DEFAULT is fenced. Strict writers
+    retry a stale DEFAULT route only after rolling back their whole batch.
+    Current/future days retain the parent fence. Failure rolls back the day.
     """
     lower, upper = _bounds(day)
     name = _name(day)
@@ -111,7 +113,12 @@ def _repair_day(conn: psycopg.Connection, day: date, *, lock_timeout_ms: int,
             if repair_default:
                 _copy_day(conn, day)
             prepared = clock.monotonic()
-            conn.execute("LOCK TABLE ONLY trace_events IN ACCESS EXCLUSIVE MODE")
+            # Never weaken today's/future routing fence. Past-day repair allows
+            # current partition traffic; strict writers retry a stale DEFAULT
+            # route's 23514 only after their whole transaction has rolled back.
+            past_repair = repair_default and current_day is not None and day < current_day
+            parent_lock = "SHARE UPDATE EXCLUSIVE" if past_repair else "ACCESS EXCLUSIVE"
+            conn.execute(f"LOCK TABLE ONLY trace_events IN {parent_lock} MODE")
             acquired = clock.monotonic()
             conn.execute("LOCK TABLE trace_events_default IN ACCESS EXCLUSIVE MODE")
             if not repair_default and conn.execute(
@@ -240,7 +247,7 @@ def maintain(
                 continue
             try:
                 batches.append(_repair_day(
-                    conn, day, repair_default=repair_default,
+                    conn, day, repair_default=repair_default, current_day=current,
                     lock_timeout_ms=lock_timeout_ms if repair_default else min(lock_timeout_ms, 100),
                     statement_timeout_ms=statement_timeout_ms if repair_default else min(statement_timeout_ms, 250),
                 ))

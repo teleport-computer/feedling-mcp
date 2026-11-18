@@ -989,7 +989,7 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (81 files)
+      - name: Run CI security tier 3 (82 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -1057,6 +1057,7 @@ jobs:
             tests/test_tee_verify.py \
             tests/test_trace_events.py \
             tests/test_trace_partition_preservation.py \
+            tests/test_trace_partition_retry.py \
             tests/test_trace_events_cleanup.py \
             tests/test_user_mcp_ca_fetch.py \
             tests/test_user_mcp_ca_fetch_leaf.py \

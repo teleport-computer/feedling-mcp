@@ -978,8 +978,21 @@ retries, budgets, public errors, or memory-write behavior.
   `TRACE_EVENTS_MIGRATION_DATABASE_URL` (the TEE migration workflow also accepts
   `TEE_MIGRATION_DATABASE_URL`); never grant DDL to the application role solely
   for repair. Each day pre-copies rows while writes can continue, then synchronizes and
-  attaches under parent/DEFAULT locks: a failed
-  day rolls back, earlier days remain committed, and reruns are idempotent.
+  attaches under parent/DEFAULT locks. Repairs of days before the maintenance
+  start date use a parent `SHARE UPDATE EXCLUSIVE` lock; current/future days keep
+  `ACCESS EXCLUSIVE`. DEFAULT still takes `ACCESS EXCLUSIVE`: writes routed there
+  and reads that access it can wait. Writes to an already attached current-day
+  partition can proceed during past-day repair. A stale DEFAULT route can fail
+  with PostgreSQL `23514` after ATTACH; the strict trace writer rolls back and
+  retries its whole batch after rollback, including rechecking the user-clear
+  tombstone. The retry budget is one per distinct past Beijing day in the batch,
+  with at least one retry; this covers successive ATTACHes racing a multi-day
+  batch. Unrepresentable timestamps are conservatively counted toward the finite
+  budget and remain subject to database validation. Permanent CHECK failures
+  surface when that budget is exhausted; other database errors are not retried.
+  Explicit clear/delete operations take a conflicting parent lock before planning
+  DELETE, so an old partition plan cannot leave relocated rows behind. A failed maintenance day rolls back,
+  earlier days remain committed, and reruns are idempotent.
   ATTACH may scan DEFAULT, so measure a comparable backlog and use a low-traffic
   window for the first repair. Lock/statement timeouts fail the batch without
   discarding its rows. DEFAULT remaining non-empty still signals degradation.
