@@ -533,3 +533,17 @@ Setup 与手动 test 的 `model_api.provider_probe.*` trace 在 `detail.status_c
 success（返回结果未提供 HTTP 状态）和 runtime_fenced 控制事件为 null。
 此诊断字段可区分 401/402/403，不改变原有 error_class、HTTP 回执或重试分类；
 trace 不记录异常消息、response_detail 或原始响应正文。
+
+## Asynchronous user export
+
+- `invalid_email` (400): invalid recipient address.
+- `export_in_progress` (409): an active export already exists; includes job_id/status.
+- `export_daily_limit` (429): per-user UTC daily limit reached (default 3).
+- `export_unavailable` (503): export worker/storage configuration is unavailable.
+- `export_job_not_found` (404): no owned export job exists.
+- `export_failed`: durable job failure, exposed only as job error_code.
+- `export_recipient_not_allowed`: terminal unsent job; recipient is outside the email allowlist, no archive is built/uploaded.
+- `export_email_rejected` / `export_email_not_accepted` / `export_email_invalid_response`: terminal mail failure; provider did not establish recipient acceptance.
+- `export_email_transient` / `export_email_timeout`: HTTP 429 throttling, 5xx or network/timeout failure; queued with a one-minute backoff within the three-attempt budget, then terminal failed. Other 4xx is terminal.
+- `export_email_unconfigured`: selected real mailer configuration became unavailable; never falls back to logging completion.
+- `export_cleanup_failed` (503 on reset): plaintext export object cleanup failed; account deletion aborted.

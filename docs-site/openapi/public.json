@@ -1966,6 +1966,276 @@
         "x-feedling-contract-level": "documented"
       }
     },
+    "/v1/content/export-jobs": {
+      "post": {
+        "summary": "Create Export Job",
+        "operationId": "create_export_job_v1_content_export_jobs_post",
+        "responses": {
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Export job status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserExportJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "invalid_email",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error_code"
+                  ],
+                  "properties": {
+                    "error_code": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "export_in_progress; includes current job_id/status",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error_code"
+                  ],
+                  "properties": {
+                    "error_code": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "export_daily_limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error_code"
+                  ],
+                  "properties": {
+                    "error_code": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "export_unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error_code"
+                  ],
+                  "properties": {
+                    "error_code": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Content"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "email"
+                ],
+                "properties": {
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "maxLength": 254
+                  }
+                },
+                "additionalProperties": true
+              }
+            }
+          }
+        },
+        "x-feedling-contract-level": "documented",
+        "description": "API-key-only asynchronous Markdown export. One active job per user; default three requests per UTC day. Status contains no email or download URL. Completed private download links last seven days; the currently supplied mailer only logs a content-free placeholder and does not deliver email."
+      }
+    },
+    "/v1/content/export-jobs/latest": {
+      "get": {
+        "summary": "Latest Export Job",
+        "operationId": "latest_export_job_v1_content_export_jobs_latest_get",
+        "responses": {
+          "200": {
+            "description": "Export job status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserExportJob"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "export_job_not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error_code"
+                  ],
+                  "properties": {
+                    "error_code": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Content"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "API-key-only asynchronous Markdown export. One active job per user; default three requests per UTC day. Status contains no email or download URL. Completed private download links last seven days; the currently supplied mailer only logs a content-free placeholder and does not deliver email."
+      }
+    },
+    "/v1/content/export-jobs/{job_id}": {
+      "get": {
+        "summary": "Get Export Job",
+        "operationId": "get_export_job_v1_content_export_jobs__job_id__get",
+        "parameters": [
+          {
+            "name": "job_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Job Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Export job status.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserExportJob"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid path or request parameter.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "default": {
+            "description": "Error response.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "export_job_not_found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "required": [
+                    "error_code"
+                  ],
+                  "properties": {
+                    "error_code": {
+                      "type": "string"
+                    }
+                  },
+                  "additionalProperties": true
+                }
+              }
+            }
+          }
+        },
+        "tags": [
+          "Content"
+        ],
+        "security": [
+          {
+            "ApiKeyAuth": []
+          }
+        ],
+        "x-feedling-contract-level": "documented",
+        "description": "API-key-only asynchronous Markdown export. One active job per user; default three requests per UTC day. Status contains no email or download URL. Completed private download links last seven days; the currently supplied mailer only logs a content-free placeholder and does not deliver email."
+      }
+    },
     "/v1/content/rewrap-to-current-key": {
       "post": {
         "summary": "Content Rewrap To Current Key",
@@ -13237,6 +13507,58 @@
           "apns_env": "production",
           "log_id": 42
         }
+      },
+      "UserExportJob": {
+        "type": "object",
+        "required": [
+          "job_id",
+          "status",
+          "created_at",
+          "expires_at",
+          "error_code"
+        ],
+        "properties": {
+          "job_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string",
+            "enum": [
+              "queued",
+              "processing",
+              "completed",
+              "failed",
+              "expired"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "error_code": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Stable job failure category; recipient allowlist rejection uses export_recipient_not_allowed. Email rejection/not-accepted/invalid-response is terminal; transient/timeout may be queued within the attempt budget."
+          }
+        },
+        "additionalProperties": false
       }
     },
     "securitySchemes": {

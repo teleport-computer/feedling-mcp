@@ -46,6 +46,18 @@ jobs:
       - name: Install migration dependencies
         run: pip install --require-hashes -r backend/requirements.lock
 
+      - name: Require lossless trace maintenance code
+        env:
+          PYTHONPATH: backend
+        run: |
+          python - <<'PYGUARD'
+          import inspect
+          from admin import trace_events_partitions as partitions
+          if (getattr(partitions, "LOSSLESS_PARTITION_MAINTENANCE", False) is not True
+                  or "retention_days" in inspect.signature(partitions.maintain).parameters):
+              raise SystemExit("::error::checked-out trace maintenance is not lossless; release required")
+          PYGUARD
+
       - name: Maintain selected RDS trace partitions
         env:
           PYTHONPATH: backend

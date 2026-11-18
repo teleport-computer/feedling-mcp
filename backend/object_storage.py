@@ -1,4 +1,7 @@
-"""Cloudflare R2 (S3-compatible) object storage for heavy frame ciphertext.
+"""Cloudflare R2 (S3-compatible) storage for attachments and user export packages.
+
+Explicit user-requested exports are plaintext ZIPs in a separate private bucket;
+their lifetime and deletion contract differs from encrypted frame attachments.
 
 A v1 frame envelope's ``body_ct`` is the >150KB ChaCha20-Poly1305 screenshot
 blob; left inline in ``frame_envelopes.doc`` it bloats the row (TOAST) and the
@@ -605,3 +608,43 @@ def _is_missing_object(e) -> bool:
         if code in ("NoSuchKey", "404"):
             return True
     return e.__class__.__name__ in ("NoSuchKey", "404")
+
+
+# User-authorized plaintext exports are separate from encrypted attachment data.
+# Provision this private bucket/prefix lifecycle externally; runtime never changes it.
+def exports_enabled() -> bool:
+    return bool(_endpoint() and _access_key() and _secret_key()
+                and os.environ.get("R2_EXPORTS_BUCKET", "").strip())
+
+
+def _export_bucket() -> str:
+    bucket = os.environ.get("R2_EXPORTS_BUCKET", "").strip()
+    if not exports_enabled():
+        raise RuntimeError("export_storage_unavailable")
+    return bucket
+
+
+def upload_export(key: str, archive_path: str) -> None:
+    if not key.startswith("user-exports/"):
+        raise ValueError("invalid_export_key")
+    with open(archive_path, "rb") as source:
+        # Single PUT avoids abandoned multipart uploads; S3's 5GB limit fails
+        # explicitly instead of publishing an incomplete archive.
+        _client().put_object(Bucket=_export_bucket(), Key=key, Body=source,
+                             ContentType="application/zip",
+                             CacheControl="private, no-store")
+
+
+def export_download_url(key: str, *, ttl: int = 604800) -> str:
+    if ttl < 1 or ttl > 604800 or not key.startswith("user-exports/"):
+        raise ValueError("invalid_export_url")
+    return _client().generate_presigned_url(
+        "get_object", Params={"Bucket": _export_bucket(), "Key": key},
+        ExpiresIn=ttl,
+    )
+
+
+def delete_export(key: str) -> None:
+    if not key.startswith("user-exports/"):
+        raise ValueError("invalid_export_key")
+    _client().delete_object(Bucket=_export_bucket(), Key=key)

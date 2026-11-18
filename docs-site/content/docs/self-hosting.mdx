@@ -967,15 +967,32 @@ retries, budgets, public errors, or memory-write behavior.
   Runtime V2 per-pool heartbeats, slot restarts, Enclave waits, queue age, disk
   use, backup age, and trace-partition health. Treat a non-empty
   `trace_events_default` partition as degraded even when writes still succeed;
-  the initial migration creates 29 past and 60 future Beijing-day partitions,
-  so schedule maintenance before that horizon expires. Run
-  `python -m admin.trace_events_partitions` outside the request-serving path
-  with a migration-capable credential in
-  `TRACE_EVENTS_MIGRATION_DATABASE_URL` (the existing TEE workflow may continue
-  to use `TEE_MIGRATION_DATABASE_URL`); never grant DDL to the application role
-  solely for partition repair. Repository operators can invoke the guarded
-  **RDS trace partition maintenance** workflow for `test`, `pre`, or `prod`;
-  production execution remains a separate, explicit operator action.
+  maintenance preserves every trace regardless of age. DEFAULT repair requires
+  explicit `--repair-default` in an authorized manual window. Automatic/default
+  CLI execution only builds unoccupied future days with short lock/statement
+  budgets; large backlogs or deferred dates remain degraded for manual repair. It moves stranded rows
+  into their Beijing-day partitions and creates only today through the next
+  60 days plus dates actually present in DEFAULT. It never purges old rows or
+  drops old partitions. Run `python -m admin.trace_events_partitions` outside
+  the request-serving path with a migration-capable credential in
+  `TRACE_EVENTS_MIGRATION_DATABASE_URL` (the TEE migration workflow also accepts
+  `TEE_MIGRATION_DATABASE_URL`); never grant DDL to the application role solely
+  for repair. Each day pre-copies rows while writes can continue, then synchronizes and
+  attaches under parent/DEFAULT locks: a failed
+  day rolls back, earlier days remain committed, and reruns are idempotent.
+  ATTACH may scan DEFAULT, so measure a comparable backlog and use a low-traffic
+  window for the first repair. Lock/statement timeouts fail the batch without
+  discarding its rows. DEFAULT remaining non-empty still signals degradation.
+  The health report declares `retention: forever`, nullable `retention_days`
+  and `projected_retained_bytes`, and a separate 30-day growth projection;
+  retained old partitions no longer count as expired.
+  Each day commits separately. Repository TEE operators can use **TEE trace partition maintenance** for
+  daily test/prod maintenance; pre is paused. GitHub schedules run only from
+  default branch `main`, so merging into `test` does not activate production
+  automation. Production also requires explicit release approval and repository
+  variable `TRACE_PARTITIONS_PROD_ENABLED=true`. The manual RDS workflow remains
+  for environments actually using RDS. Existing explicit user trace-clear APIs
+  retain their separate behavior; this retention policy governs maintenance.
 - Keep unrelated tenant code and secrets out of a shared process runner.
 - Commission an isolation and abuse review before offering the deployment to
   untrusted public users.
@@ -1044,3 +1061,21 @@ its baseline. The canary compares that key with the backend advertisement and
 checks an encrypt/decrypt round trip. Neither verifies AppAuth contract/chain,
 image digest, compose URL, or DCAP quote validity. A successful gate or canary
 must not be presented as complete policy verification.
+
+
+## User-authorized data export
+
+The [asynchronous export workflow](workflows/data-export) explicitly permits
+server-side decryption into a private, temporary Markdown ZIP. This is a
+user-initiated exception to ciphertext-only content transport. The dedicated
+plaintext export bucket needs private access and seven-day lifecycle deletion.
+The main serve-worker owns this queue for both hosted runtime cohorts; runner
+CLI caches, skills and Canvas are not export sources. Self-hosted users should
+export their local data rather than assume the hosted service has it.
+
+When the optional Cloudflare export mailer is selected, the recipient address and
+seven-day bearer download link leave the VM for Cloudflare Email Sending. The email
+contains no chat content or archive attachment. Concrete allowlists restrict test
+delivery; provider acceptance does not prove inbox delivery. See the
+[data export operator guide](workflows/data-export) for fail-closed configuration
+and bounded retry/duplicate-delivery limits. Production/pre settings are unchanged.

@@ -200,6 +200,15 @@ def test_perception_signal_state_uses_snapshot_lane():
     assert entry.lane == reg.SNAPSHOT
 
 
+def test_export_jobs_preserve_lifecycle_and_capture_only_job_keys():
+    entry = reg.REGISTRY["user_export_jobs"]
+    assert entry.lane == reg.SNAPSHOT
+    assert entry.tee_required is True
+    assert entry.key_columns == ("job_id",)
+    assert entry.capture_key_columns == ("job_id",)
+    assert entry.destination_table == "user_export_jobs"
+
+
 def test_contract_rejection_stats_uses_mirror_lane_and_reconciler_key():
     from tee_shadow import reconciler
 

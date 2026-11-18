@@ -1,0 +1,181 @@
+---
+title: Data export
+description: User-requested asynchronous Markdown and history-import archives.
+document_lifecycle: current
+canonical_owner: self
+---
+
+Submit an account API key to `POST /v1/content/export-jobs` with
+`{"email":"person@example.com"}`. The address may be any valid recipient.
+The response is 202 with `job_id`, `status`, `created_at`, `expires_at`
+and `error_code`. Runtime tokens cannot request or inspect these jobs.
+There is one active job per account, with three accepted requests per UTC day
+by default. An active request returns 409 and its job ID; the daily limit returns 429.
+
+Poll `GET /v1/content/export-jobs/{job_id}`, or
+`GET /v1/content/export-jobs/latest` when opening the export page.
+Status is queued, processing, completed, failed or expired. These responses
+never return the recipient or signed download URL.
+
+The archive preserves human-readable Markdown: current chat grouped by UTC date, all memory
+cards with archived cards individually marked **已归档 / Archived**, identity,
+persona, world book, the V2 MEMORY/STYLE/user profile, `/memory/WORKING.md`
+and `/workspace/**/*.md`. Files are selected by account ownership across
+past and current runtimes. Conversation-compaction summaries are temporary
+context caches, not long-term user descriptions, and are excluded.
+
+Internal verify/maintenance messages and their replies, system-role notices,
+cleared chat, image bytes, screen frames, binary attachments, Canvas HTML,
+skills and artifact caches are excluded. Chat text attachments are included
+only for text MIME types with .md or .txt filenames.
+Photo messages retain an Image placeholder plus any readable caption, without
+fetching the image. Chat speakers are 用户 (you) and 助手 (assistant), with bracketed ISO timestamps
+and UTC (+00:00) date files. Ordinary message bodies stay literal; embedded code
+fences and speaker-like continuation lines use a variable-length code fence to
+prevent a Markdown importer from splitting one message into several. Unknown
+chat roles fail the export rather than being silently attributed to a speaker.
+Encrypted device-only (local_only) records without a server decryption key are
+omitted and counted by section in README.md. Plaintext local_only records remain
+included. Unexpected decryption failures still fail the job; they are not
+silently counted as exclusions.
+No model request is needed to create an export.
+
+The same selection and decryption pass also writes `conversations.json` and
+`memories/*.json` for Rokku history import. JSON chat contains the original
+unfenced body, normalized user/assistant role, stable IO message ID and ISO
+UTC timestamp; each UTC day is one conversation. The Markdown remains available
+for reading and as a chat-only import fallback when JSON is absent. With JSON
+present, Rokku selects JSON instead of importing the Markdown a second time.
+
+Each readable memory card, identity, persona, V2 profile, world-book entry and
+owned Markdown workspace file becomes one Claude-shaped `memory_file`, with
+one file per JSON shard. Archived cards retain an explicit archived label.
+These are **imported memory summaries**, not a restoration of Rokku settings,
+persona configuration or workspace files. The mixed archive may receive Rokku's
+`claude` format label because of this memory schema; that label does not identify
+the source product. A fixed `io-export` namespace avoids exposing the IO account
+ID. Stable paths and message IDs support deduplication on repeated imports;
+changed memory content remains a separate record. Importing different IO accounts
+into the same Rokku account shares this namespace, so identical metadata at the
+same path can deduplicate. Workspace dates come from the durable table's `updated_at` column, not its
+content envelope. Naive historical ISO dates follow IO's existing UTC read
+convention; date-only values use midnight UTC, matching Rokku's interpretation
+(the original date remains visible in Markdown). Empty or invalid dates are
+omitted, never replaced with export time. Undated profile or memory content can
+therefore produce `timestamp_missing` warnings without losing that content.
+
+Compatibility is verified against Rokku parser commit `7845015f`. Rokku's own
+resource limits still apply: by default 8 MiB per normalized record, 64 MiB per
+conversation/JSON root, 50,000 conversations, 2 million records and archive
+compression checks. Memory sharding avoids a single growing memory root; it
+does not split an oversized individual note or a day's chat. The IO exporter
+does not truncate account data to fit those limits. Parser acceptance of a local
+archive does not prove completion of a live Rokku import.
+
+An export is an explicit authorization to decrypt account content on the
+server. Unlike the legacy ciphertext JSON endpoint, this worker receives
+plaintext, writes a temporary private ZIP, uploads it to private object storage,
+and removes its local temporary directory. Treat this export bucket as
+plaintext user data. It is separate from encrypted chat attachment storage.
+A signed download URL is a bearer credential; never place it in application logs.
+
+Links last seven days. Expiry cleanup deletes objects automatically and retries
+storage failures. Operators must additionally provision a seven-day bucket
+lifecycle rule as a backstop; this application does not mutate bucket policy.
+Account deletion/reset revokes existing export objects and removes pending jobs.
+If storage cleanup fails, deletion fails rather than reporting success with a
+readable package left behind. Archive generation does not block account deletion. Immediately before
+publication, the worker takes the per-user lifecycle fence and rechecks the
+account/job. A result built for a deleted account is discarded without upload
+or mail. Only upload/mail/completion and existing-object cleanup hold the fence.
+Account reset does not wait for these operations under the global registry lock.
+
+The default `log` mailer is a **logging placeholder**. It records only the job ID
+and whether a link was generated, without sending mail or logging the address/link.
+A completed job in this mode proves archive/upload/placeholder completion only.
+
+The opt-in `cloudflare` mailer uses the official
+[Cloudflare Email Sending REST API](https://developers.cloudflare.com/email-service/api/send-emails/rest-api/).
+Its bilingual email contains only a private download link and a seven-day validity
+notice, never chat content or archive attachments. Cloudflare receives the recipient
+address and bearer download link; this is an additional data recipient outside the
+confidential VM. A provider response must explicitly report the recipient as
+delivered or queued before the job completes. Queued acceptance does not prove
+arrival in the inbox; bounced or suppressed recipients fail the job.
+
+The mail HTTP operation has an eight-second total deadline within the publication
+fence, follows no redirects and uses no environment proxy. HTTP 429 throttling,
+5xx and network/timeouts use the existing maximum of three attempts with a
+one-minute backoff; other HTTP 4xx is terminal. Failed attempts
+delete the uploaded object and reuse the same object key on retry. The API does not
+document provider-side idempotency; the job header is correlation only. A timeout,
+or a crash after sending but before recording completion, can produce a duplicate
+email. This is best-effort delivery, not exactly-once delivery. Application mail logs
+contain only recipient domain, outcome, HTTP/numeric code and fixed error category.
+Non-2xx bodies share the deadline and size cap; only an integer provider error code
+is extracted. Malformed or oversized diagnostics use code 0 and preserve the HTTP
+failure classification. Raw provider message text is never logged.
+
+An address outside the configured allowlist ends as `failed` with
+`error_code=export_recipient_not_allowed`, before archive building/upload, and its
+stored email is cleared. Terminal delivery failure also clears the email; existing
+cleanup retry coordinates remain until object deletion succeeds. Status fields and
+the iOS contract are unchanged.
+
+## Operator configuration
+
+Exports default to disabled. Set `FEEDLING_EXPORT_ENABLED=1`,
+`FEEDLING_EXPORT_MAILER=log`, `FEEDLING_RUNTIME_TOKEN_SECRET`,
+`R2_EXPORTS_BUCKET` and the existing R2 endpoint/access credentials.
+Provision a private, non-versioned bucket and its lifecycle externally.
+The default `FEEDLING_EXPORT_DAILY_LIMIT` is 3.
+The serve-worker process hosts the export polling/expiry loop; no new Redis
+queue or provider dependency is introduced.
+
+For the hosted test environment, `deploy-test-cvm` reads the GitHub repository
+variable `TEST_R2_EXPORTS_BUCKET`. A nonempty value enables export admission;
+an empty or unset value explicitly disables it. Only set this variable after
+provisioning the private test bucket, its seven-day lifecycle and access for
+the existing test R2 credentials. The deployment forwards the bucket and
+enable flag to both backend and serve-worker.
+`TEST_FEEDLING_EXPORT_DAILY_LIMIT` optionally overrides the default of 3.
+Changing these variables requires a test deployment. Production and pre
+deployments do not enable this feature through this test configuration.
+
+To select real mail on test, also provision GitHub secret
+`TEST_CLOUDFLARE_EMAIL_TOKEN` and repository variables
+`TEST_CLOUDFLARE_EMAIL_ACCOUNT_ID`, `TEST_EXPORT_EMAIL_FROM` (the approved sender is
+`welcome@rokku.ai`) and `TEST_EXPORT_EMAIL_ALLOWLIST` (comma-separated concrete
+addresses). Only when all four are nonempty does the test deployment select
+`cloudflare`; otherwise it selects `log`. Test deployment rejects wildcard lists.
+The existing private export bucket and credentials are still required.
+Token Email Sending permission and domain verification must be checked separately;
+a token merely being active does not establish either prerequisite. CI uses mock
+HTTP only and never sends email.
+
+At runtime, explicitly choosing `FEEDLING_EXPORT_MAILER=cloudflare` requires
+`CLOUDFLARE_EMAIL_TOKEN`, `CLOUDFLARE_EMAIL_ACCOUNT_ID`,
+`FEEDLING_EXPORT_EMAIL_FROM` and `FEEDLING_EXPORT_EMAIL_ALLOWLIST`. Missing or invalid
+settings make admission unavailable (503) and park pending jobs; there is no runtime
+fallback. An empty allowlist fails closed. Explicit `*` allows arbitrary recipients
+only when an operator deliberately selects it outside the test deployment;
+concrete lists are case-insensitive exact addresses. Pre configuration remains unchanged and does not select this mailer.
+
+The production `deploy-cvm` wiring reads `PROD_R2_EXPORTS_BUCKET`, optional
+`PROD_FEEDLING_EXPORT_DAILY_LIMIT` (default 3), secret
+`PROD_CLOUDFLARE_EMAIL_TOKEN`, and variables `PROD_CLOUDFLARE_EMAIL_ACCOUNT_ID`,
+`PROD_EXPORT_EMAIL_FROM`, `PROD_EXPORT_EMAIL_ALLOWLIST`. Admission is enabled only
+when both the bucket and all four mail settings are nonempty. Incomplete mail
+configuration leaves admission disabled, even though the mailer defaults to `log`.
+An operator must explicitly set `*` for arbitrary production recipients; the
+workflow never supplies that default. Provision the private, non-versioned bucket,
+seven-day lifecycle and object read/write/delete access separately. This wiring
+is not evidence of a production deployment or successful delivery.
+
+Export job metadata participates in the existing RDS-to-TEE snapshot lane so
+status changes, recipient removal and object cleanup coordinates converge before
+primary promotion. Archives themselves are never copied into the shadow database.
+Dirty-key capture contains only the job ID. Like other snapshot tables, this
+history has a 200,000-row limit: exceeding it reports a replication failure for
+the table and requires a reviewed retention or replication change. It does not
+silently truncate job history or establish readiness for primary promotion.

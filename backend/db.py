@@ -970,6 +970,7 @@ def save_all_users(users: list[dict]) -> None:
                         _mark_chat_r2_inventory_pending_on_cursor(
                             cur, removed_id, advance_generation=True,
                         )
+                        _purge_user_exports_on_cursor(cur, removed_id)
                         _delete_runtime_allowlist_on_cursor(cur, removed_id)
                         cur.execute("DELETE FROM memory_vectors WHERE user_id=%s", (removed_id,))
                         mirror_group.append(("DELETE FROM memory_vectors WHERE user_id=%s", (removed_id,)))
@@ -1015,6 +1016,26 @@ def save_all_users(users: list[dict]) -> None:
     mirror.execute_many(mirror_group)
 
 
+class UserExportCleanupError(RuntimeError):
+    """Account removal must fail closed while export links remain usable."""
+
+
+def _purge_user_exports_on_cursor(cur, user_id: str) -> None:
+    # Caller holds the exclusive chat lifecycle fence; the export worker takes
+    # that fence shared only for upload/mail/completion, so it cannot upload
+    # a new object after this inventory and before the users-row cascade.
+    cur.execute(
+        "SELECT object_key FROM user_export_jobs WHERE user_id=%s AND "
+        "(status IN ('queued','processing','completed') OR "
+        "(status='failed' AND expires_at IS NOT NULL))", (user_id,),
+    )
+    for row in cur.fetchall():
+        try:
+            object_storage.delete_export(row[0])
+        except Exception as exc:
+            raise UserExportCleanupError("export_cleanup_failed") from exc
+
+
 def delete_user(user_id: str) -> bool:
     """False means no such account — callers answer 404 instead of claiming a
     deletion that never happened."""
@@ -1031,6 +1052,7 @@ def delete_user(user_id: str) -> bool:
                 cur.execute("SELECT 1 FROM users WHERE user_id = %s", (user_id,))
                 if cur.fetchone() is None:
                     return False
+                _purge_user_exports_on_cursor(cur, user_id)
                 # Lock before the users-row DELETE/FK cascade. The chat DELETE
                 # trigger writes cleanup rows with no users FK, so both lifecycle
                 # generation and exact-key intents survive account removal.
@@ -9047,7 +9069,7 @@ TRACE_OUTCOME_PROVENANCE_FIELD = "outcome_class_provenance"
 TRACE_OUTCOME_PROVENANCE_VALUES = frozenset({
     "explicit", "missing", "normalized_invalid",
 })
-_TRACE_EVENTS_RETENTION_DAYS = 30
+_TRACE_EVENTS_PROJECTION_DAYS = 30
 _TRACE_EVENTS_MIN_FUTURE_DAYS = 7
 _TRACE_EVENTS_DEFAULT_STORAGE_BUDGET_BYTES = 60_000_000_000
 
@@ -9673,7 +9695,7 @@ def trace_events_partition_health(*, now_epoch: float | None = None) -> dict:
     future_days = (future_through - today).days if future_through else -1
     storage_bytes = int(storage_row[0] or 0)
     peak_bytes_per_day = int(peak_row[0] or 0)
-    projected_retained_bytes = peak_bytes_per_day * _TRACE_EVENTS_RETENTION_DAYS
+    projected_growth_bytes = peak_bytes_per_day * _TRACE_EVENTS_PROJECTION_DAYS
     at_risk_events = int(at_risk_row[0] or 0)
     at_risk_bytes = int(at_risk_row[1] or 0)
     issues: list[str] = []
@@ -9681,10 +9703,7 @@ def trace_events_partition_health(*, now_epoch: float | None = None) -> dict:
         issues.append("default_partition_nonempty")
     if future_days < _TRACE_EVENTS_MIN_FUTURE_DAYS:
         issues.append("partition_horizon_low")
-    keep_from = today - timedelta(days=_TRACE_EVENTS_RETENTION_DAYS - 1)
-    if oldest_day is not None and oldest_day < keep_from:
-        issues.append("expired_partition_present")
-    if max(storage_bytes, projected_retained_bytes) > budget:
+    if storage_bytes + projected_growth_bytes > budget:
         issues.append("storage_budget_exceeded")
     if at_risk_events:
         issues.append("trace_write_at_risk")
@@ -9698,10 +9717,15 @@ def trace_events_partition_health(*, now_epoch: float | None = None) -> dict:
         "oldest_partition_day": oldest_day.isoformat() if oldest_day else None,
         "future_through": future_through.isoformat() if future_through else None,
         "future_days": future_days,
-        "retention_days": _TRACE_EVENTS_RETENTION_DAYS,
+        "retention_days": None,
+        "retention": "forever",
         "storage_bytes": storage_bytes,
         "observed_peak_bytes_per_day": peak_bytes_per_day,
-        "projected_retained_bytes": projected_retained_bytes,
+        # Infinite retention has no finite total projection. Report the next
+        # 30 days' observed-rate growth separately, without implying expiry.
+        "projected_retained_bytes": None,
+        "projection_days": _TRACE_EVENTS_PROJECTION_DAYS,
+        "projected_growth_bytes": projected_growth_bytes,
         "storage_budget_bytes": budget,
         "at_risk_events_today": at_risk_events,
         "at_risk_bytes_today": at_risk_bytes,

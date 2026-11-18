@@ -989,7 +989,7 @@ jobs:
             tests/test_verify_enclave_domain.py \
             -v
 
-      - name: Run CI security tier 3 (79 files)
+      - name: Run CI security tier 3 (81 files)
         env:
           FEEDLING_TEST_PG: "postgresql://postgres:postgres@127.0.0.1:5432/postgres"
         run: |
@@ -1009,6 +1009,7 @@ jobs:
             tests/test_chat_history_selfheal.py \
             tests/test_chat_history_selfheal_blocked_by_nonempty_page.py \
             tests/test_content_export_world_book.py \
+            tests/test_user_export_jobs.py \
             tests/test_content_offloaded_bodies.py \
             tests/test_database_topology_gate.py \
             tests/test_delete_user_cascades_all_tables.py \
@@ -1055,6 +1056,7 @@ jobs:
             tests/test_tee_sync_scheduler.py \
             tests/test_tee_verify.py \
             tests/test_trace_events.py \
+            tests/test_trace_partition_preservation.py \
             tests/test_trace_events_cleanup.py \
             tests/test_user_mcp_ca_fetch.py \
             tests/test_user_mcp_ca_fetch_leaf.py \
@@ -2902,6 +2904,13 @@ jobs:
           R2_SECRET_ACCESS_KEY:         ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.R2_FRAMES_BUCKET }}
           R2_LOGS_BUCKET:               ${{ secrets.R2_LOGS_BUCKET }}
+          # Production exports stay disabled until bucket AND real mail are configured.
+          R2_EXPORTS_BUCKET:            ${{ vars.PROD_R2_EXPORTS_BUCKET }}
+          FEEDLING_EXPORT_DAILY_LIMIT:  ${{ vars.PROD_FEEDLING_EXPORT_DAILY_LIMIT || '3' }}
+          CLOUDFLARE_EMAIL_TOKEN:       ${{ secrets.PROD_CLOUDFLARE_EMAIL_TOKEN }}
+          CLOUDFLARE_EMAIL_ACCOUNT_ID:  ${{ vars.PROD_CLOUDFLARE_EMAIL_ACCOUNT_ID }}
+          FEEDLING_EXPORT_EMAIL_FROM:   ${{ vars.PROD_EXPORT_EMAIL_FROM }}
+          FEEDLING_EXPORT_EMAIL_ALLOWLIST: ${{ vars.PROD_EXPORT_EMAIL_ALLOWLIST }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -2913,10 +2922,28 @@ jobs:
             echo "::error::expected at least one production runner CVM"
             exit 1
           fi
+          # Never admit a production export with a log-only delivery outcome.
+          FEEDLING_EXPORT_ENABLED=0
+          FEEDLING_EXPORT_MAILER=log
+          if [ -n "$CLOUDFLARE_EMAIL_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL_ACCOUNT_ID" ] && \
+             [ -n "$FEEDLING_EXPORT_EMAIL_FROM" ] && [ -n "$FEEDLING_EXPORT_EMAIL_ALLOWLIST" ]; then
+            FEEDLING_EXPORT_MAILER=cloudflare
+            if [ -n "$R2_EXPORTS_BUCKET" ]; then
+              FEEDLING_EXPORT_ENABLED=1
+            fi
+          fi
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
             -c deploy/docker-compose.phala.yaml \
+            -e "FEEDLING_EXPORT_ENABLED=$FEEDLING_EXPORT_ENABLED" \
+            -e "FEEDLING_EXPORT_MAILER=$FEEDLING_EXPORT_MAILER" \
+            -e "R2_EXPORTS_BUCKET=$R2_EXPORTS_BUCKET" \
+            -e "FEEDLING_EXPORT_DAILY_LIMIT=$FEEDLING_EXPORT_DAILY_LIMIT" \
+            -e "CLOUDFLARE_EMAIL_TOKEN=$CLOUDFLARE_EMAIL_TOKEN" \
+            -e "CLOUDFLARE_EMAIL_ACCOUNT_ID=$CLOUDFLARE_EMAIL_ACCOUNT_ID" \
+            -e "FEEDLING_EXPORT_EMAIL_FROM=$FEEDLING_EXPORT_EMAIL_FROM" \
+            -e "FEEDLING_EXPORT_EMAIL_ALLOWLIST=$FEEDLING_EXPORT_EMAIL_ALLOWLIST" \
             -e "R2_ENDPOINT=$R2_ENDPOINT" \
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
@@ -3200,11 +3227,31 @@ jobs:
           R2_SECRET_ACCESS_KEY:         ${{ secrets.TEST_R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.TEST_R2_FRAMES_BUCKET }}
           R2_LOGS_BUCKET:               ${{ secrets.TEST_R2_LOGS_BUCKET }}
+          # Test-only export bucket; absent variable must keep admission disabled.
+          R2_EXPORTS_BUCKET:            ${{ vars.TEST_R2_EXPORTS_BUCKET }}
+          FEEDLING_EXPORT_DAILY_LIMIT:  ${{ vars.TEST_FEEDLING_EXPORT_DAILY_LIMIT || '3' }}
+          CLOUDFLARE_EMAIL_TOKEN:       ${{ secrets.TEST_CLOUDFLARE_EMAIL_TOKEN }}
+          CLOUDFLARE_EMAIL_ACCOUNT_ID:  ${{ vars.TEST_CLOUDFLARE_EMAIL_ACCOUNT_ID }}
+          FEEDLING_EXPORT_EMAIL_FROM:   ${{ vars.TEST_EXPORT_EMAIL_FROM }}
+          FEEDLING_EXPORT_EMAIL_ALLOWLIST: ${{ vars.TEST_EXPORT_EMAIL_ALLOWLIST }}
         run: |
           echo ">>> deploy-test-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
             echo "::error::TEST_DATABASE_URL secret is not set — backend has no datastore"
             exit 1
+          fi
+          FEEDLING_EXPORT_ENABLED=0
+          if [ -n "$R2_EXPORTS_BUCKET" ]; then
+            FEEDLING_EXPORT_ENABLED=1
+          fi
+          # No implicit real delivery: all four settings and concrete test recipients required.
+          FEEDLING_EXPORT_MAILER=log
+          case "$FEEDLING_EXPORT_EMAIL_ALLOWLIST" in
+            *\**) echo "::error::TEST_EXPORT_EMAIL_ALLOWLIST requires concrete addresses, not wildcard"; exit 1 ;;
+          esac
+          if [ -n "$CLOUDFLARE_EMAIL_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL_ACCOUNT_ID" ] && \
+             [ -n "$FEEDLING_EXPORT_EMAIL_FROM" ] && [ -n "$FEEDLING_EXPORT_EMAIL_ALLOWLIST" ]; then
+            FEEDLING_EXPORT_MAILER=cloudflare
           fi
           FEEDLING_RESIDENT_PLAINTEXT_RECALL="${FEEDLING_RESIDENT_PLAINTEXT_RECALL:-off}"
           case "$FEEDLING_RESIDENT_PLAINTEXT_RECALL" in
@@ -3215,6 +3262,14 @@ jobs:
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
             -c deploy/docker-compose.phala.test.yaml \
+            -e "R2_EXPORTS_BUCKET=$R2_EXPORTS_BUCKET" \
+            -e "FEEDLING_EXPORT_ENABLED=$FEEDLING_EXPORT_ENABLED" \
+            -e "FEEDLING_EXPORT_MAILER=$FEEDLING_EXPORT_MAILER" \
+            -e "FEEDLING_EXPORT_DAILY_LIMIT=$FEEDLING_EXPORT_DAILY_LIMIT" \
+            -e "CLOUDFLARE_EMAIL_TOKEN=$CLOUDFLARE_EMAIL_TOKEN" \
+            -e "CLOUDFLARE_EMAIL_ACCOUNT_ID=$CLOUDFLARE_EMAIL_ACCOUNT_ID" \
+            -e "FEEDLING_EXPORT_EMAIL_FROM=$FEEDLING_EXPORT_EMAIL_FROM" \
+            -e "FEEDLING_EXPORT_EMAIL_ALLOWLIST=$FEEDLING_EXPORT_EMAIL_ALLOWLIST" \
             -e "R2_ENDPOINT=$R2_ENDPOINT" \
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \

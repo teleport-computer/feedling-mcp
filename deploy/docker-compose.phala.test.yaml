@@ -160,7 +160,7 @@ services:
   # baked into REPORT_DATA. Moving this behind ingress would break the
   # Phase 3 pinning guarantee.
   enclave:
-    image: &enclave-image ghcr.io/teleport-computer/feedling:59e9348
+    image: &enclave-image ghcr.io/teleport-computer/feedling:f8b3f07
     command: &enclave-command ["python", "-u", "backend/enclave_app.py"]
     restart: unless-stopped
     environment:
@@ -259,7 +259,7 @@ services:
   # a safe no-op unless invoked with --force.
 
   backend:
-    image: ghcr.io/teleport-computer/feedling:59e9348
+    image: ghcr.io/teleport-computer/feedling:f8b3f07
     # gunicorn (uvicorn ASGI worker) = production server (the Werkzeug dev server stalls on large
     # responses under TDX). Worker count now comes from FEEDLING_BACKEND_WORKERS
     # (backend/gunicorn_conf.py, default 1) — NOT a `-w` flag — so the default is
@@ -381,6 +381,15 @@ services:
       # MUST also be scoped to this bucket (else PUT 403 → graceful inline
       # Postgres fallback). Set a short lifecycle (7d) on the bucket.
       R2_USER_LOGS_BUCKET: "${R2_USER_LOGS_BUCKET:-io-user-logs}"
+      # Test export activation is injected only after a dedicated bucket exists.
+      FEEDLING_EXPORT_ENABLED: "${FEEDLING_EXPORT_ENABLED:-0}"
+      FEEDLING_EXPORT_MAILER: "${FEEDLING_EXPORT_MAILER:-log}"
+      R2_EXPORTS_BUCKET: "${R2_EXPORTS_BUCKET:-}"
+      FEEDLING_EXPORT_DAILY_LIMIT: "${FEEDLING_EXPORT_DAILY_LIMIT:-3}"
+      CLOUDFLARE_EMAIL_TOKEN: "${CLOUDFLARE_EMAIL_TOKEN:-}"
+      CLOUDFLARE_EMAIL_ACCOUNT_ID: "${CLOUDFLARE_EMAIL_ACCOUNT_ID:-}"
+      FEEDLING_EXPORT_EMAIL_FROM: "${FEEDLING_EXPORT_EMAIL_FROM:-}"
+      FEEDLING_EXPORT_EMAIL_ALLOWLIST: "${FEEDLING_EXPORT_EMAIL_ALLOWLIST:-}"
       # APNs developer key for push (Dynamic Island / Live Activity).
       # Injected via `phala deploy -e APNS_KEY_P8_B64=...` (encrypted env
       # channel, NOT baked into compose_hash). Empty default keeps dev
@@ -461,7 +470,7 @@ services:
   # (deploy/docker-compose.phala.runner.yaml) is unrelated extra V2 capacity
   # and is untouched by this change.
   serve-worker:
-    image: ghcr.io/teleport-computer/feedling:59e9348
+    image: ghcr.io/teleport-computer/feedling:f8b3f07
     container_name: serve-worker
     command: ["python", "-u", "backend/model_api_runtime/v2/serve_worker.py"]
     restart: unless-stopped
@@ -486,6 +495,14 @@ services:
       R2_ACCESS_KEY_ID: "${R2_ACCESS_KEY_ID:-}"
       R2_SECRET_ACCESS_KEY: "${R2_SECRET_ACCESS_KEY:-}"
       R2_FRAMES_BUCKET: "${R2_FRAMES_BUCKET:-}"
+      FEEDLING_EXPORT_ENABLED: "${FEEDLING_EXPORT_ENABLED:-0}"
+      FEEDLING_EXPORT_MAILER: "${FEEDLING_EXPORT_MAILER:-log}"
+      R2_EXPORTS_BUCKET: "${R2_EXPORTS_BUCKET:-}"
+      FEEDLING_EXPORT_DAILY_LIMIT: "${FEEDLING_EXPORT_DAILY_LIMIT:-3}"
+      CLOUDFLARE_EMAIL_TOKEN: "${CLOUDFLARE_EMAIL_TOKEN:-}"
+      CLOUDFLARE_EMAIL_ACCOUNT_ID: "${CLOUDFLARE_EMAIL_ACCOUNT_ID:-}"
+      FEEDLING_EXPORT_EMAIL_FROM: "${FEEDLING_EXPORT_EMAIL_FROM:-}"
+      FEEDLING_EXPORT_EMAIL_ALLOWLIST: "${FEEDLING_EXPORT_EMAIL_ALLOWLIST:-}"
       FEEDLING_RUNTIME_TOKEN_SECRET: "${FEEDLING_RUNTIME_TOKEN_SECRET:-}"
       # 1c/2g test CVM: resource-bounded three-pool topology. These are
       # deployment values, not secrets, so keep them literal and reviewable.
@@ -598,7 +615,7 @@ services:
       retries: 3
 
   cpu-recorder:
-    image: ghcr.io/teleport-computer/feedling:59e9348
+    image: ghcr.io/teleport-computer/feedling:f8b3f07
     container_name: cpu-recorder
     command: ["python", "-u", "ops/cpu_recorder.py"]
     restart: unless-stopped
@@ -628,7 +645,7 @@ services:
         condition: service_healthy
 
   log-shipper:
-    image: ghcr.io/teleport-computer/feedling:59e9348
+    image: ghcr.io/teleport-computer/feedling:f8b3f07
     container_name: log-shipper
     command: ["python", "-u", "ops/log_shipper.py"]
     restart: unless-stopped

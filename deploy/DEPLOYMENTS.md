@@ -611,6 +611,54 @@ The heavy frame ciphertext (`frame_envelopes.doc.body_ct`, >150KB ChaCha20-Poly1
 - **Threat model**: R2 creds live in the TDX CVM; a leak exposes only ciphertext blobs (content_sk is in the enclave/iOS, never the backend) — equivalent to a `DATABASE_URL` leak today.
 - **Migrating existing rows**: run `backend/backfill_frames_to_r2.py` offline against prod `DATABASE_URL` + the R2 creds (`--dry-run` first to count/size). Idempotent + resumable; already-offloaded rows are skipped. The schema migration (`0006`) only adds columns — it does NOT move data.
 
+### Production user exports (T844; configuration wiring, not a rollout)
+
+Production `deploy-cvm` forwards export settings to both `backend` and
+`serve-worker` in `docker-compose.phala.yaml`. Defaults are disabled (`0`),
+logging mailer (`log`) and empty bucket/mail settings, with daily limit `3`.
+The workflow sets `FEEDLING_EXPORT_ENABLED=1` **only** when a bucket and all four
+real-mail settings below are nonempty. With incomplete mail settings it uses
+`log` **with admission disabled**: production users must not receive a completed
+job whose email was only logged. Invalid nonempty mail settings still fail closed
+at runtime (503); presence in GitHub is not proof of permission or delivery.
+
+Engineer provisioning checklist (names only; no credentials in this document):
+
+- Provision a dedicated **private, non-versioned** bucket, suggested name
+  `io-user-exports-prod`. No public URL or public bucket policy. Set a seven-day
+  expiration lifecycle for `user-exports/` objects before enabling exports.
+  Archives are decrypted user data; keep this separate from encrypted frames,
+  attachments and diagnostic logs. Seven-day signed links do not replace lifecycle.
+- Existing production secrets `R2_ENDPOINT`, `R2_ACCESS_KEY_ID` and
+  `R2_SECRET_ACCESS_KEY` are already forwarded to both processes. Their runtime
+  credential must also allow object PUT, signed GET and DELETE on the new export
+  bucket (including deletion/expiry cleanup), while retaining existing bucket
+  access. Keep bucket/lifecycle administration outside the runtime credential.
+- Existing secret `FEEDLING_RUNTIME_TOKEN_SECRET` is already wired to both
+  processes and required by export admission; do not replace/rotate it for this work.
+- Set repository variable `PROD_R2_EXPORTS_BUCKET` to the dedicated bucket name.
+- Set secret `PROD_CLOUDFLARE_EMAIL_TOKEN` with Email Sending permission for the
+  chosen account; verify the sender domain independently. Set variables
+  `PROD_CLOUDFLARE_EMAIL_ACCOUNT_ID`, `PROD_EXPORT_EMAIL_FROM`, and
+  `PROD_EXPORT_EMAIL_ALLOWLIST`. For arbitrary recipients the operator must
+  **explicitly** set the allowlist to `*`; an empty list stays disabled. A concrete
+  comma-separated list may be used for a restricted rollout. No implicit wildcard.
+- Optional variable `PROD_FEEDLING_EXPORT_DAILY_LIMIT` overrides default `3`.
+  These repository names map to the unprefixed container settings
+  `R2_EXPORTS_BUCKET`, `FEEDLING_EXPORT_DAILY_LIMIT`, `CLOUDFLARE_EMAIL_TOKEN`,
+  `CLOUDFLARE_EMAIL_ACCOUNT_ID`, `FEEDLING_EXPORT_EMAIL_FROM` and
+  `FEEDLING_EXPORT_EMAIL_ALLOWLIST`; workflow derives enabled/mailer.
+- Setting variables alone does not update a running CVM: use the separately
+  authorized production release process. This patch does not provision resources,
+  set repository configuration or dispatch deployments. Verify exact deployed SHA,
+  actual recipient receipt, ZIP contents and deletion cleanup during that release.
+
+Test retains its concrete-address-only wildcard rejection and log-mode acceptance
+behavior. Pre (`deploy-pre-cvm` / `docker-compose.phala.pre.yaml`) deliberately
+receives no export settings: it has neither a dedicated export bucket nor an
+export acceptance plan; adding another activation surface is outside this scope.
+Runner jobs do not host the export queue and remain unchanged.
+
 ### Client diagnostic logs to R2 (`backend/diagnostics/`)
 
 Lets a client upload its persistent `diagnostics.log` (`POST /v1/diagnostics/logs`, user auth) so a developer can pull it by user id (`GET /v1/admin/diagnostics/logs/<user_id>`, admin auth → presigned download URLs). See `backend/diagnostics/`.

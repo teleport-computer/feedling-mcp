@@ -83,6 +83,7 @@ from core import chat_images
 from core.store_sections import StoreSection
 from core import wake_bus as core_wake_bus
 from genesis import daemon as genesis_daemon
+from content import export_service
 from hosted import config_store as hosted_config_store
 from hosted import mcp_core
 from hosted import mcp_status
@@ -4991,7 +4992,7 @@ def _prepare_recall_attachments(user_id, rows, *, required_ids, deadline):
     raise recall_contract.RecallFailure("attachment_unconfirmed")
 
 
-def _read_context_memories(user_id: str, *, through_seq: int, coordinates: dict | None = None, deadline: float | None = None, attachment_proofs=None, source_snapshots=None) -> dict:
+def _read_context_memories(user_id: str, *, through_seq: int, coordinates: dict | None = None, deadline: float | None = None, attachment_proofs=None, source_snapshots=None, current_optional: bool = False) -> dict:
     """Pick this turn's context cards.
 
     ``FEEDLING_V2_PLAINTEXT_RECALL`` (T779 step 2b): ``off`` (default) is the
@@ -5014,7 +5015,7 @@ def _read_context_memories(user_id: str, *, through_seq: int, coordinates: dict 
             # Explicit references are validated by the prompt reader.
             include_references=False, query_args=plaintext_recall.V2_QUERY_ARGS,
             attachment_proofs=attachment_proofs, source_snapshots=source_snapshots,
-            hybrid=recall_policy.hybrid_enabled())
+            hybrid=recall_policy.hybrid_enabled(), current_optional=current_optional)
         return {**payload, "account_mode": "off"}
     rpc_started = time.monotonic()
     payload, diagnostics = _read_context_memories_enclave(
@@ -7030,6 +7031,7 @@ async def _serve(worker_id: str, *, poll_interval: float) -> None:
     tasks = [
         asyncio.create_task(_reaper_loop(stop_event)),
         asyncio.create_task(_r2_cleanup_loop(stop_event)),
+        asyncio.create_task(export_service.run(stop_event)),
         *[
             asyncio.create_task(
                 _fleet_heartbeat_loop(worker_id, pool, fleet, stop_event)

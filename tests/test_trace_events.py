@@ -943,7 +943,7 @@ def test_clear_tombstone_preserves_disabled_default_for_missing_flag(
             conn.execute("DELETE FROM users WHERE user_id=%s", (uid,))
 
 
-def test_default_is_red_then_owner_maintenance_recovers_and_expires(tee_primary, caplog):
+def test_default_is_red_then_owner_maintenance_recovers_without_expiry(tee_primary, caplog):
     uid = _uid()
     today = datetime.now(_ZONE).date()
     stranded_day = today + timedelta(days=400)
@@ -969,15 +969,22 @@ def test_default_is_red_then_owner_maintenance_recovers_and_expires(tee_primary,
             fixed = partitions.maintain(owner, today=today)
         assert fixed["default_rows_before"] >= 2
         assert fixed["default_rows_after"] == 0
-        assert fixed["moved_rows"] >= 1
-        assert fixed["expired_default_rows"] >= 1
+        assert fixed["moved_rows"] >= 2
         with db.get_pool().connection() as conn:
             rows = conn.execute(
                 "SELECT trace_id,tableoid::regclass::text FROM trace_events "
                 "WHERE user_id=%s ORDER BY trace_id",
                 (uid,),
             ).fetchall()
-        assert rows == [("stranded", stranded_partition)]
+        assert rows == [("expired", partitions._name(stale_day)),
+                        ("stranded", stranded_partition)]
+        health = db.trace_events_partition_health()
+        assert "expired_partition_present" not in health["issues"]
+        assert "default_partition_nonempty" not in health["issues"]
+        assert health["retention"] == "forever"
+        assert health["retention_days"] is None
+        assert health["projected_retained_bytes"] is None
+        assert health["projection_days"] == 30
 
         # A repaired far-future outlier must not mask a hole in the near-term
         # rolling window: health measures consecutive coverage from today.
