@@ -159,8 +159,18 @@ At runtime, explicitly choosing `FEEDLING_EXPORT_MAILER=cloudflare` requires
 settings make admission unavailable (503) and park pending jobs; there is no runtime
 fallback. An empty allowlist fails closed. Explicit `*` allows arbitrary recipients
 only when an operator deliberately selects it outside the test deployment;
-concrete lists are case-insensitive exact addresses. Production/pre configuration
-is unchanged and does not select this mailer.
+concrete lists are case-insensitive exact addresses. Pre configuration remains unchanged and does not select this mailer.
+
+The production `deploy-cvm` wiring reads `PROD_R2_EXPORTS_BUCKET`, optional
+`PROD_FEEDLING_EXPORT_DAILY_LIMIT` (default 3), secret
+`PROD_CLOUDFLARE_EMAIL_TOKEN`, and variables `PROD_CLOUDFLARE_EMAIL_ACCOUNT_ID`,
+`PROD_EXPORT_EMAIL_FROM`, `PROD_EXPORT_EMAIL_ALLOWLIST`. Admission is enabled only
+when both the bucket and all four mail settings are nonempty. Incomplete mail
+configuration leaves admission disabled, even though the mailer defaults to `log`.
+An operator must explicitly set `*` for arbitrary production recipients; the
+workflow never supplies that default. Provision the private, non-versioned bucket,
+seven-day lifecycle and object read/write/delete access separately. This wiring
+is not evidence of a production deployment or successful delivery.
 
 Export job metadata participates in the existing RDS-to-TEE snapshot lane so
 status changes, recipient removal and object cleanup coordinates converge before

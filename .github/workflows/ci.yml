@@ -2901,6 +2901,13 @@ jobs:
           R2_SECRET_ACCESS_KEY:         ${{ secrets.R2_SECRET_ACCESS_KEY }}
           R2_FRAMES_BUCKET:             ${{ secrets.R2_FRAMES_BUCKET }}
           R2_LOGS_BUCKET:               ${{ secrets.R2_LOGS_BUCKET }}
+          # Production exports stay disabled until bucket AND real mail are configured.
+          R2_EXPORTS_BUCKET:            ${{ vars.PROD_R2_EXPORTS_BUCKET }}
+          FEEDLING_EXPORT_DAILY_LIMIT:  ${{ vars.PROD_FEEDLING_EXPORT_DAILY_LIMIT || '3' }}
+          CLOUDFLARE_EMAIL_TOKEN:       ${{ secrets.PROD_CLOUDFLARE_EMAIL_TOKEN }}
+          CLOUDFLARE_EMAIL_ACCOUNT_ID:  ${{ vars.PROD_CLOUDFLARE_EMAIL_ACCOUNT_ID }}
+          FEEDLING_EXPORT_EMAIL_FROM:   ${{ vars.PROD_EXPORT_EMAIL_FROM }}
+          FEEDLING_EXPORT_EMAIL_ALLOWLIST: ${{ vars.PROD_EXPORT_EMAIL_ALLOWLIST }}
         run: |
           echo ">>> deploy-cvm target: $CVM_ID"
           if [ -z "$DATABASE_URL" ]; then
@@ -2912,10 +2919,28 @@ jobs:
             echo "::error::expected at least one production runner CVM"
             exit 1
           fi
+          # Never admit a production export with a log-only delivery outcome.
+          FEEDLING_EXPORT_ENABLED=0
+          FEEDLING_EXPORT_MAILER=log
+          if [ -n "$CLOUDFLARE_EMAIL_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL_ACCOUNT_ID" ] && \
+             [ -n "$FEEDLING_EXPORT_EMAIL_FROM" ] && [ -n "$FEEDLING_EXPORT_EMAIL_ALLOWLIST" ]; then
+            FEEDLING_EXPORT_MAILER=cloudflare
+            if [ -n "$R2_EXPORTS_BUCKET" ]; then
+              FEEDLING_EXPORT_ENABLED=1
+            fi
+          fi
           phala deploy \
             --api-token "$PHALA_CLOUD_API_KEY" \
             --cvm-id "$CVM_ID" \
             -c deploy/docker-compose.phala.yaml \
+            -e "FEEDLING_EXPORT_ENABLED=$FEEDLING_EXPORT_ENABLED" \
+            -e "FEEDLING_EXPORT_MAILER=$FEEDLING_EXPORT_MAILER" \
+            -e "R2_EXPORTS_BUCKET=$R2_EXPORTS_BUCKET" \
+            -e "FEEDLING_EXPORT_DAILY_LIMIT=$FEEDLING_EXPORT_DAILY_LIMIT" \
+            -e "CLOUDFLARE_EMAIL_TOKEN=$CLOUDFLARE_EMAIL_TOKEN" \
+            -e "CLOUDFLARE_EMAIL_ACCOUNT_ID=$CLOUDFLARE_EMAIL_ACCOUNT_ID" \
+            -e "FEEDLING_EXPORT_EMAIL_FROM=$FEEDLING_EXPORT_EMAIL_FROM" \
+            -e "FEEDLING_EXPORT_EMAIL_ALLOWLIST=$FEEDLING_EXPORT_EMAIL_ALLOWLIST" \
             -e "R2_ENDPOINT=$R2_ENDPOINT" \
             -e "R2_ACCESS_KEY_ID=$R2_ACCESS_KEY_ID" \
             -e "R2_SECRET_ACCESS_KEY=$R2_SECRET_ACCESS_KEY" \
